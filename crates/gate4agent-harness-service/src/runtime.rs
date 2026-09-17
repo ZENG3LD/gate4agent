@@ -4,9 +4,9 @@ use crate::{
         ArmedHarnessMcpReservationProof,
         ContextPackExportStart, ExportContextPackOutcome, HarnessC2Adapter,
         HarnessC2Error, HarnessC2EventReceiver,
-        HarnessObservationResync, PendingContextPackFetch, PendingHostDirectoryBrowse,
+        HarnessObservationResync, PendingHostDirectoryBrowse,
         PendingNativeHistoryRequest,
-        PendingNodeWorkspaceRead, PendingWorkspacePathFetch,
+        PendingNodeWorkspaceRead,
         PendingNodeWorkspaceWrite, PendingResourceMutation, PendingRunRead,
         PendingRunContextSourceObservation, PendingSessionControl,
         PendingSessionRecordMutation, PreparedHostDirectoryBrowse,
@@ -90,7 +90,7 @@ use gate4agent_harness_api::{
     HarnessReverseAttributionSubjectV1, HarnessReverseAttributionV1,
     FeatureObservationStateV1, ProjectionAvailabilityV1, ProjectionFreshnessV1,
     ContextSourceExclusionEntryV1, ContextSourceExclusionV1,
-    HarnessMailFetchResultV1, HarnessReadHostErrorV1, HarnessReadReplyV1,
+    HarnessReadHostErrorV1, HarnessReadReplyV1,
     HarnessReadResponseV1, RedactedBindingStateV1,
     RedactedRunIntentV1, RedactedRunV1, RedactedTaskV1, RedactedWorktreeIntentV1,
     RunPageV1, TaskCreatorCategoryV1, TaskPageV1,
@@ -120,7 +120,7 @@ use gate4agent_node_protocol::{
     HarnessMcpLocalReplyV1, HarnessMcpOpaquePayloadV1,
     HarnessMcpRejectReasonV1, HarnessMcpReplyChunkHexV1, HarnessMcpReservationId,
     NodeFailureCode, SessionAddress,
-    SessionRecordId, SpawnBundleId, SpawnContextId, SpawnProfileId, WorkspaceFileContent,
+    SessionRecordId, SpawnBundleId, SpawnContextId, SpawnProfileId,
     MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES, MAX_HARNESS_MCP_REPLY_CHUNK_RAW_BYTES,
     MAX_HARNESS_MCP_PENDING_CALLS_PER_NODE,
 };
@@ -4586,291 +4586,6 @@ fn start_continuation_export_finish(
     });
 }
 
-/// D3/Slice C2's deferred half of `HostCommand::Read`'s `MailFetch` path:
-/// resolves the intent's run to a node route synchronously (still holding
-/// `harness`/`&mut harness` for this one turn of the select loop), starts the
-/// C2/Node round trip, then hands the caller's own `reply` sender to a
-/// `tokio::spawn`ed task together with the pending handle -- the loop
-/// iteration ends here, exactly like every other node round trip this host
-/// starts (`start_continuation_export_finish` and siblings). Never touches
-/// `HostCommand`/`&mut harness` again once spawned: `PendingContextPackFetch`
-/// owns its own C2 waiter, and the run's receipt this needs was already
-/// cloned out before the synchronous half returned.
-fn start_context_pack_fetch_reply(
-    adapter: &HarnessC2Adapter,
-    engine: &gate4agent_harness_engine::HarnessEngine,
-    intent: crate::read::ContextPackFetchIntent,
-    reply: oneshot::Sender<HarnessReadReplyV1>,
-) {
-    match prepare_context_pack_fetch(adapter, engine, &intent) {
-        Ok((pending, receipt)) => {
-            tokio::spawn(async move {
-                let reply_value = finish_context_pack_fetch(pending, receipt, intent.digest).await;
-                let _ = reply.send(reply_value);
-            });
-        }
-        Err(error) => {
-            let _ = reply.send(HarnessReadReplyV1::Error { error });
-        }
-    }
-}
-
-/// Synchronous half: looks up the intent's run, re-checks its receipt still
-/// carries the exact digest the engine resolved (defends against a run
-/// mutating between `HarnessEngine::mail_fetch`'s scan and this lookup --
-/// both happen inside the same `&mut harness` turn today, so this can never
-/// actually diverge, but costs nothing to assert), and starts the node
-/// round trip from that run's own stored binding.
-fn prepare_context_pack_fetch(
-    adapter: &HarnessC2Adapter,
-    engine: &gate4agent_harness_engine::HarnessEngine,
-    intent: &crate::read::ContextPackFetchIntent,
-) -> Result<
-    (PendingContextPackFetch, gate4agent_harness_protocol::HarnessResolvedContextPackReceiptV1),
-    HarnessReadHostErrorV1,
-> {
-    let run = engine.run(&intent.run_id).ok_or(HarnessReadHostErrorV1::Internal)?;
-    let receipt = run.context_pack.as_ref()
-        .filter(|receipt| receipt.digest == intent.digest)
-        .ok_or(HarnessReadHostErrorV1::Internal)?
-        .clone();
-    let binding = run.binding.as_ref().ok_or(HarnessReadHostErrorV1::Internal)?;
-    let pending = adapter.start_context_pack_fetch(binding, &intent.digest)
-        .map_err(|_| HarnessReadHostErrorV1::Internal)?;
-    Ok((pending, receipt))
-}
-
-/// Asynchronous half: awaits the node round trip, then applies both digest
-/// checks D3/C2 requires -- `correlate_context_pack_fetch_response` (inside
-/// `pending.finish()`) already proved the node's own echoed digest matches
-/// what was requested; this additionally recomputes the digest over the
-/// bytes actually received, so a corrupted store or a wrong pack cannot pass
-/// as a match on the wire's say-so alone. The node naming the digest unknown
-/// (`NodeFailureCode::UnknownContextPack` -- the pack was evicted between
-/// the engine's scan and this fetch) folds into the same
-/// `MailRefContextPackUnknown` outcome `HarnessEngineError::MailRefTargetUnknown`
-/// already maps to at scan time (`read.rs`'s own mapping), since both mean
-/// the same thing to the caller: nothing answers for this digest any more.
-/// Any other transport/rejection failure is `HarnessReadHostErrorV1::Internal`,
-/// the same bucket every other unreachable-Node condition on this read wire
-/// already collapses to (this wire has no dedicated "upstream unavailable"
-/// variant).
-async fn finish_context_pack_fetch(
-    pending: PendingContextPackFetch,
-    receipt: gate4agent_harness_protocol::HarnessResolvedContextPackReceiptV1,
-    expected_digest: String,
-) -> HarnessReadReplyV1 {
-    let pack = match pending.finish().await {
-        Ok(pack) => pack,
-        Err(HarnessC2Error::ContextPackFetchRejected { code })
-            if code == NodeFailureCode::UnknownContextPack =>
-        {
-            return HarnessReadReplyV1::Ok {
-                response: HarnessReadResponseV1::MailFetch(
-                    HarnessMailFetchResultV1::MailRefContextPackUnknown { digest: expected_digest },
-                ),
-            };
-        }
-        Err(_) => {
-            return HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Internal };
-        }
-    };
-    let recomputed = match crate::c2::recompute_context_pack_digest(&receipt, &pack.bytes) {
-        Ok(digest) => digest,
-        Err(_) => return HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Internal },
-    };
-    if recomputed != expected_digest {
-        return HarnessReadReplyV1::Ok {
-            response: HarnessReadResponseV1::MailFetch(
-                HarnessMailFetchResultV1::MailedContextPackDigestMismatch {
-                    expected: expected_digest,
-                    recomputed,
-                },
-            ),
-        };
-    }
-    let response = HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::ContextPack {
-        digest: expected_digest,
-        id: pack.id.as_str().to_owned(),
-        byte_len: pack.byte_len,
-        bytes_hex: encode_hex(&pack.bytes),
-    });
-    match response.validate() {
-        Ok(()) => HarnessReadReplyV1::Ok { response },
-        Err(_) => HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Internal },
-    }
-}
-
-fn mail_fetch_refused_reply(result: HarnessMailFetchResultV1) -> HarnessReadReplyV1 {
-    HarnessReadReplyV1::Ok { response: HarnessReadResponseV1::MailFetch(result) }
-}
-
-/// D3/Slice C3's deferred half of `HostCommand::Read`'s `MailFetch` path for
-/// a `WorkspacePath` ref: resolves the ref's own `workspace` to a node
-/// synchronously from the cached runtime inventory (still holding this one
-/// turn of the select loop -- no `&mut harness` needed here at all, unlike
-/// `start_context_pack_fetch_reply`, since a `WorkspacePath` ref carries no
-/// run to re-check), starts the C2/Node round trip, then hands the caller's
-/// own `reply` sender to a `tokio::spawn`ed task together with the pending
-/// handle and the ref's own fields -- the loop iteration ends here, exactly
-/// like `start_context_pack_fetch_reply` and every other node round trip
-/// this host starts. Never touches `HostCommand`/`&mut harness`/
-/// `HarnessRuntimeInventoryCache` again once spawned: `PendingWorkspacePathFetch`
-/// owns its own C2 waiter, and `intent`'s fields are plain owned `String`s
-/// moved into the task.
-fn start_workspace_path_fetch_reply(
-    adapter: &HarnessC2Adapter,
-    runtime_inventory: &HarnessRuntimeInventoryCache,
-    intent: crate::read::WorkspacePathFetchIntent,
-    reply: oneshot::Sender<HarnessReadReplyV1>,
-) {
-    match prepare_workspace_path_fetch(adapter, runtime_inventory, &intent) {
-        Ok(pending) => {
-            tokio::spawn(async move {
-                let reply_value = finish_workspace_path_fetch(pending, intent).await;
-                let _ = reply.send(reply_value);
-            });
-        }
-        Err(reply_value) => {
-            let _ = reply.send(reply_value);
-        }
-    }
-}
-
-/// Synchronous half: resolves `intent.workspace` to exactly one connected
-/// node by scanning the cached runtime inventory's own workspace roster per
-/// node (`HarnessRuntimeInventoryCache::all_nodes`, the same cache
-/// `node_still_has_session` reads from elsewhere in this file) -- no node
-/// registering it at all is `MailRefWorkspaceUnknown`, more than one is
-/// `MailRefWorkspaceAmbiguous` naming every node that does (sorted, for a
-/// stable reply). Converts the ref's own `workspace`/`path` strings into
-/// their typed Node-protocol forms only once exactly one node is settled
-/// on; a conversion failure here means the mailed ref itself is malformed
-/// (a workspace or path string a session was allowed to mail but the Node
-/// protocol's own identifier/path rules reject), so it is refused by name
-/// -- naming the malformed input -- rather than surfaced as a host error.
-fn prepare_workspace_path_fetch(
-    adapter: &HarnessC2Adapter,
-    runtime_inventory: &HarnessRuntimeInventoryCache,
-    intent: &crate::read::WorkspacePathFetchIntent,
-) -> Result<PendingWorkspacePathFetch, HarnessReadReplyV1> {
-    let mut matching_node_ids: Vec<String> = runtime_inventory.all_nodes().into_iter()
-        .filter(|node| node.inventory.workspaces.contains_key(intent.workspace.as_str()))
-        .map(|node| node.node_id)
-        .collect();
-    matching_node_ids.sort();
-    let node_id_str = match matching_node_ids.len() {
-        0 => return Err(mail_fetch_refused_reply(HarnessMailFetchResultV1::MailRefWorkspaceUnknown {
-            workspace: intent.workspace.clone(),
-        })),
-        1 => matching_node_ids.remove(0),
-        _ => return Err(mail_fetch_refused_reply(HarnessMailFetchResultV1::MailRefWorkspaceAmbiguous {
-            workspace: intent.workspace.clone(),
-            nodes: matching_node_ids,
-        })),
-    };
-    // `node_id_str` round-tripped through a validated `NodeId` on the way
-    // into the runtime inventory cache (`refresh`'s own route), so a parse
-    // failure here is a harness-internal invariant break, not a caller
-    // input problem -- the same "unreachable in practice" reasoning
-    // `fill_managed_session_blocked_stats` documents for the identical
-    // round trip.
-    let node_id = gate4agent_node_protocol::NodeId::new(node_id_str.as_str())
-        .map_err(|_| HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Internal })?;
-    let workspace_id = gate4agent_node_protocol::WorkspaceId::new(intent.workspace.as_str())
-        .map_err(|_| mail_fetch_refused_reply(HarnessMailFetchResultV1::Refused {
-            reason: format!("workspace {} is not a valid workspace identifier", intent.workspace),
-        }))?;
-    let path = gate4agent_node_protocol::RepositoryPath::utf8(intent.path.clone())
-        .map_err(|_| mail_fetch_refused_reply(HarnessMailFetchResultV1::Refused {
-            reason: format!("path {} is not a valid repository path", intent.path),
-        }))?;
-    adapter.start_workspace_path_fetch(&node_id, workspace_id, path)
-        .map_err(|_| HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Internal })
-}
-
-/// Asynchronous half: awaits the node round trip. The node reporting no such
-/// workspace any more (`NodeFailureCode::UnknownWorkspace` -- the workspace
-/// was unregistered between the inventory scan above and this fetch) folds
-/// into the same `MailRefWorkspaceUnknown` outcome `prepare_workspace_path_
-/// fetch` already uses for the cache-time case, since both mean the same
-/// thing to the caller: no node answers for this workspace any more. The
-/// node reporting no such file, or one it cannot read
-/// (`RepositoryFileNotFound`/`RepositoryFileNotRegular`/`InvalidRepositoryPath`/
-/// `RepositoryPathUnsafe`/`RepositoryFileReadFailed` -- every failure code
-/// that names a property of THIS path rather than a generic node-capacity
-/// condition) is `MailRefWorkspacePathUnknown`. Any other transport/
-/// rejection failure (a busy node, a read timeout, a route mismatch) is
-/// `HarnessReadHostErrorV1::Internal`, the same bucket every other
-/// unreachable-Node condition on this read wire already collapses to. A
-/// `Utf8` file recomputes `sha256_hex` over its own bytes and compares it to
-/// the ref's own `sha256` -- never trusting the node's `revision` alone --
-/// answering `WorkspacePath` on a match or `MailedWorkspacePathDigestMismatch`
-/// otherwise; `NonUtf8`/`TooLarge` answer
-/// `MailedWorkspacePathContentNotFetchable` naming which and its size.
-async fn finish_workspace_path_fetch(
-    pending: PendingWorkspacePathFetch,
-    intent: crate::read::WorkspacePathFetchIntent,
-) -> HarnessReadReplyV1 {
-    let crate::read::WorkspacePathFetchIntent { workspace, path, sha256: expected_sha256 } = intent;
-    let file = match pending.finish().await {
-        Ok(file) => file,
-        Err(HarnessC2Error::WorkspacePathFetchRejected { code })
-            if code == NodeFailureCode::UnknownWorkspace =>
-        {
-            return mail_fetch_refused_reply(HarnessMailFetchResultV1::MailRefWorkspaceUnknown { workspace });
-        }
-        Err(HarnessC2Error::WorkspacePathFetchRejected { code })
-            if matches!(
-                code,
-                NodeFailureCode::RepositoryFileNotFound
-                    | NodeFailureCode::RepositoryFileNotRegular
-                    | NodeFailureCode::InvalidRepositoryPath
-                    | NodeFailureCode::RepositoryPathUnsafe
-                    | NodeFailureCode::RepositoryFileReadFailed
-            ) =>
-        {
-            return mail_fetch_refused_reply(HarnessMailFetchResultV1::MailRefWorkspacePathUnknown {
-                workspace,
-                path,
-            });
-        }
-        Err(_) => return HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Internal },
-    };
-    match file.content {
-        WorkspaceFileContent::Utf8 { text, byte_len } => {
-            let recomputed = gate4agent_node_protocol::sha256_hex(text.as_bytes());
-            if recomputed != expected_sha256 {
-                return mail_fetch_refused_reply(HarnessMailFetchResultV1::MailedWorkspacePathDigestMismatch {
-                    expected: expected_sha256,
-                    recomputed,
-                });
-            }
-            let response = HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::WorkspacePath {
-                workspace, path, byte_len, sha256: recomputed, text,
-            });
-            match response.validate() {
-                Ok(()) => HarnessReadReplyV1::Ok { response },
-                Err(_) => HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Internal },
-            }
-        }
-        WorkspaceFileContent::NonUtf8 { byte_len } => {
-            mail_fetch_refused_reply(HarnessMailFetchResultV1::MailedWorkspacePathContentNotFetchable {
-                workspace,
-                path,
-                why: format!("file is not valid UTF-8 ({byte_len} bytes)"),
-            })
-        }
-        WorkspaceFileContent::TooLarge { limit_bytes } => {
-            mail_fetch_refused_reply(HarnessMailFetchResultV1::MailedWorkspacePathContentNotFetchable {
-                workspace,
-                path,
-                why: format!("file exceeds the {limit_bytes}-byte limit"),
-            })
-        }
-    }
-}
-
 fn start_harness_mcp_arm_finish(
     commands: mpsc::Sender<HostCommand>,
     operation_id: HarnessOperationId,
@@ -5557,22 +5272,6 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         },
                                     };
                                     let _ = reply.send(reply_value);
-                                }
-                                Ok(ReadDispatch::ContextPackFetch(intent)) => {
-                                    start_context_pack_fetch_reply(
-                                        &adapter,
-                                        harness.engine(),
-                                        intent,
-                                        reply,
-                                    );
-                                }
-                                Ok(ReadDispatch::WorkspacePathFetch(intent)) => {
-                                    start_workspace_path_fetch_reply(
-                                        &adapter,
-                                        &runtime_inventory,
-                                        intent,
-                                        reply,
-                                    );
                                 }
                                 Err(error) => {
                                     let _ = reply.send(HarnessReadReplyV1::Error { error });
@@ -7565,43 +7264,22 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                         HarnessMcpOrRegularEvent::HarnessMcp(event) => {
                             match event {
                                 Some(event) => {
-                                    let result = match prepare_harness_mcp_read_call(
+                                    let plan = prepare_harness_mcp_read_call(
                                         &adapter,
                                         &mut harness,
                                         &observation,
                                         &support,
                                         &runtime_inventory,
                                         event,
-                                    )? {
-                                        PreparedHarnessMcpRead::Ready(plan) => {
-                                            let _ = schedule_harness_mcp_relay(
-                                                &adapter,
-                                                &commands,
-                                                &mut harness_mcp_workers,
-                                                &pending_harness_mcp_aborts,
-                                                &harness_mcp_rejects,
-                                                plan,
-                                            )?;
-                                            Ok(())
-                                        }
-                                        PreparedHarnessMcpRead::Deferred(deferred) => {
-                                            schedule_deferred_harness_mcp_relay(
-                                                &adapter,
-                                                &harness,
-                                                &commands,
-                                                &runtime_inventory,
-                                                &mut harness_mcp_workers,
-                                                &pending_harness_mcp_aborts,
-                                                &harness_mcp_rejects,
-                                                deferred,
-                                            )
-                                        }
-                                    };
-                                    if let Err(error) = result {
-                                        if !matches!(error, HarnessRuntimeError::C2(_)) {
-                                            return Err(error);
-                                        }
-                                    }
+                                    )?;
+                                    let _ = schedule_harness_mcp_relay(
+                                        &adapter,
+                                        &commands,
+                                        &mut harness_mcp_workers,
+                                        &pending_harness_mcp_aborts,
+                                        &harness_mcp_rejects,
+                                        plan,
+                                    )?;
                                 }
                                 None => {
                                     harness_mcp_events_open = false;
@@ -9108,7 +8786,6 @@ pub fn redact_runtime_inventory(
             // projection of it (see this function's own doc comment).
             blocked_count: 0,
             last_blocked_at_ms: None,
-            unread_mail: 0,
         }
     }).collect();
     HarnessRuntimeInventoryV1 {
@@ -9126,27 +8803,23 @@ pub fn redact_runtime_inventory(
     }
 }
 
-/// Overlays `blocked_count`/`last_blocked_at_ms`/`unread_mail` onto every
-/// managed session in a `RuntimeInventoryList` reply from the harness's own
-/// observation projection and mailbox state -- the `runtime-inventory`
-/// counterpart of `observation_state` (`read.rs`), which does the same
-/// lookup-by-`ManagedSessionKey` for a single run's freshness/availability.
-/// `redact_runtime_inventory` cannot fill these itself: it is a pure mapping
-/// of the node's own `SlimNodeInventory`, which carries nothing about the
-/// harness's own `ActionBlocked` observations or mailbox
-/// (see that function's own doc comment).
+/// Overlays `blocked_count`/`last_blocked_at_ms` onto every managed session
+/// in a `RuntimeInventoryList` reply from the harness's own observation
+/// projection -- the `runtime-inventory` counterpart of `observation_state`
+/// (`read.rs`), which does the same lookup-by-`ManagedSessionKey` for a
+/// single run's freshness/availability. `redact_runtime_inventory` cannot
+/// fill this itself: it is a pure mapping of the node's own
+/// `SlimNodeInventory`, which carries nothing about the harness's own
+/// `ActionBlocked` observations (see that function's own doc comment).
 ///
 /// A node id or record id that fails to parse back into its typed form is
 /// left at the zero/`None` `redact_runtime_inventory` already set -- every
 /// value here round-tripped through validated wire types on the way in, so
 /// a parse failure is unreachable in practice, not a case worth surfacing as
-/// an error to an operator asking a read-only question. `unread_mail` is
-/// filled from `engine` alone (no observation projection needed) and is
-/// therefore filled even when the observation-side lookup below misses.
+/// an error to an operator asking a read-only question.
 fn fill_managed_session_blocked_stats(
     page: &mut HarnessRuntimeInventoryPageV1,
     observation: &ObservationService,
-    engine: &gate4agent_harness_engine::HarnessEngine,
 ) {
     for node in &mut page.nodes {
         let Ok(node_id) = NodeId::new(node.node_id.as_str()) else { continue; };
@@ -9154,9 +8827,6 @@ fn fill_managed_session_blocked_stats(
             continue;
         };
         for record in &mut node.inventory.managed_sessions {
-            if let Ok(selector) = HarnessSelectorV1::new(record.record_id.clone()) {
-                record.unread_mail = crate::read::count_unread_mail(engine, &selector);
-            }
             let Ok(record_id) = SessionRecordId::new(record.record_id.as_str()) else {
                 continue;
             };
@@ -9908,7 +9578,7 @@ fn execute_operator_request(
         }
         HarnessOperatorRequestV1::RuntimeInventoryList { after_node_id, limit } => {
             let mut page = runtime_inventory.page(after_node_id.as_deref(), limit);
-            fill_managed_session_blocked_stats(&mut page, observation, harness.engine());
+            fill_managed_session_blocked_stats(&mut page, observation);
             HarnessOperatorResponseV1::RuntimeInventory(page)
         }
         HarnessOperatorRequestV1::TerminalRead { session, after_sequence, limit } => {
@@ -9924,15 +9594,6 @@ fn execute_operator_request(
                 transport_incomplete: page.transport_incomplete,
                 next_cursor: page.next_cursor,
             })
-        }
-        HarnessOperatorRequestV1::MailInbox { record_id, since_unix_ms, limit } => {
-            HarnessOperatorResponseV1::MailInbox(
-                crate::read::operator_mail_inbox(harness.engine(), &record_id, since_unix_ms, limit)
-                    .map_err(map_operator_read_error)?,
-            )
-        }
-        HarnessOperatorRequestV1::AckMail { request } => {
-            operator_mutation_response(harness.operator_ack_mail(request))?
         }
         HarnessOperatorRequestV1::CatalogNativeSessions { .. }
         | HarnessOperatorRequestV1::PageNativeSessions { .. }
@@ -11925,51 +11586,9 @@ struct HarnessMcpRelayPlan {
     outcome: Result<Vec<u8>, HarnessMcpRejectReasonV1>,
 }
 
-/// `prepare_harness_mcp_read_call`'s own outcome: either a plan ready to
-/// relay immediately (`Ready`, the in-process case, and also every
-/// unauthorized/refused/errored call -- none of those need a node round
-/// trip either), or -- for a `g4a_mail_fetch` call whose ref resolved to a
-/// `ContextPack` or `WorkspacePath` -- the fetch intent this call must
-/// complete against the node before it can reply (`Deferred`), the
-/// harness-MCP sibling of `ReadDispatch`'s own two node-backed variants.
-enum PreparedHarnessMcpRead {
-    Ready(HarnessMcpRelayPlan),
-    Deferred(DeferredHarnessMcpFetch),
-}
-
-/// A `g4a_mail_fetch` MCP call whose ref resolved to a `ContextPack` or
-/// `WorkspacePath` -- carries the same reply identity `HarnessMcpRelayPlan`
-/// does (everything `relay_harness_mcp_read_call` needs to answer the node
-/// once the fetch completes) plus the fetch intent itself, still
-/// unresolved. See `schedule_deferred_harness_mcp_relay`, the caller that
-/// resolves `intent` to a node route and starts the round trip.
-struct DeferredHarnessMcpFetch {
-    route: NodeRoute,
-    reservation_id: gate4agent_node_protocol::HarnessMcpReservationId,
-    activation_digest: gate4agent_node_protocol::HarnessMcpActivationDigest,
-    record_id: gate4agent_node_protocol::SessionRecordId,
-    session: gate4agent_node_protocol::SessionAddress,
-    call_id: gate4agent_node_protocol::HarnessMcpCallId,
-    deadline_unix_ms: u64,
-    intent: DeferredHarnessMcpFetchIntent,
-}
-
-/// `DeferredHarnessMcpFetch`'s own fetch intent -- the harness-MCP relay's
-/// analogue of `ReadDispatch`'s two node-backed variants, carried here
-/// instead of re-matched on `ReadDispatch` itself since this caller (unlike
-/// `HostCommand::Read`'s own arm) has no `oneshot::Sender<HarnessReadReplyV1>`
-/// to hand a `HarnessReadReplyV1` back through -- it relays a
-/// `HarnessMcpRelayPlan` to the node instead.
-enum DeferredHarnessMcpFetchIntent {
-    ContextPack(crate::read::ContextPackFetchIntent),
-    WorkspacePath(crate::read::WorkspacePathFetchIntent),
-}
-
 /// Serializes a resolved `HarnessReadResponseV1` into the wire bytes a
-/// harness-MCP relay call replies with -- shared by `prepare_harness_mcp_
-/// read_call`'s in-process `Ready` path and its deferred `ContextPack`/
-/// `WorkspacePath` completion (`start_deferred_harness_mcp_relay_finish`).
-/// A response that fails `HarnessMcpLocalReplyV1::validate` -- whether
+/// harness-MCP relay call replies with. A response that fails
+/// `HarnessMcpLocalReplyV1::validate` -- whether
 /// because the response itself is malformed or because its own wire form
 /// exceeds `MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES` -- rejects with
 /// `ResponseTooLarge`, the same reject reason this reply already uses for
@@ -12018,7 +11637,7 @@ fn prepare_harness_mcp_read_call(
     support: &ObservationSupportRegistry,
     runtime_inventory: &HarnessRuntimeInventoryCache,
     routed: RoutedNodeEvent,
-) -> Result<PreparedHarnessMcpRead, HarnessRuntimeError> {
+) -> Result<HarnessMcpRelayPlan, HarnessRuntimeError> {
     let route = NodeRoute {
         node_id: routed.node_id.clone(),
         expected_incarnation_id: routed.cursor.incarnation_id,
@@ -12043,7 +11662,7 @@ fn prepare_harness_mcp_read_call(
                 reason = "opaque request payload did not decode as a harness read request",
                 "harness MCP read call refused",
             );
-            return Ok(PreparedHarnessMcpRead::Ready(HarnessMcpRelayPlan {
+            return Ok(HarnessMcpRelayPlan {
                 route,
                 reservation_id,
                 activation_digest,
@@ -12052,7 +11671,7 @@ fn prepare_harness_mcp_read_call(
                 call_id,
                 deadline_unix_ms,
                 outcome: Err(HarnessMcpRejectReasonV1::InvalidRequest),
-            }));
+            });
         }
     };
     let tool_id = crate::read::harness_mcp_tool_id(&request);
@@ -12119,13 +11738,6 @@ fn prepare_harness_mcp_read_call(
     // the success side, since an unauthorized call never resolved a grant
     // at all.
     let grant_id = authorization.as_ref().ok().map(|binding| binding.grant_id.clone());
-    // Mirrors `execute_read`'s own split (`read.rs`): a `g4a_mail_fetch`
-    // call is intercepted here and routed through `dispatch_mail_fetch` so
-    // a `ContextPack`/`WorkspacePath` ref can come back as its own
-    // `ReadDispatch` variant instead of the in-process-only refusal
-    // `execute_exact_binding_read` (via `mail_fetch`) would answer with;
-    // every other request still goes through `execute_exact_binding_read`
-    // exactly as before.
     // Both steps below answer the agent with the same "harness read
     // unavailable", and neither said which one failed: measured live
     // 2026-09-09, a kimi call arrived with 2.4s of headroom against a valid
@@ -12142,22 +11754,7 @@ fn prepare_harness_mcp_read_call(
                 );
                 error
             })?;
-        if let gate4agent_harness_api::HarnessReadRequestV1::MailFetch { message_id, ref_index } = request {
-            return crate::read::dispatch_mail_fetch(
-                harness, observation, support, &binding, message_id, ref_index,
-            )
-            .map_err(|error| {
-                tracing::warn!(
-                    tool = tool_id,
-                    error = ?error,
-                    step = "dispatch-mail-fetch",
-                    "harness MCP read call could not be dispatched",
-                );
-                error
-            });
-        }
         execute_exact_binding_read(harness, observation, support, &binding, request, runtime_inventory)
-            .map(ReadDispatch::Response)
             .map_err(|error| {
                 tracing::warn!(
                     tool = tool_id,
@@ -12169,7 +11766,7 @@ fn prepare_harness_mcp_read_call(
             })
     });
     let prepared = match dispatch {
-        Ok(ReadDispatch::Response(response)) => PreparedHarnessMcpRead::Ready(HarnessMcpRelayPlan {
+        Ok(response) => HarnessMcpRelayPlan {
             route,
             reservation_id,
             activation_digest,
@@ -12178,32 +11775,8 @@ fn prepare_harness_mcp_read_call(
             call_id,
             deadline_unix_ms,
             outcome: encode_mcp_outcome(response),
-        }),
-        Ok(ReadDispatch::ContextPackFetch(intent)) => {
-            PreparedHarnessMcpRead::Deferred(DeferredHarnessMcpFetch {
-                route,
-                reservation_id,
-                activation_digest,
-                record_id,
-                session,
-                call_id,
-                deadline_unix_ms,
-                intent: DeferredHarnessMcpFetchIntent::ContextPack(intent),
-            })
-        }
-        Ok(ReadDispatch::WorkspacePathFetch(intent)) => {
-            PreparedHarnessMcpRead::Deferred(DeferredHarnessMcpFetch {
-                route,
-                reservation_id,
-                activation_digest,
-                record_id,
-                session,
-                call_id,
-                deadline_unix_ms,
-                intent: DeferredHarnessMcpFetchIntent::WorkspacePath(intent),
-            })
-        }
-        Err(error) => PreparedHarnessMcpRead::Ready(HarnessMcpRelayPlan {
+        },
+        Err(error) => HarnessMcpRelayPlan {
             route,
             reservation_id,
             activation_digest,
@@ -12212,234 +11785,24 @@ fn prepare_harness_mcp_read_call(
             call_id,
             deadline_unix_ms,
             outcome: Err(reject_reason(error)),
-        }),
+        },
     };
     // One line per served call (not per reply chunk -- chunking happens
     // later, in `relay_harness_mcp_read_call`), naming the grant and
     // session a live proof can cross-check against the MCP client's own
-    // `tools/call` trace. A deferred `ContextPack`/`WorkspacePath` fetch
-    // cannot know `served` yet -- its own node round trip has not even
-    // started -- so it logs `deferred = true` here instead; the spawned
-    // completion (`start_deferred_harness_mcp_relay_finish`) logs the
-    // eventual `served=<bool>` itself, correlatable against this line by
-    // `reservation_id`/`call_id`.
-    match &prepared {
-        PreparedHarnessMcpRead::Ready(plan) => {
-            tracing::info!(
-                node_id = plan.route.node_id.as_str(),
-                workspace_id = plan.session.workspace_id.as_str(),
-                session = ?plan.session.session,
-                reservation_id = plan.reservation_id.as_str(),
-                call_id = plan.call_id.as_str(),
-                tool = tool_id,
-                grant_id = grant_id.as_ref().map(|grant_id| grant_id.as_str()).unwrap_or("unauthorized"),
-                served = plan.outcome.is_ok(),
-                "harness MCP read call served",
-            );
-        }
-        PreparedHarnessMcpRead::Deferred(deferred) => {
-            tracing::info!(
-                node_id = deferred.route.node_id.as_str(),
-                workspace_id = deferred.session.workspace_id.as_str(),
-                session = ?deferred.session.session,
-                reservation_id = deferred.reservation_id.as_str(),
-                call_id = deferred.call_id.as_str(),
-                tool = tool_id,
-                grant_id = grant_id.as_ref().map(|grant_id| grant_id.as_str()).unwrap_or("unauthorized"),
-                deferred = true,
-                "harness MCP read call served",
-            );
-        }
-    }
-    Ok(prepared)
-}
-
-/// The harness-MCP relay's own deferred half of `prepare_harness_mcp_read_
-/// call`: the sibling of `start_context_pack_fetch_reply`/`start_
-/// workspace_path_fetch_reply` (`HostCommand::Read`'s own deferred halves),
-/// reusing their exact synchronous `prepare_context_pack_fetch`/`prepare_
-/// workspace_path_fetch` calls to resolve the node route while `harness`/
-/// `runtime_inventory` are still in scope for this one turn of the serve
-/// loop. A route that resolves registers into `workers.relays` (the same
-/// attempt-id/capacity bookkeeping `schedule_harness_mcp_relay` uses for
-/// its own in-process replies) before spawning the node round trip, so
-/// `HarnessMcpWorkerRegistry::has_capacity` and the abort-worker
-/// reconciliation loop both see this call as in flight for as long as the
-/// node round trip actually takes -- unlike a plain in-process reply, this
-/// one can run for up to `deadline_unix_ms`. No capacity, or the
-/// synchronous half itself refusing or failing, never touches the node at
-/// all and relays immediately through `capacity_rejects` -- the same queue
-/// `schedule_harness_mcp_relay`'s own capacity rejection already uses,
-/// since its worker (`start_harness_mcp_reject_worker`) relays whatever
-/// finished `HarnessMcpRelayPlan` it is handed regardless of why the call
-/// never reached the node.
-fn schedule_deferred_harness_mcp_relay(
-    adapter: &HarnessC2Adapter,
-    harness: &HarnessService,
-    commands: &mpsc::Sender<HostCommand>,
-    runtime_inventory: &HarnessRuntimeInventoryCache,
-    workers: &mut HarnessMcpWorkerRegistry,
-    pending_aborts: &BTreeMap<HarnessMcpReservationId, PendingHarnessMcpAbort>,
-    capacity_rejects: &mpsc::Sender<HarnessMcpRelayPlan>,
-    deferred: DeferredHarnessMcpFetch,
-) -> Result<(), HarnessRuntimeError> {
-    let DeferredHarnessMcpFetch {
-        route, reservation_id, activation_digest, record_id, session, call_id,
-        deadline_unix_ms, intent,
-    } = deferred;
-    let key = (reservation_id.clone(), call_id.clone());
-    if workers.relays.contains_key(&key) {
-        return Ok(());
-    }
-    let plan_with_outcome = |outcome: Result<Vec<u8>, HarnessMcpRejectReasonV1>| HarnessMcpRelayPlan {
-        route: route.clone(),
-        reservation_id: reservation_id.clone(),
-        activation_digest: activation_digest.clone(),
-        record_id: record_id.clone(),
-        session: session.clone(),
-        call_id: call_id.clone(),
-        deadline_unix_ms,
-        outcome,
-    };
-    if !workers.has_capacity(pending_aborts) {
-        return enqueue_finished_harness_mcp_relay(
-            capacity_rejects,
-            plan_with_outcome(Err(HarnessMcpRejectReasonV1::Internal)),
-        );
-    }
-    let pending = match intent {
-        DeferredHarnessMcpFetchIntent::ContextPack(intent) => {
-            match prepare_context_pack_fetch(adapter, harness.engine(), &intent) {
-                Ok((pending, receipt)) => DeferredHarnessMcpFetchPending::ContextPack {
-                    pending,
-                    receipt,
-                    digest: intent.digest,
-                },
-                Err(error) => {
-                    return enqueue_finished_harness_mcp_relay(
-                        capacity_rejects,
-                        plan_with_outcome(Err(reject_reason(error))),
-                    );
-                }
-            }
-        }
-        DeferredHarnessMcpFetchIntent::WorkspacePath(intent) => {
-            match prepare_workspace_path_fetch(adapter, runtime_inventory, &intent) {
-                Ok(pending) => DeferredHarnessMcpFetchPending::WorkspacePath { pending, intent },
-                Err(reply_value) => {
-                    let outcome = match reply_value {
-                        HarnessReadReplyV1::Ok { response } => encode_mcp_outcome(response),
-                        HarnessReadReplyV1::Error { error } => Err(reject_reason(error)),
-                    };
-                    return enqueue_finished_harness_mcp_relay(
-                        capacity_rejects,
-                        plan_with_outcome(outcome),
-                    );
-                }
-            }
-        }
-    };
-    let attempt_id = workers.allocate_attempt_id();
-    workers.relays.insert(key, ActiveHarnessMcpRelay { attempt_id });
-    start_deferred_harness_mcp_relay_finish(
-        adapter.clone(),
-        commands.clone(),
-        plan_with_outcome(Err(HarnessMcpRejectReasonV1::Internal)),
-        pending,
-        attempt_id,
+    // `tools/call` trace.
+    tracing::info!(
+        node_id = prepared.route.node_id.as_str(),
+        workspace_id = prepared.session.workspace_id.as_str(),
+        session = ?prepared.session.session,
+        reservation_id = prepared.reservation_id.as_str(),
+        call_id = prepared.call_id.as_str(),
+        tool = tool_id,
+        grant_id = grant_id.as_ref().map(|grant_id| grant_id.as_str()).unwrap_or("unauthorized"),
+        served = prepared.outcome.is_ok(),
+        "harness MCP read call served",
     );
-    Ok(())
-}
-
-/// `schedule_deferred_harness_mcp_relay`'s own resolved-but-unfetched
-/// state: the pending C2/Node waiter plus whatever each fetch kind needs
-/// to finish it (`finish_context_pack_fetch`/`finish_workspace_path_fetch`
-/// both need more than the bare pending handle -- see each's own doc
-/// comment).
-enum DeferredHarnessMcpFetchPending {
-    ContextPack {
-        pending: PendingContextPackFetch,
-        receipt: gate4agent_harness_protocol::HarnessResolvedContextPackReceiptV1,
-        digest: String,
-    },
-    WorkspacePath {
-        pending: PendingWorkspacePathFetch,
-        intent: crate::read::WorkspacePathFetchIntent,
-    },
-}
-
-async fn finish_deferred_harness_mcp_fetch(
-    pending: DeferredHarnessMcpFetchPending,
-) -> HarnessReadReplyV1 {
-    match pending {
-        DeferredHarnessMcpFetchPending::ContextPack { pending, receipt, digest } => {
-            finish_context_pack_fetch(pending, receipt, digest).await
-        }
-        DeferredHarnessMcpFetchPending::WorkspacePath { pending, intent } => {
-            finish_workspace_path_fetch(pending, intent).await
-        }
-    }
-}
-
-/// Awaits the node round trip, then relays and reports completion exactly
-/// like `start_harness_mcp_relay_finish` does for an already-encoded plan
-/// -- the one difference is `plan`'s own `outcome` is still a placeholder
-/// (`Err(Internal)`, never read) until this task overwrites it with the
-/// fetch's real result. Never touches `HostCommand`/`&mut harness`/
-/// `HarnessMcpWorkerRegistry` again once spawned: the loop iteration that
-/// scheduled this already registered `plan`'s `(reservation_id, call_id)`
-/// key into `workers.relays`, and `HostCommand::HarnessMcpRelayFinished`
-/// (sent at the end here, exactly as `start_harness_mcp_relay_finish`
-/// sends it) is what tells that registry to release it.
-fn start_deferred_harness_mcp_relay_finish(
-    adapter: HarnessC2Adapter,
-    commands: mpsc::Sender<HostCommand>,
-    mut plan: HarnessMcpRelayPlan,
-    pending: DeferredHarnessMcpFetchPending,
-    attempt_id: u64,
-) {
-    tokio::spawn(async move {
-        let reply = finish_deferred_harness_mcp_fetch(pending).await;
-        plan.outcome = match reply {
-            HarnessReadReplyV1::Ok { response } => encode_mcp_outcome(response),
-            HarnessReadReplyV1::Error { error } => Err(reject_reason(error)),
-        };
-        tracing::info!(
-            node_id = plan.route.node_id.as_str(),
-            workspace_id = plan.session.workspace_id.as_str(),
-            session = ?plan.session.session,
-            reservation_id = plan.reservation_id.as_str(),
-            call_id = plan.call_id.as_str(),
-            served = plan.outcome.is_ok(),
-            "harness MCP read call served (deferred)",
-        );
-        let reservation_id = plan.reservation_id.clone();
-        let call_id = plan.call_id.clone();
-        let result = relay_harness_mcp_read_call(&adapter, plan).await;
-        let _ = commands.send(HostCommand::HarnessMcpRelayFinished {
-            reservation_id,
-            call_id,
-            attempt_id,
-            result,
-        }).await;
-    });
-}
-
-/// Relays an already-finished `HarnessMcpRelayPlan` through the same
-/// worker `schedule_harness_mcp_relay`'s own capacity rejection uses
-/// (`start_harness_mcp_reject_worker`), for the two `schedule_deferred_
-/// harness_mcp_relay` call sites that finish before ever starting a node
-/// round trip (no capacity to start one, or the synchronous resolve step
-/// itself refused/failed) -- unlike `enqueue_harness_mcp_capacity_
-/// rejection`, this does not force `outcome` to `Internal`: the caller has
-/// already decided the real outcome (a capacity rejection, a resolve
-/// failure, or a domain refusal such as `MailRefWorkspaceUnknown`).
-fn enqueue_finished_harness_mcp_relay(
-    capacity_rejects: &mpsc::Sender<HarnessMcpRelayPlan>,
-    plan: HarnessMcpRelayPlan,
-) -> Result<(), HarnessRuntimeError> {
-    capacity_rejects.try_send(plan)
-        .map_err(|_| HarnessRuntimeError::HarnessMcpRejectQueueFull)
+    Ok(prepared)
 }
 
 async fn relay_harness_mcp_read_call(
@@ -13693,22 +13056,16 @@ mod tests {
         assert_eq!(grant.maximum_child_count, 0);
         assert_eq!(grant.maximum_child_depth, 0);
         assert!(grant.allowed_delivery_bundles.is_empty());
-        assert!(grant.mail, "the default grant may write mail (mailbox arc D1)");
 
         let mut tool_ids = crate::read::allowed_tool_ids(&grant);
         tool_ids.sort();
         let mut expected: Vec<String> = gate4agent_harness_api::HARNESS_READ_TOOL_IDS
             .iter().map(|id| (*id).to_owned()).collect();
-        expected.extend([
-            "g4a_mail_send".to_owned(),
-            "g4a_mail_inbox".to_owned(),
-            "g4a_mail_ack".to_owned(),
-            "g4a_mail_fetch".to_owned(),
-        ]);
+        expected.push("g4a_run_finish".to_owned());
         expected.sort();
         assert_eq!(
             tool_ids, expected,
-            "the eight reads plus the four mailbox tools are the full ceiling now that the default grant carries mail",
+            "the eight reads plus the unconditional g4a_run_finish are the full ceiling for the default grant",
         );
 
         // Retrying the identical dispatch replays the same grant rather than
@@ -13936,8 +13293,6 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
         }).unwrap();
         let harness = HarnessService::from_engine_for_test(engine);
         let route = NodeRoute {
@@ -14029,8 +13384,6 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
         }).unwrap();
         let mut harness = HarnessService::from_engine_for_test(engine);
         let observation_path = database_path();
@@ -14196,8 +13549,6 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
         }).unwrap();
         let mut harness = HarnessService::from_engine_for_test(engine);
         let observation_path = database_path();
@@ -14402,8 +13753,6 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
         }).unwrap();
         let harness = HarnessService::from_engine_for_test(engine);
         let route = NodeRoute {
@@ -16855,7 +16204,7 @@ mod tests {
         }
 
         let mut page = cache.page(None, 1);
-        fill_managed_session_blocked_stats(&mut page, &observation, &gate4agent_harness_engine::HarnessEngine::new());
+        fill_managed_session_blocked_stats(&mut page, &observation);
         page.validate().unwrap();
         assert_eq!(page.nodes[0].inventory.managed_sessions.len(), 1);
         let record = &page.nodes[0].inventory.managed_sessions[0];
@@ -17760,23 +17109,22 @@ mod tests {
         assert_eq!(rejected.outcome, Err(HarnessMcpRejectReasonV1::Internal));
     }
 
-    /// A response whose own per-field bounds pass (`HarnessMailFetchResultV1
-    /// ::WorkspacePath` enforces no upper bound on `text`/`byte_len`, unlike
-    /// `ContextPack`'s `HARNESS_CONTEXT_PACK_MAX_BYTES`) but whose serialized
-    /// wire form exceeds `MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES` still
-    /// rejects with `ResponseTooLarge` -- `HarnessMcpLocalReplyV1::validate`
-    /// enforces the aggregate wire bound itself, and `encode_mcp_outcome`
-    /// collapses any `validate` failure into that one reject reason.
+    /// A response whose serialized wire form exceeds
+    /// `MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES` rejects with
+    /// `ResponseTooLarge` -- `HarnessMcpLocalReplyV1::validate` enforces the
+    /// aggregate wire bound itself, and `encode_mcp_outcome` collapses any
+    /// `validate` failure into that one reject reason. `encode_mcp_outcome`
+    /// never calls the response's own semantic `validate()` (it relays the
+    /// response as opaque bytes -- see this test module's own doc comment
+    /// below), so a synthetic value built directly, bypassing whatever
+    /// per-field bound its own type would otherwise enforce, still exercises
+    /// this gate the same way a legitimately oversized one would.
     #[test]
     fn encode_mcp_outcome_rejects_a_response_too_large_to_fit_the_aggregate_reply_bound() {
         let oversize_text = "a".repeat(2 * MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES);
-        let oversize = HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::WorkspacePath {
-            workspace: "workspace-a".to_owned(),
-            path: "src/main.rs".to_owned(),
-            byte_len: oversize_text.len() as u32,
-            sha256: "a".repeat(64),
-            text: oversize_text,
-        });
+        let oversize = HarnessReadResponseV1::TaskCreate(
+            gate4agent_harness_api::HarnessTaskCreateResultV1::TitleInvalid { why: oversize_text },
+        );
         assert_eq!(
             encode_mcp_outcome(oversize),
             Err(HarnessMcpRejectReasonV1::ResponseTooLarge),
@@ -17788,9 +17136,11 @@ mod tests {
     /// `relay_harness_mcp_read_call` chunks onto the wire.
     #[test]
     fn encode_mcp_outcome_encodes_a_response_that_fits() {
-        let response = HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused {
-            reason: "no such message".to_owned(),
-        });
+        let response = HarnessReadResponseV1::TaskCreate(
+            gate4agent_harness_api::HarnessTaskCreateResultV1::TitleInvalid {
+                why: "title is empty".to_owned(),
+            },
+        );
         // The reply carries the response as opaque bytes plus a content
         // type, not as the harness's own typed enum: everything between this
         // encode and the reviewed local helper program that decodes it is a

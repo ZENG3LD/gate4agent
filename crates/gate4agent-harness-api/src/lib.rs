@@ -42,13 +42,10 @@ pub use gate4agent_harness_protocol::{
     HarnessRuntimeIdentityV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
     HarnessTaskCreateResultV1, HarnessTaskMoveResultV1,
     HarnessValidationError, HarnessWorktreeIntentV1, SessionGrantId,
-    HarnessMailAckV1, HarnessMailAddressV1, HarnessMailMessageId, HarnessMailMessageV1,
-    HarnessMailRefV1,
-    HarnessRecordRef,
     HARNESS_ARTIFACTS_MAX, HARNESS_BODY_MAX_BYTES,
     HARNESS_CHILD_COUNT_MAX, HARNESS_CHILD_DEPTH_MAX, HARNESS_DEPENDENCIES_MAX,
     HARNESS_CONTEXT_PACK_MAX_BYTES, HARNESS_CONTEXT_PACK_RETAINED_MESSAGES_MAX,
-    HARNESS_LINKS_MAX, HARNESS_MAIL_REFS_MAX, HARNESS_RESULTS_MAX, HARNESS_TITLE_MAX_BYTES,
+    HARNESS_LINKS_MAX, HARNESS_RESULTS_MAX, HARNESS_TITLE_MAX_BYTES,
     HARNESS_RUN_GIT_PATH_MAX_BYTES,
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -215,50 +212,26 @@ pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
     "g4a_operation_get",
 ];
 
-/// The mailbox arc's Slice B write allow-list (D1 + D7), joined by Slice C's
-/// `g4a_mail_fetch`, Slice D's `g4a_task_create`/`g4a_task_move` (D5), and
-/// S10's `g4a_run_finish`. Kept separate from `HARNESS_READ_TOOL_IDS` rather
-/// than folded into it -- that array's own test
+/// Slice D's `g4a_task_create`/`g4a_task_move` (D5) and S10's
+/// `g4a_run_finish`. Kept separate from `HARNESS_READ_TOOL_IDS` rather than
+/// folded into it -- that array's own test
 /// (`all_eight_tool_schemas_are_stable_and_closed`) pins it as exactly the
-/// eight read-only tools zipped in `tool_definitions()`'s declared order, and
-/// every mail tool here is gated by `grant.mail`, not by any of the three
-/// `read_permissions`/`monitoring_visibility` scopes the eight reads use.
-/// `g4a_mail_inbox` and `g4a_mail_fetch` perform no mutation -- they are
-/// reads in effect, `g4a_mail_fetch`'s the C1 read whose authorization is
-/// message-membership ("it was mailed to me") rather than lineage scope --
-/// but both belong here with their mutating siblings because the gate they
-/// share is the same one, not the eight reads' gate. `g4a_task_create`/
-/// `g4a_task_move` are gated by `grant.task_permissions.create`/`.mutate`
-/// respectively, the same wiring `mail` already establishes for its own four
-/// siblings here. `g4a_run_finish` is the one member of this array gated by
-/// no grant permission at all (`expected_allowed_tool_ids` carries it
-/// unconditionally, the same way it carries `g4a_context_get` out of
-/// `HARNESS_READ_TOOL_IDS`) -- every session needs the ability to report its
-/// own work finished regardless of what else its grant allows. D7: this
-/// array, and `HARNESS_READ_TOOL_IDS`, are the only two names `tools/call`
-/// ever admits; `ResolveInteraction` (or any other name) is refused by name
-/// regardless of what a grant's `allowed_tool_ids` claims.
-pub const HARNESS_WRITE_TOOL_IDS: [&str; 7] = [
-    "g4a_mail_ack",
-    "g4a_mail_fetch",
-    "g4a_mail_inbox",
-    "g4a_mail_send",
+/// eight read-only tools zipped in `tool_definitions()`'s declared order.
+/// `g4a_task_create`/`g4a_task_move` are gated by
+/// `grant.task_permissions.create`/`.mutate` respectively. `g4a_run_finish`
+/// is the one member of this array gated by no grant permission at all
+/// (`expected_allowed_tool_ids` carries it unconditionally, the same way it
+/// carries `g4a_context_get` out of `HARNESS_READ_TOOL_IDS`) -- every
+/// session needs the ability to report its own work finished regardless of
+/// what else its grant allows. D7: this array, and `HARNESS_READ_TOOL_IDS`,
+/// are the only two names `tools/call` ever admits; `ResolveInteraction`
+/// (or any other name) is refused by name regardless of what a grant's
+/// `allowed_tool_ids` claims.
+pub const HARNESS_WRITE_TOOL_IDS: [&str; 3] = [
     "g4a_run_finish",
     "g4a_task_create",
     "g4a_task_move",
 ];
-/// Bound on a mail send/ack named-refusal reason string
-/// (`HarnessMailSendResultV1::Refused`). The longest reason
-/// `HarnessEngineError` actually produces for `SendMail` (`MailRecipientUnknown`/
-/// `MailRecipientEnded`/`MailPermissionDenied`, formatted via `to_string()`)
-/// runs well under 128 bytes even with a maximal opaque id embedded; this
-/// stays generous headroom rather than a tight fit.
-pub const HARNESS_MAIL_REFUSAL_REASON_MAX_BYTES: usize = 256;
-/// Bound on the `thread` id list `g4a_mail_inbox` attaches to one page entry
-/// -- the wire-level cap on what is otherwise an unbounded transitive
-/// closure (`HarnessEngine::mail_inbox`'s own doc comment), sized like the
-/// other page-shaped limits in this crate (`HARNESS_TIMELINE_PAGE_LIMIT_MAX`).
-pub const HARNESS_MAIL_THREAD_IDS_MAX: u16 = 128;
 
 const TOKEN_PREFIX: &str = "g4ah2_";
 const OPERATOR_TOKEN_PREFIX: &str = "g4aho_";
@@ -2374,28 +2347,6 @@ impl HarnessProviderInteractionResponseV1 {
     }
 }
 
-/// Authority for `HarnessOperatorRequestV1::AckMail`: the operator's own ack
-/// of one message on behalf of `record_id`, applied through
-/// `HarnessMutationV1::AckMail` with the operator as the operation's actor
-/// (`gate4agent-harness-service::operator_ack_mail` resolves the mail-
-/// permitted grant currently bound to `record_id` to satisfy that mutation's
-/// own `grant_id` authority -- see that function's doc comment).
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HarnessMailAckOperatorRequestV1 {
-    pub authority: HarnessOperatorAuthorityV1,
-    pub record_id: HarnessSelectorV1,
-    pub message_id: HarnessMailMessageId,
-}
-
-impl HarnessMailAckOperatorRequestV1 {
-    pub fn validate(&self) -> Result<(), HarnessValidationError> {
-        self.authority.validate()?;
-        self.record_id.validate()?;
-        self.message_id.validate()
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessOperatorRequestV1 {
@@ -2544,14 +2495,6 @@ pub enum HarnessOperatorRequestV1 {
     TerminalRead {
         session: HarnessRuntimeSessionAddressV1,
         after_sequence: Option<u64>,
-        limit: u16,
-    },
-    /// D1/D8, Slice B: the operator's own bounded, redacted mailbox read for
-    /// one session record -- the same `HarnessMailInboxPageV1` shape
-    /// `g4a_mail_inbox` returns.
-    MailInbox {
-        record_id: HarnessSelectorV1,
-        since_unix_ms: Option<u64>,
         limit: u16,
     },
     // Direct operator session verbs: unlike the CAS/task-mutation family
@@ -2812,14 +2755,6 @@ pub enum HarnessOperatorRequestV1 {
     StartTask { request: HarnessStartTaskRequestV1 },
     ReplaceTaskExecutionSpecV2 { request: HarnessReplaceTaskExecutionSpecRequestV2 },
     StartTaskV2 { request: HarnessStartTaskRequestV2 },
-    /// The operator's own ack (D1, Slice B): an operator act, applied
-    /// through the same `HarnessMutationV1::AckMail` mutation an agent's own
-    /// `g4a_mail_ack` uses -- not a distinct authority channel, so it is not
-    /// routed through `HarnessOperatorActionV1`/`SubmitIntent` the way the
-    /// task-mutation family above is; there is no task to CAS against, the
-    /// same reason the direct session-control verbs below skip that layer
-    /// too.
-    AckMail { request: HarnessMailAckOperatorRequestV1 },
     SubmitIntent { intent: HarnessOperatorIntentV1 },
     // Node-scoped, paged host-directory listing behind the folder-browser
     // dialog: the harness-mode sibling of the light TUI's own
@@ -3078,11 +3013,6 @@ impl HarnessOperatorRequestV1 {
                 session.validate()?;
                 validate_operator_terminal_limit(*limit)
             }
-            Self::MailInbox { record_id, limit, .. } => {
-                record_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
-                validate_operator_limit(*limit)
-            }
-            Self::AckMail { request } => request.validate().map_err(HarnessOperatorApiError::Protocol),
             Self::SpawnSession { node_id, workspace_id, provider, provider_profile, terminal_size, .. } => {
                 validate_node_workspace_route(node_id, workspace_id)?;
                 if !valid_runtime_id(provider, 128) || !valid_runtime_id(provider_profile, 128) {
@@ -3999,7 +3929,6 @@ pub enum HarnessOperatorResponseV1 {
     TaskLaunchOptions(HarnessTaskLaunchOptionsV1),
     RuntimeInventory(HarnessRuntimeInventoryPageV1),
     TerminalRead(HarnessRuntimeTerminalPageV1),
-    MailInbox(HarnessMailInboxPageV1),
     SessionSpawned(HarnessRuntimeSessionAddressV1),
     SessionInputWritten,
     SessionResized,
@@ -4094,7 +4023,6 @@ impl HarnessOperatorResponseV1 {
             Self::TaskLaunchOptions(value) => value.validate(),
             Self::RuntimeInventory(value) => value.validate(),
             Self::TerminalRead(value) => value.validate(),
-            Self::MailInbox(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::SessionSpawned(value) => value.validate(),
             Self::SessionInputWritten
             | Self::SessionResized
@@ -5319,12 +5247,6 @@ pub struct HarnessRuntimeManagedSessionV1 {
     /// `received_at_ms` of the most recent such observation, or `None` when
     /// `blocked_count` is zero.
     pub last_blocked_at_ms: Option<u64>,
-    /// Unacked mail addressed to this record directly, plus mail addressed
-    /// to a task this record's currently bound grant can see -- the mailbox
-    /// arc's counterpart of `blocked_count` immediately above, filled the
-    /// same way (`gate4agent-harness-service::runtime::
-    /// fill_managed_session_blocked_stats`).
-    pub unread_mail: u64,
 }
 
 impl HarnessRuntimeManagedSessionV1 {
@@ -6031,45 +5953,6 @@ pub enum HarnessReadRequestV1 {
     },
     RunGet { run_id: HarnessRunId },
     OperationGet { operation_id: HarnessOperationId },
-    /// D1/D8: `to` addresses a session record or a task (forum); `subject`/
-    /// `body` reuse the task title/body bounds (S9, unchanged). The named
-    /// refusal (unknown/ended recipient, no `mail` permission) travels back
-    /// as `HarnessMailSendResultV1::Refused`, never as a host error -- see
-    /// that type's own doc comment. `refs` is Slice C's addition (D3): at
-    /// most `HARNESS_MAIL_REFS_MAX` dereferenceable references, defaulted so
-    /// a caller built before Slice C still sends a valid request.
-    MailSend {
-        to: HarnessMailAddressV1,
-        subject: String,
-        body: String,
-        reply_to: Option<HarnessMailMessageId>,
-        #[serde(default)]
-        refs: Vec<HarnessMailRefV1>,
-    },
-    /// D8's forum read: mail addressed to the caller's own session record
-    /// plus every message addressed to a task currently visible to the
-    /// caller's grant. Unacked entries sort first.
-    MailInbox {
-        since_unix_ms: Option<u64>,
-        limit: u16,
-    },
-    /// Idempotent: acking an already-acked message is a no-op success (S9's
-    /// at-least-once delivery termination).
-    MailAck { message_id: HarnessMailMessageId },
-    /// D3/Slice C: dereference one ref on a message already in the caller's
-    /// inbox ("it was mailed to me" -- `HarnessEngine::mail_fetch`'s own doc
-    /// comment). Authorization here is message membership, never the
-    /// caller's own lineage (`read_visibility`) -- see
-    /// `HARNESS_WRITE_TOOL_IDS`'s doc comment for why this otherwise-read
-    /// tool lives there rather than in `HARNESS_READ_TOOL_IDS`. A refusal
-    /// (not addressed to the caller, an out-of-range index, or a ref kind
-    /// C1 does not yet fetch) travels back as
-    /// `HarnessMailFetchResultV1::Refused`, never as a host error -- same
-    /// pattern as `MailSend`'s own named refusal.
-    MailFetch {
-        message_id: HarnessMailMessageId,
-        ref_index: u16,
-    },
     /// D5, Slice D: an agent creates a task under its own subtree --
     /// `parent_task_id: None` means "under my own task"; `Some` must name
     /// the caller's own task or a strict descendant of it (checked
@@ -6078,10 +5961,10 @@ pub enum HarnessReadRequestV1 {
     /// can. Gated by `grant.task_permissions.create`. Every refusal --
     /// unreachable parent, a terminal parent, or an invalid title/body/
     /// dependencies -- travels back as `HarnessTaskCreateResultV1`'s own
-    /// named variant, never a host error (the same discipline `MailSend`
-    /// established for mail). This bound is the coarse wire-level ceiling
-    /// only; the authoritative title/body rule is the engine's own
-    /// `HarnessTaskV1::validate()`, reached when the mutation applies.
+    /// named variant, never a host error. This bound is the coarse
+    /// wire-level ceiling only; the authoritative title/body rule is the
+    /// engine's own `HarnessTaskV1::validate()`, reached when the mutation
+    /// applies.
     TaskCreate {
         title: String,
         body: String,
@@ -6112,13 +5995,13 @@ pub enum HarnessReadRequestV1 {
     /// is): every session needs the ability to report its own work
     /// finished regardless of what else its grant allows, or nothing ever
     /// closes -- the exact structural gap this verb exists to close.
-    /// `summary`, when given, is posted as mail to the task's own forum
-    /// (`HarnessMailAddressV1::Task`) through the existing mail-send path,
-    /// never a new free-text result field; a mail failure never undoes the
-    /// finish, which is already committed by the time the mail is
-    /// attempted. Not idempotent: a second call against an already-terminal
-    /// run is refused by name as `HarnessRunFinishResultV1::AlreadyFinished`,
-    /// never silently accepted.
+    /// `summary` is accepted on the wire for backward compatibility but has
+    /// no effect: it used to be posted as mail to the task's own forum,
+    /// removed 2026-09-17 when the mailbox moved to its own service (see
+    /// `gate4agent-harness-service::read::execute_exact_binding_read`'s
+    /// `RunFinish` handler). Not idempotent: a second call against an
+    /// already-terminal run is refused by name as
+    /// `HarnessRunFinishResultV1::AlreadyFinished`, never silently accepted.
     RunFinish {
         outcome: HarnessRunFinishOutcomeV1,
         #[serde(default)]
@@ -6152,30 +6035,6 @@ impl HarnessReadRequestV1 {
             Self::TaskMove { task_id, expected_revision, .. } => {
                 task_id.validate().map_err(HarnessReadApiError::Protocol)?;
                 expected_revision.validate().map_err(HarnessReadApiError::Protocol)
-            }
-            Self::MailSend { to, subject, body, reply_to, refs } => {
-                to.validate().map_err(HarnessReadApiError::Protocol)?;
-                if subject.is_empty()
-                    || subject.len() > HARNESS_TITLE_MAX_BYTES
-                    || body.len() > HARNESS_BODY_MAX_BYTES
-                    || refs.len() > HARNESS_MAIL_REFS_MAX
-                {
-                    return Err(HarnessReadApiError::InvalidMailMessage);
-                }
-                if let Some(reply_to) = reply_to {
-                    reply_to.validate().map_err(HarnessReadApiError::Protocol)?;
-                }
-                for reference in refs {
-                    reference.validate().map_err(HarnessReadApiError::Protocol)?;
-                }
-                Ok(())
-            }
-            Self::MailInbox { limit, .. } => validate_limit(*limit, HARNESS_ENTITY_PAGE_LIMIT_MAX),
-            Self::MailAck { message_id } => {
-                message_id.validate().map_err(HarnessReadApiError::Protocol)
-            }
-            Self::MailFetch { message_id, .. } => {
-                message_id.validate().map_err(HarnessReadApiError::Protocol)
             }
             Self::TimelineRead { run_id, after_sequence, limit } => {
                 if let Some(run_id) = run_id {
@@ -6250,10 +6109,6 @@ pub enum HarnessReadResponseV1 {
     Runs(RunPageV1),
     Run(RedactedRunV1),
     Operation(RedactedOperationV1),
-    MailSend(HarnessMailSendResultV1),
-    MailInbox(HarnessMailInboxPageV1),
-    MailAck(HarnessMailAckResultV1),
-    MailFetch(HarnessMailFetchResultV1),
     TaskCreate(HarnessTaskCreateResultV1),
     TaskMove(HarnessTaskMoveResultV1),
     RunFinish(HarnessRunFinishResultV1),
@@ -6270,319 +6125,9 @@ impl HarnessReadResponseV1 {
             Self::Runs(value) => value.validate(),
             Self::Run(value) => value.validate(),
             Self::Operation(value) => value.validate(),
-            Self::MailSend(value) => value.validate(),
-            Self::MailInbox(value) => value.validate(),
-            Self::MailAck(value) => value.validate(),
-            Self::MailFetch(value) => value.validate(),
             Self::TaskCreate(value) => value.validate().map_err(HarnessReadApiError::Protocol),
             Self::TaskMove(value) => value.validate().map_err(HarnessReadApiError::Protocol),
             Self::RunFinish(value) => value.validate().map_err(HarnessReadApiError::Protocol),
-        }
-    }
-}
-
-/// The outcome of one `g4a_mail_send` call. A refusal is a domain answer,
-/// never a host error (D1's "an unknown, ended or unreachable recipient is a
-/// named refusal, never a silent drop"): `reason` is
-/// `HarnessEngineError`'s own `Display` text for `MailRecipientUnknown`/
-/// `MailRecipientEnded`/`MailPermissionDenied`, carried verbatim so the
-/// caller sees exactly what the engine refused and why.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum HarnessMailSendResultV1 {
-    Accepted { message_id: HarnessMailMessageId },
-    Refused { reason: String },
-}
-
-impl HarnessMailSendResultV1 {
-    pub fn validate(&self) -> Result<(), HarnessReadApiError> {
-        match self {
-            Self::Accepted { message_id } => {
-                message_id.validate().map_err(HarnessReadApiError::Protocol)
-            }
-            Self::Refused { reason } => {
-                if reason.is_empty()
-                    || reason.len() > HARNESS_MAIL_REFUSAL_REASON_MAX_BYTES
-                    || reason.chars().any(char::is_control)
-                {
-                    return Err(HarnessReadApiError::InvalidMailMessage);
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-/// One `g4a_mail_inbox` page entry: the envelope, whether the caller has
-/// acked it, and its `thread` -- the ids of every message in the transitive
-/// `reply_to` closure (S9: "threading needs no second concept"), bounded by
-/// `HARNESS_MAIL_THREAD_IDS_MAX`.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HarnessMailInboxEntryV1 {
-    pub message_id: HarnessMailMessageId,
-    pub from: HarnessRecordRef,
-    pub to: HarnessMailAddressV1,
-    pub subject: String,
-    pub body: String,
-    pub reply_to: Option<HarnessMailMessageId>,
-    pub task_id: Option<HarnessTaskId>,
-    /// Slice C's addition: what this message carries, so a reader sees what
-    /// is attached without dereferencing it -- bounded the same way the
-    /// message itself is, `HARNESS_MAIL_REFS_MAX`.
-    #[serde(default)]
-    pub refs: Vec<HarnessMailRefV1>,
-    pub created_at_unix_ms: u64,
-    pub acked: bool,
-    pub thread: Vec<HarnessMailMessageId>,
-}
-
-impl HarnessMailInboxEntryV1 {
-    pub fn validate(&self) -> Result<(), HarnessReadApiError> {
-        self.message_id.validate().map_err(HarnessReadApiError::Protocol)?;
-        self.from.validate().map_err(HarnessReadApiError::Protocol)?;
-        self.to.validate().map_err(HarnessReadApiError::Protocol)?;
-        if self.subject.is_empty()
-            || self.subject.len() > HARNESS_TITLE_MAX_BYTES
-            || self.body.len() > HARNESS_BODY_MAX_BYTES
-            || self.refs.len() > HARNESS_MAIL_REFS_MAX
-        {
-            return Err(HarnessReadApiError::InvalidMailMessage);
-        }
-        if let Some(reply_to) = &self.reply_to {
-            reply_to.validate().map_err(HarnessReadApiError::Protocol)?;
-        }
-        if let Some(task_id) = &self.task_id {
-            task_id.validate().map_err(HarnessReadApiError::Protocol)?;
-        }
-        for reference in &self.refs {
-            reference.validate().map_err(HarnessReadApiError::Protocol)?;
-        }
-        if self.created_at_unix_ms == 0 || self.thread.len() > usize::from(HARNESS_MAIL_THREAD_IDS_MAX) {
-            return Err(HarnessReadApiError::InvalidMailInbox);
-        }
-        for message_id in &self.thread {
-            message_id.validate().map_err(HarnessReadApiError::Protocol)?;
-        }
-        Ok(())
-    }
-}
-
-/// `g4a_mail_inbox`'s full reply, and the operator wire's `MailInbox` reply
-/// -- the same shape both doors read (`docs/gate4agent/plans/
-/// gate4agent-arc-mailbox-and-task-layer-2026-09-02.md` §3 Slice B).
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HarnessMailInboxPageV1 {
-    pub messages: Vec<HarnessMailInboxEntryV1>,
-    pub unacked: u64,
-}
-
-impl HarnessMailInboxPageV1 {
-    pub fn validate(&self) -> Result<(), HarnessReadApiError> {
-        if self.messages.len() > usize::from(HARNESS_ENTITY_PAGE_LIMIT_MAX) {
-            return Err(HarnessReadApiError::InvalidMailInbox);
-        }
-        for message in &self.messages {
-            message.validate()?;
-        }
-        Ok(())
-    }
-}
-
-/// `g4a_mail_ack`'s reply -- idempotent, so `acked` is `true` on every
-/// success (an already-acked message acks again as a no-op).
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HarnessMailAckResultV1 {
-    pub acked: bool,
-}
-
-impl HarnessMailAckResultV1 {
-    pub fn validate(&self) -> Result<(), HarnessReadApiError> { Ok(()) }
-}
-
-/// Bound on `HarnessMailFetchResultV1::MailRefWorkspaceAmbiguous.nodes` --
-/// generous for any real deployment (a workspace name registered on this
-/// many distinct connected nodes at once would itself be the anomaly worth
-/// investigating), and small enough that the list never threatens this
-/// wire's response-size bound the way an unbounded node roster could.
-pub const HARNESS_MAIL_FETCH_AMBIGUOUS_NODES_MAX: usize = 16;
-
-/// The outcome of one `g4a_mail_fetch` call (D3, Slice C). `Run` and
-/// `Result` are the two kinds C1 dereferences: `Run` returns the named run's
-/// redacted monitor projection plus a bounded timeline page -- the same
-/// shapes `g4a_monitor_get`/`g4a_timeline_read` already return, just reached
-/// through the mailed ref instead of the caller's own lineage; `Result`
-/// returns the redacted run record the result reference names. `ContextPack`
-/// (C2) is the mailed pack's own bytes, hex-encoded like every other raw
-/// byte payload this wire carries (`HarnessMcpReplyChunkHexV1`'s convention):
-/// `digest`/`id` mirror `HarnessResolvedContextPackReceiptV1`'s own fields,
-/// `byte_len` is the RAW (pre-hex) length, and `bytes_hex.len()` is always
-/// exactly `byte_len * 2`. `WorkspacePath` (C3) is the mailed file's own
-/// UTF-8 text verbatim (never hex -- there is no non-UTF-8 case to encode
-/// around, see below): `byte_len` is `text`'s own byte length, and `sha256`
-/// is the bare (no `sha256:` prefix) lowercase hex digest of `text`'s bytes,
-/// recomputed by the service against the mailed ref's own `sha256` before
-/// this is ever returned -- a mismatch is `MailedWorkspacePathDigestMismatch`
-/// instead. `Refused` carries `HarnessEngineError`'s own `Display` text
-/// verbatim for `MailNotForReader` (message not addressed to this reader) or
-/// `MailRefIndexOutOfRange` (no such ref on the message), or
-/// `gate4agent-harness-service`'s own text for a malformed mailed
-/// `WorkspacePath` ref (an invalid workspace or path identifier), a mailed
-/// `Run`/`Result` ref naming a run that no longer exists, or a malformed
-/// `Result` reference -- none of these name a bounded, reusable set of
-/// inputs the way the typed variants below do, so they stay prose. The
-/// remaining seven variants are named resolutions of a ref this side could
-/// not complete, each carrying its own inputs directly rather than a
-/// formatted string, the same pattern `HarnessMailSendResultV1` established
-/// for `Refused` alone. Two are `ContextPack` (C2)'s own:
-/// `MailRefContextPackUnknown` folds together the two moments nothing
-/// answers for a mailed pack's `digest` any more -- no run's own
-/// `context_pack` receipt carries it at the engine's scan time
-/// (`HarnessEngineError::MailRefTargetUnknown`, D3/Slice C's own resolution
-/// gate) and the pack having been evicted at the node by the time the fetch
-/// actually reaches it (`NodeFailureCode::UnknownContextPack`) -- both mean
-/// the identical thing to the caller, so both fold into this one variant;
-/// `MailedContextPackDigestMismatch` is the pack's own bytes not hashing to
-/// `digest` once fetched (`expected`/`recomputed` are `SpawnContextDigest`'s
-/// own `sha256:<64 hex>` rendering, unlike `WorkspacePath`'s bare hex,
-/// because a `ContextPack` ref's digest was always a `SpawnContextDigest` to
-/// begin with). The other five are `WorkspacePath` (C3)'s own, unchanged:
-/// `MailRefWorkspaceUnknown` (no connected node's runtime inventory
-/// registers `workspace`, or the node no longer does by the time the read
-/// reaches it), `MailRefWorkspaceAmbiguous` (more than one connected node
-/// does, named in `nodes`), `MailRefWorkspacePathUnknown` (the one node that
-/// does has no such file at `path`, or cannot read it),
-/// `MailedWorkspacePathContentNotFetchable` (the file exists but is not
-/// UTF-8, or exceeds the node's read bound -- `why` names which), and
-/// `MailedWorkspacePathDigestMismatch` (the file's own bytes do not hash to
-/// the digest the mailed ref named).
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum HarnessMailFetchResultV1 {
-    Run { monitor: SessionMonitorV1, timeline: TimelinePageV1 },
-    Result { run: RedactedRunV1 },
-    ContextPack { digest: String, id: String, byte_len: u32, bytes_hex: String },
-    WorkspacePath { workspace: String, path: String, byte_len: u32, sha256: String, text: String },
-    Refused { reason: String },
-    MailRefContextPackUnknown { digest: String },
-    MailedContextPackDigestMismatch { expected: String, recomputed: String },
-    MailRefWorkspaceUnknown { workspace: String },
-    MailRefWorkspaceAmbiguous { workspace: String, nodes: Vec<String> },
-    MailRefWorkspacePathUnknown { workspace: String, path: String },
-    MailedWorkspacePathContentNotFetchable { workspace: String, path: String, why: String },
-    MailedWorkspacePathDigestMismatch { expected: String, recomputed: String },
-}
-
-fn valid_mail_fetch_workspace(workspace: &str) -> bool {
-    valid_runtime_id(workspace, 128)
-}
-
-fn valid_mail_fetch_path(path: &str) -> bool {
-    !path.is_empty()
-        && path.len() <= HARNESS_RUN_GIT_PATH_MAX_BYTES
-        && !path.chars().any(char::is_control)
-}
-
-fn valid_mail_fetch_why(why: &str) -> bool {
-    !why.is_empty()
-        && why.len() <= HARNESS_MAIL_REFUSAL_REASON_MAX_BYTES
-        && !why.chars().any(char::is_control)
-}
-
-fn valid_bare_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(is_lower_hex)
-}
-
-impl HarnessMailFetchResultV1 {
-    pub fn validate(&self) -> Result<(), HarnessReadApiError> {
-        match self {
-            Self::Run { monitor, timeline } => {
-                monitor.validate()?;
-                timeline.validate()
-            }
-            Self::Result { run } => run.validate(),
-            Self::ContextPack { digest, id, byte_len, bytes_hex } => {
-                if !valid_sha256_digest(digest)
-                    || !valid_runtime_id(id, 128)
-                    || *byte_len == 0
-                    || *byte_len > HARNESS_CONTEXT_PACK_MAX_BYTES
-                    || bytes_hex.len() != (*byte_len as usize) * 2
-                    || !bytes_hex.bytes().all(is_lower_hex)
-                {
-                    return Err(HarnessReadApiError::InvalidMailFetch);
-                }
-                Ok(())
-            }
-            Self::WorkspacePath { workspace, path, byte_len, sha256, text } => {
-                if !valid_mail_fetch_workspace(workspace)
-                    || !valid_mail_fetch_path(path)
-                    || !valid_bare_sha256(sha256)
-                    || text.len() as u64 != u64::from(*byte_len)
-                {
-                    return Err(HarnessReadApiError::InvalidMailFetch);
-                }
-                Ok(())
-            }
-            Self::Refused { reason } => {
-                if reason.is_empty()
-                    || reason.len() > HARNESS_MAIL_REFUSAL_REASON_MAX_BYTES
-                    || reason.chars().any(char::is_control)
-                {
-                    return Err(HarnessReadApiError::InvalidMailFetch);
-                }
-                Ok(())
-            }
-            Self::MailRefContextPackUnknown { digest } => {
-                if !valid_sha256_digest(digest) {
-                    return Err(HarnessReadApiError::InvalidMailFetch);
-                }
-                Ok(())
-            }
-            Self::MailedContextPackDigestMismatch { expected, recomputed } => {
-                if !valid_sha256_digest(expected) || !valid_sha256_digest(recomputed) {
-                    return Err(HarnessReadApiError::InvalidMailFetch);
-                }
-                Ok(())
-            }
-            Self::MailRefWorkspaceUnknown { workspace } => {
-                if !valid_mail_fetch_workspace(workspace) {
-                    return Err(HarnessReadApiError::InvalidMailFetch);
-                }
-                Ok(())
-            }
-            Self::MailRefWorkspaceAmbiguous { workspace, nodes } => {
-                if !valid_mail_fetch_workspace(workspace)
-                    || nodes.len() < 2
-                    || nodes.len() > HARNESS_MAIL_FETCH_AMBIGUOUS_NODES_MAX
-                    || !nodes.iter().all(|node| valid_runtime_id(node, 128))
-                {
-                    return Err(HarnessReadApiError::InvalidMailFetch);
-                }
-                Ok(())
-            }
-            Self::MailRefWorkspacePathUnknown { workspace, path } => {
-                if !valid_mail_fetch_workspace(workspace) || !valid_mail_fetch_path(path) {
-                    return Err(HarnessReadApiError::InvalidMailFetch);
-                }
-                Ok(())
-            }
-            Self::MailedWorkspacePathContentNotFetchable { workspace, path, why } => {
-                if !valid_mail_fetch_workspace(workspace)
-                    || !valid_mail_fetch_path(path)
-                    || !valid_mail_fetch_why(why)
-                {
-                    return Err(HarnessReadApiError::InvalidMailFetch);
-                }
-                Ok(())
-            }
-            Self::MailedWorkspacePathDigestMismatch { expected, recomputed } => {
-                if !valid_bare_sha256(expected) || !valid_bare_sha256(recomputed) {
-                    return Err(HarnessReadApiError::InvalidMailFetch);
-                }
-                Ok(())
-            }
         }
     }
 }
@@ -6646,14 +6191,8 @@ pub struct SessionContextV1 {
     /// count` replaces `maximum_child_count` (see that field's doc comment).
     /// Nothing in this wire enforces an upper bound on this depth.
     pub child_task_subtree_depth: u64,
-    /// D1: whether this grant holds the mail permission -- the source
-    /// `expected_allowed_tool_ids` reads to decide whether the four
-    /// `g4a_mail_*` ids belong in `allowed_tool_ids`, the same way
-    /// `read_permissions`/`monitoring_visibility` decide the eight reads.
-    pub mail: bool,
     /// D5, Slice D: mirrors `grant.task_permissions.create` -- gates
-    /// `g4a_task_create` in `allowed_tool_ids`, the same wiring `mail`
-    /// already establishes for its own four siblings.
+    /// `g4a_task_create` in `allowed_tool_ids`.
     pub task_create: bool,
     /// D5, Slice D: mirrors `grant.task_permissions.mutate` -- gates
     /// `g4a_task_move` in `allowed_tool_ids`.
@@ -6727,9 +6266,6 @@ fn expected_allowed_tool_ids(context: &SessionContextV1) -> Vec<String> {
     }
     if context.read_permissions.operations != HarnessEntityReadScopeV1::None {
         tools.push("g4a_operation_get");
-    }
-    if context.mail {
-        tools.extend(["g4a_mail_send", "g4a_mail_inbox", "g4a_mail_ack", "g4a_mail_fetch"]);
     }
     if context.task_create {
         tools.push("g4a_task_create");
@@ -7483,12 +7019,6 @@ pub enum HarnessReadApiError {
     InvalidContextTask,
     #[error("harness read text field is invalid: {0}")]
     InvalidText(&'static str),
-    #[error("harness mail message is invalid")]
-    InvalidMailMessage,
-    #[error("harness mail inbox page is invalid")]
-    InvalidMailInbox,
-    #[error("harness mail fetch result is invalid")]
-    InvalidMailFetch,
     #[error("harness task create request is invalid")]
     InvalidTaskCreate,
     #[error("harness protocol value is invalid: {0}")]
@@ -10879,7 +10409,6 @@ mod tests {
             updated_at_unix_ms: 10,
             blocked_count: 0,
             last_blocked_at_ms: None,
-            unread_mail: 0,
         }
     }
 
@@ -11979,298 +11508,11 @@ mod tests {
         }
     }
 
-    /// D3/Slice C: `HarnessMailFetchResultV1` round-trips for all three
-    /// outcomes, and `Refused`'s reason string is bounded the same way
-    /// `HarnessMailSendResultV1::Refused`'s already is.
-    #[test]
-    fn mail_fetch_result_round_trips_for_run_result_and_refused() {
-        let run_result = HarnessMailFetchResultV1::Run {
-            monitor: monitor_with_mixed_capabilities(),
-            timeline: TimelinePageV1 {
-                run_id: HarnessRunId::new("hrun_000000000000000000000001").unwrap(),
-                availability: ProjectionAvailabilityV1::Current,
-                freshness: ProjectionFreshnessV1::Live,
-                transport_incomplete: false,
-                entries: Vec::new(),
-                next_cursor: None,
-            },
-        };
-        run_result.validate().unwrap();
-        let encoded = serde_json::to_string(&run_result).unwrap();
-        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), run_result);
-
-        let result_outcome = HarnessMailFetchResultV1::Result { run: sample_redacted_run('2') };
-        result_outcome.validate().unwrap();
-        let encoded = serde_json::to_string(&result_outcome).unwrap();
-        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), result_outcome);
-
-        let refused = HarnessMailFetchResultV1::Refused {
-            reason: "mail message hmail_000000000000000000000001 is not addressed to this reader".to_owned(),
-        };
-        refused.validate().unwrap();
-        let encoded = serde_json::to_string(&refused).unwrap();
-        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), refused);
-
-        let empty_reason = HarnessMailFetchResultV1::Refused { reason: String::new() };
-        assert!(matches!(empty_reason.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
-
-        let oversized_reason = HarnessMailFetchResultV1::Refused {
-            reason: "x".repeat(HARNESS_MAIL_REFUSAL_REASON_MAX_BYTES + 1),
-        };
-        assert!(matches!(oversized_reason.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
-    }
-
-    /// D3/Slice C2: `HarnessMailFetchResultV1::ContextPack` round-trips, and
-    /// `bytes_hex` must be exactly `byte_len * 2` lower-hex bytes -- a short
-    /// or long `bytes_hex` (declared length lying about the payload) is
-    /// `InvalidMailFetch`, the same shape every other length-declaring wire
-    /// value in this crate is checked.
-    #[test]
-    fn mail_fetch_result_context_pack_round_trips_and_bounds_bytes_hex_to_byte_len() {
-        let context_pack = HarnessMailFetchResultV1::ContextPack {
-            digest: format!("sha256:{}", "a".repeat(64)),
-            id: "ctx-deadbeef".to_owned(),
-            byte_len: 3,
-            bytes_hex: "0a1b2c".to_owned(),
-        };
-        context_pack.validate().unwrap();
-        let encoded = serde_json::to_string(&context_pack).unwrap();
-        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), context_pack);
-
-        let short_bytes_hex = HarnessMailFetchResultV1::ContextPack {
-            digest: format!("sha256:{}", "a".repeat(64)),
-            id: "ctx-deadbeef".to_owned(),
-            byte_len: 3,
-            bytes_hex: "0a1b".to_owned(),
-        };
-        assert!(matches!(short_bytes_hex.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
-
-        let long_bytes_hex = HarnessMailFetchResultV1::ContextPack {
-            digest: format!("sha256:{}", "a".repeat(64)),
-            id: "ctx-deadbeef".to_owned(),
-            byte_len: 3,
-            bytes_hex: "0a1b2c3d".to_owned(),
-        };
-        assert!(matches!(long_bytes_hex.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
-
-        let zero_byte_len = HarnessMailFetchResultV1::ContextPack {
-            digest: format!("sha256:{}", "a".repeat(64)),
-            id: "ctx-deadbeef".to_owned(),
-            byte_len: 0,
-            bytes_hex: String::new(),
-        };
-        assert!(matches!(zero_byte_len.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
-
-        let bad_digest = HarnessMailFetchResultV1::ContextPack {
-            digest: "not-a-digest".to_owned(),
-            id: "ctx-deadbeef".to_owned(),
-            byte_len: 3,
-            bytes_hex: "0a1b2c".to_owned(),
-        };
-        assert!(matches!(bad_digest.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
-    }
-
-    /// D3/Slice C2: the two named `ContextPack`-fetch refusals round-trip and
-    /// bound their own inputs to `SpawnContextDigest`'s own `sha256:<64 hex>`
-    /// rendering -- unlike `WorkspacePath`'s sibling refusals, whose digests
-    /// are bare (no `sha256:` prefix).
-    #[test]
-    fn mail_fetch_context_pack_refusals_round_trip_and_bound_their_inputs() {
-        let unknown = HarnessMailFetchResultV1::MailRefContextPackUnknown {
-            digest: format!("sha256:{}", "a".repeat(64)),
-        };
-        unknown.validate().unwrap();
-        let encoded = serde_json::to_string(&unknown).unwrap();
-        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), unknown);
-
-        let bare_digest = HarnessMailFetchResultV1::MailRefContextPackUnknown {
-            digest: "a".repeat(64),
-        };
-        assert!(matches!(bare_digest.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
-
-        let digest_mismatch = HarnessMailFetchResultV1::MailedContextPackDigestMismatch {
-            expected: format!("sha256:{}", "a".repeat(64)),
-            recomputed: format!("sha256:{}", "b".repeat(64)),
-        };
-        digest_mismatch.validate().unwrap();
-        let encoded = serde_json::to_string(&digest_mismatch).unwrap();
-        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), digest_mismatch);
-
-        let bare_mismatch = HarnessMailFetchResultV1::MailedContextPackDigestMismatch {
-            expected: "a".repeat(64),
-            recomputed: format!("sha256:{}", "b".repeat(64)),
-        };
-        assert!(matches!(bare_mismatch.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
-    }
-
-    /// D3/Slice C3: `HarnessMailFetchResultV1::WorkspacePath` round-trips,
-    /// `text.len()` must equal `byte_len` exactly (a lying declared length is
-    /// `InvalidMailFetch`, same shape as `ContextPack`'s `bytes_hex` bound),
-    /// and `sha256` must be a bare (unprefixed) 64-lowercase-hex digest --
-    /// unlike `ContextPack.digest`, which carries the `sha256:` prefix.
-    #[test]
-    fn mail_fetch_result_workspace_path_round_trips_and_bounds_text_to_byte_len() {
-        let workspace_path = HarnessMailFetchResultV1::WorkspacePath {
-            workspace: "primary".to_owned(),
-            path: "reports/handoff.md".to_owned(),
-            byte_len: 5,
-            sha256: "a".repeat(64),
-            text: "hello".to_owned(),
-        };
-        workspace_path.validate().unwrap();
-        let encoded = serde_json::to_string(&workspace_path).unwrap();
-        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), workspace_path);
-
-        let short_byte_len = HarnessMailFetchResultV1::WorkspacePath {
-            workspace: "primary".to_owned(),
-            path: "reports/handoff.md".to_owned(),
-            byte_len: 4,
-            sha256: "a".repeat(64),
-            text: "hello".to_owned(),
-        };
-        assert!(matches!(short_byte_len.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
-
-        let prefixed_digest = HarnessMailFetchResultV1::WorkspacePath {
-            workspace: "primary".to_owned(),
-            path: "reports/handoff.md".to_owned(),
-            byte_len: 5,
-            sha256: format!("sha256:{}", "a".repeat(64)),
-            text: "hello".to_owned(),
-        };
-        assert!(matches!(prefixed_digest.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
-
-        let empty_path = HarnessMailFetchResultV1::WorkspacePath {
-            workspace: "primary".to_owned(),
-            path: String::new(),
-            byte_len: 5,
-            sha256: "a".repeat(64),
-            text: "hello".to_owned(),
-        };
-        assert!(matches!(empty_path.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
-    }
-
-    /// D3/Slice C3: the five named `WorkspacePath`-fetch refusals round-trip
-    /// and bound their own inputs -- `MailRefWorkspaceAmbiguous.nodes` must
-    /// name at least two nodes (one node is not an ambiguity) and never more
-    /// than `HARNESS_MAIL_FETCH_AMBIGUOUS_NODES_MAX`.
-    #[test]
-    fn mail_fetch_workspace_path_refusals_round_trip_and_bound_their_inputs() {
-        let unknown = HarnessMailFetchResultV1::MailRefWorkspaceUnknown { workspace: "primary".to_owned() };
-        unknown.validate().unwrap();
-        let encoded = serde_json::to_string(&unknown).unwrap();
-        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), unknown);
-
-        let ambiguous = HarnessMailFetchResultV1::MailRefWorkspaceAmbiguous {
-            workspace: "primary".to_owned(),
-            nodes: vec!["node-a".to_owned(), "node-b".to_owned()],
-        };
-        ambiguous.validate().unwrap();
-        let encoded = serde_json::to_string(&ambiguous).unwrap();
-        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), ambiguous);
-
-        let one_node = HarnessMailFetchResultV1::MailRefWorkspaceAmbiguous {
-            workspace: "primary".to_owned(),
-            nodes: vec!["node-a".to_owned()],
-        };
-        assert!(matches!(one_node.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
-
-        let too_many_nodes = HarnessMailFetchResultV1::MailRefWorkspaceAmbiguous {
-            workspace: "primary".to_owned(),
-            nodes: (0..HARNESS_MAIL_FETCH_AMBIGUOUS_NODES_MAX + 1)
-                .map(|index| format!("node-{index}"))
-                .collect(),
-        };
-        assert!(matches!(too_many_nodes.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
-
-        let path_unknown = HarnessMailFetchResultV1::MailRefWorkspacePathUnknown {
-            workspace: "primary".to_owned(),
-            path: "reports/handoff.md".to_owned(),
-        };
-        path_unknown.validate().unwrap();
-        let encoded = serde_json::to_string(&path_unknown).unwrap();
-        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), path_unknown);
-
-        let not_fetchable = HarnessMailFetchResultV1::MailedWorkspacePathContentNotFetchable {
-            workspace: "primary".to_owned(),
-            path: "reports/handoff.md".to_owned(),
-            why: "file exceeds the 262144-byte limit".to_owned(),
-        };
-        not_fetchable.validate().unwrap();
-        let encoded = serde_json::to_string(&not_fetchable).unwrap();
-        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), not_fetchable);
-
-        let digest_mismatch = HarnessMailFetchResultV1::MailedWorkspacePathDigestMismatch {
-            expected: "a".repeat(64),
-            recomputed: "b".repeat(64),
-        };
-        digest_mismatch.validate().unwrap();
-        let encoded = serde_json::to_string(&digest_mismatch).unwrap();
-        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), digest_mismatch);
-
-        let prefixed_mismatch = HarnessMailFetchResultV1::MailedWorkspacePathDigestMismatch {
-            expected: format!("sha256:{}", "a".repeat(64)),
-            recomputed: "b".repeat(64),
-        };
-        assert!(matches!(prefixed_mismatch.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
-    }
-
-    /// C1: `HarnessMailInboxEntryV1` written before `refs` existed
-    /// deserializes with an empty ref list.
-    #[test]
-    fn mail_inbox_entry_old_shape_without_refs_deserializes() {
-        let old_shape = serde_json::json!({
-            "message_id": format!("hmail_{}", "1".repeat(24)),
-            "from": { "record_id": "record-a", "provider": "claude" },
-            "to": { "kind": "session", "record_id": "record-b" },
-            "subject": "status",
-            "body": "handing off the result",
-            "reply_to": null,
-            "task_id": null,
-            "created_at_unix_ms": 1_000,
-            "acked": false,
-            "thread": [],
-        });
-        let decoded: HarnessMailInboxEntryV1 = serde_json::from_value(old_shape).unwrap();
-        assert!(decoded.refs.is_empty());
-        decoded.validate().unwrap();
-    }
-
-    /// D3/Slice C: `MailSend` accepts `refs`, bounded by
-    /// `HARNESS_MAIL_REFS_MAX`, and an old-shape request (no `refs` key)
-    /// still validates.
-    #[test]
-    fn mail_send_request_accepts_bounded_refs_and_old_shape_defaults_empty() {
-        let run_id = HarnessRunId::new("hrun_000000000000000000000001").unwrap();
-        let request = HarnessReadRequestV1::MailSend {
-            to: HarnessMailAddressV1::Session { record_id: HarnessSelectorV1::new("record-b").unwrap() },
-            subject: "status".to_owned(),
-            body: "handing off the result".to_owned(),
-            reply_to: None,
-            refs: vec![HarnessMailRefV1::Run { run_id }],
-        };
-        request.validate().unwrap();
-
-        let old_shape = serde_json::json!({
-            "kind": "mail-send",
-            "to": { "kind": "session", "record_id": "record-b" },
-            "subject": "status",
-            "body": "handing off the result",
-            "reply_to": null,
-        });
-        let decoded: HarnessReadRequestV1 = serde_json::from_value(old_shape).unwrap();
-        match &decoded {
-            HarnessReadRequestV1::MailSend { refs, .. } => assert!(refs.is_empty()),
-            other => panic!("expected MailSend, got {other:?}"),
-        }
-        decoded.validate().unwrap();
-    }
-
     /// `TasksList`/`RunsList` gain a parent filter ("what did this task/run
-    /// spawn") additive over the pre-existing shape, the same
-    /// `#[serde(default)]` discipline `MailSend`'s own `refs` field
-    /// established above: an old-shape request with no `parent_task_id`/
-    /// `parent_run_id` key still decodes (defaulting to `None`), and a set
-    /// value round-trips. A malformed id can never reach `parent_task_id`/
+    /// spawn") additive over the pre-existing shape via `#[serde(default)]`:
+    /// an old-shape request with no `parent_task_id`/`parent_run_id` key
+    /// still decodes (defaulting to `None`), and a set value round-trips.
+    /// A malformed id can never reach `parent_task_id`/
     /// `parent_run_id` in the first place -- `HarnessTaskId::new`/
     /// `HarnessRunId::new` are the validation, refusing a malformed string
     /// before a request carrying one could ever be built (the CLI's own
@@ -12451,8 +11693,8 @@ mod tests {
 
     /// S10: `g4a_run_finish`'s wire request round-trips, `summary` defaults
     /// to `None` for a caller that omits it, and an oversized summary is a
-    /// named validation failure the same bound `g4a_mail_send`'s own `body`
-    /// already enforces.
+    /// named validation failure (`HARNESS_BODY_MAX_BYTES`, the same bound
+    /// task bodies enforce).
     #[test]
     fn run_finish_request_round_trips_and_bounds_summary() {
         let request = HarnessReadRequestV1::RunFinish {
@@ -12602,7 +11844,6 @@ mod tests {
             monitoring_visibility: HarnessMonitoringVisibilityV1::None,
             child_task_count: 0,
             child_task_subtree_depth: 0,
-            mail: false,
             task_create: false,
             task_mutate: false,
             allowed_tool_ids: vec!["g4a_context_get".to_owned(), "g4a_run_finish".to_owned()],
@@ -12613,10 +11854,9 @@ mod tests {
     }
 
     /// D5, Slice D: `expected_allowed_tool_ids` derives `g4a_task_create`/
-    /// `g4a_task_move` from `task_permissions.create`/`.mutate` exactly like
-    /// `mail` already derives its own four siblings -- create-only advertises
-    /// `g4a_task_create` alone, and a grant cannot claim a tool it was not
-    /// actually granted (`InvalidAllowedTools`).
+    /// `g4a_task_move` from `task_permissions.create`/`.mutate` -- create-only
+    /// advertises `g4a_task_create` alone, and a grant cannot claim a tool it
+    /// was not actually granted (`InvalidAllowedTools`).
     #[test]
     fn expected_allowed_tool_ids_derives_task_tools_from_task_permissions() {
         let base = base_session_context();

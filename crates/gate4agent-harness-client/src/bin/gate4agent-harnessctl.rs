@@ -14,8 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gate4agent_harness_client::{
     HarnessCreateTaskRequestV1, HarnessDeliveryBundleIdV1, HarnessDeliveryBundleSelectionV1,
-    HarnessExpectedExecutionSpecRevisionV1, HarnessIdempotencyRef, HarnessMailAckOperatorRequestV1,
-    HarnessMailMessageId, HarnessMailRefV1, HarnessMoveTaskRequestV1,
+    HarnessExpectedExecutionSpecRevisionV1, HarnessIdempotencyRef, HarnessMoveTaskRequestV1,
     HarnessOperationId, HarnessOperatorAuthorityV1, HarnessOperatorClient, HarnessOperatorCredential,
     HarnessOperatorMutationOutcomeV1, HarnessOrdinaryLaunchPlanOptionV1,
     HarnessReplaceTaskExecutionSpecRequestV2, HarnessReviewedTaskLaunchSelectionV1,
@@ -54,8 +53,6 @@ fn usage() -> &'static str {
      \x20 transfers RUN_ID\n\
      \x20 runtime-inventory [--after NODE_ID] [--limit N]\n\
      \x20 monitor RUN_ID\n\
-     \x20 mail inbox RECORD_ID [--since MS] [--limit N]\n\
-     \x20 mail ack RECORD_ID MESSAGE_ID\n\
      \x20 workspace inspect NODE_ID WORKSPACE_ID\n\
      \x20 session spawn NODE_ID WORKSPACE_ID PROVIDER [--profile ID] [--mode pty|inline|acp] [--rows N] [--cols N] [--approval moderate|full-auto|read-only|unmanaged]\n\
      \x20 session stop NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION [--force yes]\n\
@@ -128,8 +125,6 @@ enum Command {
     Transfers { run_id: HarnessRunId },
     RuntimeInventory { after: Option<String>, limit: u16 },
     Monitor { run_id: HarnessRunId },
-    MailInbox { record_id: HarnessSelectorV1, since_unix_ms: Option<u64>, limit: u16 },
-    MailAck { record_id: HarnessSelectorV1, message_id: HarnessMailMessageId },
     WorkspaceInspect { node_id: String, workspace_id: String },
     SessionSpawn {
         node_id: String,
@@ -177,8 +172,6 @@ enum Verb {
     Transfers,
     RuntimeInventory,
     Monitor,
-    MailInbox,
-    MailAck,
     WorkspaceInspect,
     SessionSpawn,
     SessionStop,
@@ -213,11 +206,6 @@ fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
         Some("transfers") => Ok((Verb::Transfers, 1)),
         Some("runtime-inventory") => Ok((Verb::RuntimeInventory, 1)),
         Some("monitor") => Ok((Verb::Monitor, 1)),
-        Some("mail") => match args.get(2).map(String::as_str) {
-            Some("inbox") => Ok((Verb::MailInbox, 2)),
-            Some("ack") => Ok((Verb::MailAck, 2)),
-            _ => Err(usage().to_owned()),
-        },
         Some("session") => match args.get(2).map(String::as_str) {
             Some("spawn") => Ok((Verb::SessionSpawn, 2)),
             Some("stop") => Ok((Verb::SessionStop, 2)),
@@ -384,31 +372,11 @@ fn parse_run_id(value: String) -> Result<HarnessRunId, String> {
     HarnessRunId::new(value).map_err(|_| "invalid run id".to_owned())
 }
 
-fn parse_record_id(value: String) -> Result<HarnessSelectorV1, String> {
-    HarnessSelectorV1::new(value).map_err(|_| "invalid record id".to_owned())
-}
-
 /// `--provider`/`--workspace`/`--plan`/`--after` on `launch-options` all name
 /// a `HarnessSelectorV1` (a provider id, workspace id, or plan id -- the
 /// three fields `HarnessOrdinaryLaunchPlanOptionV1` filters on).
 fn parse_selector(value: String) -> Result<HarnessSelectorV1, String> {
     HarnessSelectorV1::new(value.clone()).map_err(|_| format!("invalid selector value: {value}"))
-}
-
-fn parse_mail_message_id(value: String) -> Result<HarnessMailMessageId, String> {
-    HarnessMailMessageId::new(value).map_err(|_| "invalid mail message id".to_owned())
-}
-
-/// D3/Slice C: names one attached ref's kind for `mail inbox`'s one-line
-/// summary -- never the ref's own content (a run id, a digest, a path), just
-/// which of the four fixed kinds it is.
-fn mail_ref_kind_name(reference: &HarnessMailRefV1) -> &'static str {
-    match reference {
-        HarnessMailRefV1::Run { .. } => "run",
-        HarnessMailRefV1::ContextPack { .. } => "context-pack",
-        HarnessMailRefV1::Result { .. } => "result",
-        HarnessMailRefV1::WorkspacePath { .. } => "workspace-path",
-    }
 }
 
 fn parse_kebab<T: serde::de::DeserializeOwned>(value: &str, flag: &str) -> Result<T, String> {
@@ -540,21 +508,6 @@ fn build_command(
         Verb::Monitor => {
             let run_id = expect_single_positional(positionals, "run-id").and_then(parse_run_id)?;
             Ok(Command::Monitor { run_id })
-        }
-        Verb::MailInbox => {
-            let record_id = expect_single_positional(positionals, "record-id").and_then(parse_record_id)?;
-            let since_unix_ms = take_flag(flags, "since")
-                .map(|value| value.parse::<u64>().map_err(|_| "--since must be a u64".to_owned()))
-                .transpose()?;
-            let limit = parse_limit(flags, HARNESS_ENTITY_PAGE_LIMIT_MAX)?;
-            Ok(Command::MailInbox { record_id, since_unix_ms, limit })
-        }
-        Verb::MailAck => {
-            let (record_id, message_id) =
-                expect_two_positionals(positionals, ("record-id", "message-id"))?;
-            let record_id = parse_record_id(record_id)?;
-            let message_id = parse_mail_message_id(message_id)?;
-            Ok(Command::MailAck { record_id, message_id })
         }
         Verb::WorkspaceInspect => {
             let (node_id, workspace_id) =
@@ -1014,28 +967,6 @@ fn execute(invocation: Invocation) -> Result<String, String> {
         Command::Monitor { run_id } => {
             let monitor = client.monitor_get(run_id).map_err(|error| error.to_string())?;
             render(&monitor)
-        }
-        Command::MailInbox { record_id, since_unix_ms, limit } => {
-            let page = client
-                .mail_inbox(record_id, since_unix_ms, limit)
-                .map_err(|error| error.to_string())?;
-            let mut lines = Vec::with_capacity(page.messages.len() * 2 + 1);
-            for message in &page.messages {
-                lines.push(serde_json::to_string(message).map_err(|error| error.to_string())?);
-                if !message.refs.is_empty() {
-                    let kinds = message.refs.iter().map(mail_ref_kind_name).collect::<Vec<_>>().join(",");
-                    lines.push(format!("  refs[{}]: {kinds}", message.refs.len()));
-                }
-            }
-            lines.push(format!("{{\"unacked\":{}}}", page.unacked));
-            Ok(lines.join("\n"))
-        }
-        Command::MailAck { record_id, message_id } => {
-            let authority = fresh_authority()?;
-            let outcome = client
-                .ack_mail(HarnessMailAckOperatorRequestV1 { authority, record_id, message_id })
-                .map_err(|error| error.to_string())?;
-            render(&outcome)
         }
         Command::WorkspaceInspect { node_id, workspace_id } => {
             let inspection = client
@@ -1893,7 +1824,11 @@ mod tests {
 
     #[test]
     fn launch_options_filters_all_default_to_absent() {
-        let task_id = format!("htask_{}", "g".repeat(24));
+        // `g` is not a hex digit, so this id never parsed and the test
+        // panicked on the unwrap below instead of asserting anything about
+        // launch-option defaults. Pre-existing; fixed here because the crate
+        // was open anyway.
+        let task_id = format!("htask_{}", "a".repeat(24));
         let outcome = parse(
             &[
                 "gate4agent-harnessctl",

@@ -3,13 +3,13 @@
 use std::{io::{BufRead, Write}, net::SocketAddr};
 
 use gate4agent_harness_client::{
-    HarnessMailAddressV1, HarnessMailMessageId, HarnessMailRefV1, HarnessOperationId,
+    HarnessOperationId,
     HarnessReadClient,
     HarnessReadClientError, HarnessReadCredential, HarnessReadHostErrorV1, HarnessReadRequestV1,
     HarnessReadResponseV1,
     HarnessRevision, HarnessRunFinishOutcomeV1, HarnessRunId, HarnessRunLifecycleV1,
-    HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
-    SessionContextV1, HARNESS_MAIL_REFS_MAX, HARNESS_READ_REQUEST_MAX_BYTES,
+    HarnessTaskId, HarnessTaskStateV1,
+    SessionContextV1, HARNESS_READ_REQUEST_MAX_BYTES,
     HARNESS_READ_RESPONSE_MAX_BYTES,
     HARNESS_READ_TOOL_IDS, HARNESS_WRITE_TOOL_IDS,
 };
@@ -74,24 +74,6 @@ impl HarnessMcpBackend for HarnessReadClient {
             }
             HarnessMcpToolCall::OperationGet { operation_id } => {
                 HarnessReadResponseV1::Operation(self.operation_get(operation_id).map_err(HarnessMcpBackendError::from)?)
-            }
-            HarnessMcpToolCall::MailSend { to, subject, body, reply_to, refs } => {
-                HarnessReadResponseV1::MailSend(
-                    self.mail_send(to, subject, body, reply_to, refs).map_err(HarnessMcpBackendError::from)?,
-                )
-            }
-            HarnessMcpToolCall::MailInbox { since_unix_ms, limit } => {
-                HarnessReadResponseV1::MailInbox(
-                    self.mail_inbox(since_unix_ms, limit).map_err(HarnessMcpBackendError::from)?,
-                )
-            }
-            HarnessMcpToolCall::MailAck { message_id } => {
-                HarnessReadResponseV1::MailAck(self.mail_ack(message_id).map_err(HarnessMcpBackendError::from)?)
-            }
-            HarnessMcpToolCall::MailFetch { message_id, ref_index } => {
-                HarnessReadResponseV1::MailFetch(
-                    self.mail_fetch(message_id, ref_index).map_err(HarnessMcpBackendError::from)?,
-                )
             }
             HarnessMcpToolCall::TaskCreate { title, body, parent_task_id } => {
                 HarnessReadResponseV1::TaskCreate(
@@ -173,16 +155,6 @@ fn tool_call_request(call: HarnessMcpToolCall) -> HarnessReadRequestV1 {
         HarnessMcpToolCall::OperationGet { operation_id } => {
             HarnessReadRequestV1::OperationGet { operation_id }
         }
-        HarnessMcpToolCall::MailSend { to, subject, body, reply_to, refs } => {
-            HarnessReadRequestV1::MailSend { to, subject, body, reply_to, refs }
-        }
-        HarnessMcpToolCall::MailInbox { since_unix_ms, limit } => {
-            HarnessReadRequestV1::MailInbox { since_unix_ms, limit }
-        }
-        HarnessMcpToolCall::MailAck { message_id } => HarnessReadRequestV1::MailAck { message_id },
-        HarnessMcpToolCall::MailFetch { message_id, ref_index } => {
-            HarnessReadRequestV1::MailFetch { message_id, ref_index }
-        }
         HarnessMcpToolCall::TaskCreate { title, body, parent_task_id } => {
             HarnessReadRequestV1::TaskCreate { title, body, parent_task_id }
         }
@@ -225,16 +197,6 @@ pub enum HarnessMcpToolCall {
     },
     RunGet { run_id: HarnessRunId },
     OperationGet { operation_id: HarnessOperationId },
-    MailSend {
-        to: HarnessMailAddressV1,
-        subject: String,
-        body: String,
-        reply_to: Option<HarnessMailMessageId>,
-        refs: Vec<HarnessMailRefV1>,
-    },
-    MailInbox { since_unix_ms: Option<u64>, limit: u16 },
-    MailAck { message_id: HarnessMailMessageId },
-    MailFetch { message_id: HarnessMailMessageId, ref_index: u16 },
     TaskCreate {
         title: String,
         body: String,
@@ -823,33 +785,6 @@ struct OperationGetArgs { operation_id: String }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MailAddressArgs { session: Option<String>, task: Option<String> }
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MailSendArgs {
-    to: MailAddressArgs,
-    subject: String,
-    body: String,
-    reply_to: Option<String>,
-    #[serde(default)]
-    refs: Vec<HarnessMailRefV1>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MailInboxArgs { since_unix_ms: Option<u64>, #[serde(default = "default_limit")] limit: u16 }
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MailAckArgs { message_id: String }
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MailFetchArgs { message_id: String, ref_index: u16 }
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct TaskCreateArgs {
     title: String,
     body: String,
@@ -869,18 +804,6 @@ struct TaskMoveArgs {
 struct RunFinishArgs {
     outcome: HarnessRunFinishOutcomeV1,
     summary: Option<String>,
-}
-
-fn parse_mail_address(args: MailAddressArgs) -> Result<HarnessMailAddressV1, ()> {
-    match (args.session, args.task) {
-        (Some(record_id), None) => Ok(HarnessMailAddressV1::Session {
-            record_id: HarnessSelectorV1::new(record_id).map_err(|_| ())?,
-        }),
-        (None, Some(task_id)) => Ok(HarnessMailAddressV1::Task {
-            task_id: HarnessTaskId::new(task_id).map_err(|_| ())?,
-        }),
-        _ => Err(()),
-    }
 }
 
 /// Strip a leading MCP server-qualifier off a `tools/call` name, so a
@@ -955,34 +878,6 @@ fn parse_tool_call(name: &str, arguments: Value) -> Result<HarnessMcpToolCall, (
             let args: OperationGetArgs = serde_json::from_value(arguments).map_err(|_| ())?;
             Ok(HarnessMcpToolCall::OperationGet { operation_id: HarnessOperationId::new(args.operation_id).map_err(|_| ())? })
         }
-        "g4a_mail_send" => {
-            let args: MailSendArgs = serde_json::from_value(arguments).map_err(|_| ())?;
-            if args.refs.len() > HARNESS_MAIL_REFS_MAX { return Err(()); }
-            Ok(HarnessMcpToolCall::MailSend {
-                to: parse_mail_address(args.to)?,
-                subject: args.subject,
-                body: args.body,
-                reply_to: parse_optional(args.reply_to, HarnessMailMessageId::new)?,
-                refs: args.refs,
-            })
-        }
-        "g4a_mail_inbox" => {
-            let args: MailInboxArgs = serde_json::from_value(arguments).map_err(|_| ())?;
-            if !(1..=64).contains(&args.limit) { return Err(()); }
-            Ok(HarnessMcpToolCall::MailInbox { since_unix_ms: args.since_unix_ms, limit: args.limit })
-        }
-        "g4a_mail_ack" => {
-            let args: MailAckArgs = serde_json::from_value(arguments).map_err(|_| ())?;
-            Ok(HarnessMcpToolCall::MailAck { message_id: HarnessMailMessageId::new(args.message_id).map_err(|_| ())? })
-        }
-        "g4a_mail_fetch" => {
-            let args: MailFetchArgs = serde_json::from_value(arguments).map_err(|_| ())?;
-            if usize::from(args.ref_index) >= HARNESS_MAIL_REFS_MAX { return Err(()); }
-            Ok(HarnessMcpToolCall::MailFetch {
-                message_id: HarnessMailMessageId::new(args.message_id).map_err(|_| ())?,
-                ref_index: args.ref_index,
-            })
-        }
         "g4a_task_create" => {
             let args: TaskCreateArgs = serde_json::from_value(arguments).map_err(|_| ())?;
             Ok(HarnessMcpToolCall::TaskCreate {
@@ -1025,48 +920,8 @@ fn tool_definitions() -> Vec<Value> {
         // way the eight reads above are ordered to match `HARNESS_READ_TOOL_IDS`
         // -- `all_eight_tool_schemas_are_stable_and_closed` zips both.
         tool_with_hints(
-            "g4a_mail_ack",
-            "Acknowledge one mail message. Idempotent: acking an already-acked message succeeds again.",
-            object_schema(vec![("message_id", string_schema())], vec!["message_id"]),
-            false,
-            true,
-        ),
-        tool_with_hints(
-            "g4a_mail_fetch",
-            "Dereference one ref attached to a mail message already in this session's inbox. Authorized by message membership, not by this grant's own lineage. A Run ref returns a monitor projection plus a timeline page; a Result ref returns the redacted run record; a ContextPack ref returns its digest, id, byte_len, and its bytes as lower-hex (bytes_hex, exactly byte_len * 2 hex characters); a WorkspacePath ref returns its workspace, path, byte_len, bare-hex sha256, and its UTF-8 text verbatim; anything else refuses by name.",
-            object_schema(vec![
-                ("message_id", string_schema()),
-                ("ref_index", integer_schema(0, HARNESS_MAIL_REFS_MAX as u64 - 1)),
-            ], vec!["message_id", "ref_index"]),
-            true,
-            true,
-        ),
-        tool_with_hints(
-            "g4a_mail_inbox",
-            "Read waiting mail addressed to this session or to a task it can see.",
-            object_schema(vec![
-                ("since_unix_ms", integer_schema(1, u64::MAX)),
-                ("limit", integer_schema(1, 64)),
-            ], vec![]),
-            true,
-            true,
-        ),
-        tool_with_hints(
-            "g4a_mail_send",
-            "Send mail to a session record or a task's forum. Returns the queued message id or the engine's named refusal.",
-            object_schema(vec![
-                ("to", mail_address_schema()),
-                ("subject", title_schema()),
-                ("body", body_schema()),
-                ("reply_to", string_schema()),
-                ("refs", mail_refs_schema()),
-            ], vec!["to", "subject", "body"]),
-            false,
-            false,
-        ),
-        tool_with_hints(
             "g4a_run_finish",
-            "Report this session's OWN run finished -- there is no run-id argument, only the caller's own run. `done` moves the run to Completed and its task to Review (never Done -- an operator must still review it); `failed` moves both to Failed and records a retryable failure. Not idempotent: a second call against an already-finished run is refused by name as already-finished, not repeated as a no-op. `summary`, when given, is posted as mail to the task's own forum; a mail failure never undoes the finish.",
+            "Report this session's OWN run finished -- there is no run-id argument, only the caller's own run. `done` moves the run to Completed and its task to Review (never Done -- an operator must still review it); `failed` moves both to Failed and records a retryable failure. Not idempotent: a second call against an already-finished run is refused by name as already-finished, not repeated as a no-op. `summary` is accepted but has no effect.",
             object_schema(vec![
                 ("outcome", enum_schema(&["done", "failed"])),
                 ("summary", body_schema()),
@@ -1133,60 +988,6 @@ fn integer_schema(minimum: u64, maximum: u64) -> Value { json!({ "type": "intege
 fn enum_schema(values: &[&str]) -> Value { json!({ "type": "string", "enum": values }) }
 fn title_schema() -> Value { json!({ "type": "string", "minLength": 1, "maxLength": 256 }) }
 fn body_schema() -> Value { json!({ "type": "string", "maxLength": 8_192 }) }
-fn mail_address_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": { "session": string_schema(), "task": string_schema() },
-        "additionalProperties": false
-    })
-}
-/// A ref field's own text can run longer than `string_schema`'s 128-byte
-/// tool-argument convention (a workspace-relative `path`, in particular).
-/// This is advisory only -- `HarnessMailRefV1::validate()` (harness-protocol)
-/// is the authoritative bound each field is actually checked against; this
-/// schema only needs to not reject something that would otherwise validate.
-fn mail_ref_text_schema() -> Value { json!({ "type": "string", "minLength": 1, "maxLength": 2_048 }) }
-
-/// One `HarnessMailRefV1`, deserialized straight off the protocol's own
-/// `#[serde(tag = "kind")]` shape (D3): four fixed kinds, so a `oneOf` over
-/// their exact shapes is closed and stable, unlike `mail_address_schema`'s
-/// deliberately simplified two-key surface (that address has only two
-/// shapes and no internal tag to begin with).
-fn mail_ref_schema() -> Value {
-    json!({
-        "type": "object",
-        "oneOf": [
-            {
-                "properties": { "kind": { "const": "run" }, "run_id": mail_ref_text_schema() },
-                "required": ["kind", "run_id"],
-                "additionalProperties": false,
-            },
-            {
-                "properties": { "kind": { "const": "context-pack" }, "digest": mail_ref_text_schema() },
-                "required": ["kind", "digest"],
-                "additionalProperties": false,
-            },
-            {
-                "properties": { "kind": { "const": "result" }, "result_ref": mail_ref_text_schema() },
-                "required": ["kind", "result_ref"],
-                "additionalProperties": false,
-            },
-            {
-                "properties": {
-                    "kind": { "const": "workspace-path" },
-                    "workspace": mail_ref_text_schema(),
-                    "path": mail_ref_text_schema(),
-                    "sha256": mail_ref_text_schema(),
-                },
-                "required": ["kind", "workspace", "path", "sha256"],
-                "additionalProperties": false,
-            },
-        ],
-    })
-}
-fn mail_refs_schema() -> Value {
-    json!({ "type": "array", "items": mail_ref_schema(), "maxItems": HARNESS_MAIL_REFS_MAX })
-}
 fn empty_object() -> Value { json!({}) }
 fn default_limit() -> u16 { DEFAULT_LIMIT }
 
@@ -1266,7 +1067,7 @@ mod tests {
         call_error: Cell<Option<HarnessMcpBackendError>>,
         tasks_enabled: Cell<bool>,
         own_task_present: Cell<bool>,
-        mail_enabled: Cell<bool>,
+        task_create_enabled: Cell<bool>,
     }
 
     /// The calling run's own task, returned only when `own_task_present` is set.
@@ -1347,8 +1148,7 @@ mod tests {
                 monitoring_visibility: HarnessMonitoringVisibilityV1::None,
                 child_task_count: 0,
                 child_task_subtree_depth: 0,
-                mail: self.mail_enabled.get(),
-                task_create: false,
+                task_create: self.task_create_enabled.get(),
                 task_mutate: false,
                 allowed_tool_ids: self.allowed.borrow().clone(),
                 history_message_count: None,
@@ -1391,7 +1191,7 @@ mod tests {
             call_error: Cell::new(None),
             tasks_enabled: Cell::new(true),
             own_task_present: Cell::new(false),
-            mail_enabled: Cell::new(false),
+            task_create_enabled: Cell::new(false),
         }
     }
 
@@ -1543,58 +1343,6 @@ mod tests {
         }
     }
 
-    /// D3/Slice C: `g4a_mail_fetch` parses a valid call, refuses an
-    /// out-of-range `ref_index` before ever reaching the backend, and
-    /// `g4a_mail_send` carries `refs` end to end (parse -> tool call ->
-    /// wire request), all bounded by `HARNESS_MAIL_REFS_MAX`.
-    #[test]
-    fn mail_fetch_parses_and_rejects_out_of_range_index_before_the_backend() {
-        let message_id = format!("hmail_{}", "1".repeat(24));
-        let call = parse_tool_call(
-            "g4a_mail_fetch",
-            json!({ "message_id": message_id, "ref_index": 0 }),
-        ).unwrap();
-        assert_eq!(
-            call,
-            HarnessMcpToolCall::MailFetch {
-                message_id: HarnessMailMessageId::new(format!("hmail_{}", "1".repeat(24))).unwrap(),
-                ref_index: 0,
-            },
-        );
-        assert!(parse_tool_call(
-            "g4a_mail_fetch",
-            json!({ "message_id": format!("hmail_{}", "1".repeat(24)), "ref_index": HARNESS_MAIL_REFS_MAX as u64 }),
-        ).is_err());
-
-        let run_id = format!("hrun_{}", "2".repeat(24));
-        let send_call = parse_tool_call(
-            "g4a_mail_send",
-            json!({
-                "to": { "session": "record-b" },
-                "subject": "status",
-                "body": "handing off",
-                "refs": [{ "kind": "run", "run_id": run_id }],
-            }),
-        ).unwrap();
-        match send_call {
-            HarnessMcpToolCall::MailSend { refs, .. } => assert_eq!(refs.len(), 1),
-            other => panic!("expected MailSend, got {other:?}"),
-        }
-
-        let too_many_refs = (0..HARNESS_MAIL_REFS_MAX + 1)
-            .map(|_| json!({ "kind": "run", "run_id": format!("hrun_{}", "2".repeat(24)) }))
-            .collect::<Vec<_>>();
-        assert!(parse_tool_call(
-            "g4a_mail_send",
-            json!({
-                "to": { "session": "record-b" },
-                "subject": "status",
-                "body": "handing off",
-                "refs": too_many_refs,
-            }),
-        ).is_err());
-    }
-
     /// S10: `g4a_run_finish` is listed with a closed schema naming `outcome`
     /// as the only required argument, its arguments parse into
     /// `HarnessMcpToolCall::RunFinish` with `summary` defaulting to `None`
@@ -1644,9 +1392,8 @@ mod tests {
     /// not_found_and_object_denial_is_generic` above already exercises for a
     /// legitimate-but-ungranted tool id.
     #[test]
-    fn d7_no_tool_reaches_resolve_interaction_and_write_tool_ids_are_exactly_mail_task_and_run() {
+    fn d7_no_tool_reaches_resolve_interaction_and_write_tool_ids_are_exactly_task_and_run() {
         assert_eq!(HARNESS_WRITE_TOOL_IDS, [
-            "g4a_mail_ack", "g4a_mail_fetch", "g4a_mail_inbox", "g4a_mail_send",
             "g4a_run_finish", "g4a_task_create", "g4a_task_move",
         ]);
         assert!(HARNESS_READ_TOOL_IDS.iter().chain(HARNESS_WRITE_TOOL_IDS.iter()).all(|id| {
@@ -1665,7 +1412,7 @@ mod tests {
 
     #[test]
     fn strip_server_prefix_strips_the_longer_prefix_first_and_leaves_bare_names_alone() {
-        assert_eq!(strip_server_prefix("mcp__gate4agent__g4a_mail_inbox"), "g4a_mail_inbox");
+        assert_eq!(strip_server_prefix("mcp__gate4agent__g4a_task_create"), "g4a_task_create");
         assert_eq!(strip_server_prefix("gate4agent__g4a_context_get"), "g4a_context_get");
         assert_eq!(strip_server_prefix("g4a_context_get"), "g4a_context_get");
         assert_eq!(strip_server_prefix("foo__g4a_context_get"), "foo__g4a_context_get");
@@ -1683,20 +1430,16 @@ mod tests {
     fn server_qualified_tool_names_resolve_to_the_bare_id() {
         let mut server = HarnessMcpServer::new(fixture());
         initialize(&mut server);
-        // Turn on the mail grant (and off the unrelated tasks grant) so
-        // `g4a_mail_inbox` joins `allowed_tool_ids` -- `SessionContextV1::
+        // Turn on the task-create grant (and off the unrelated tasks grant)
+        // so `g4a_task_create` joins `allowed_tool_ids` -- `SessionContextV1::
         // validate` requires that list to equal exactly the ids the
-        // context's own flags derive, so it must carry every mail id once
-        // `mail` is on, not just the one this test calls.
+        // context's own flags derive.
         server.backend.tasks_enabled.set(false);
-        server.backend.mail_enabled.set(true);
+        server.backend.task_create_enabled.set(true);
         server.backend.allowed.replace(vec![
             "g4a_context_get".to_owned(),
-            "g4a_mail_ack".to_owned(),
-            "g4a_mail_fetch".to_owned(),
-            "g4a_mail_inbox".to_owned(),
-            "g4a_mail_send".to_owned(),
             "g4a_run_finish".to_owned(),
+            "g4a_task_create".to_owned(),
         ]);
 
         // A bare id is unaffected -- codex/kimi/claude's own shape.
@@ -1717,14 +1460,14 @@ mod tests {
         let response: Value = serde_json::from_str(text).unwrap();
         assert_eq!(response["kind"], "context");
 
-        // `mcp__gate4agent__g4a_mail_inbox` resolves to `g4a_mail_inbox` --
-        // it clears the allow-list and tool-id checks and reaches the
+        // `mcp__gate4agent__g4a_task_create` resolves to `g4a_task_create`
+        // -- it clears the allow-list and tool-id checks and reaches the
         // backend (this fixture doesn't implement the call, so it comes
         // back as a business-level refusal, never a protocol-level
         // "method not found").
         let mcp_qualified = request(&mut server, json!({
             "jsonrpc":"2.0","id":4,"method":"tools/call",
-            "params":{"name":"mcp__gate4agent__g4a_mail_inbox","arguments":{}}
+            "params":{"name":"mcp__gate4agent__g4a_task_create","arguments":{}}
         }));
         assert!(mcp_qualified.get("error").is_none());
         assert_eq!(mcp_qualified["result"]["isError"], true);

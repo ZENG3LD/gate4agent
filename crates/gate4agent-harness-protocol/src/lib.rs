@@ -33,18 +33,12 @@ pub const HARNESS_CONTEXT_PACK_RETAINED_MESSAGES_MAX: u64 = 256;
 pub const HARNESS_SCHEDULER_SCAN_MAX: usize = 8_192;
 pub const HARNESS_DELIVERY_COMPONENT_KINDS_MAX: usize = 9;
 pub const HARNESS_DELIVERY_COMPONENTS_MAX: u32 = 4_096;
-/// Bound on `HarnessMailMessageV1.refs` (D3, C1): a message names a handful
-/// of dereferenceable results, never a manifest -- the mailbox stays S9's
-/// "bounded text, or an artifact reference plus hash", plural but small.
-pub const HARNESS_MAIL_REFS_MAX: usize = 8;
 /// Bound on `HarnessTaskCreateResultV1`/`HarnessTaskMoveResultV1`'s own
 /// `why` fields (D5, Slice D). The value they carry is always a short,
 /// fixed-format `HarnessValidationError` `Display` rendering, never
 /// arbitrary caller-supplied prose, but this side still bounds it
 /// defensively -- the same 256-byte ceiling `HARNESS_TITLE_MAX_BYTES`
-/// already holds a task title to, and the same discipline
-/// `HarnessMailSendResultV1::Refused.reason` (`gate4agent-harness-api`)
-/// applies to `HarnessEngineError`'s own text.
+/// already holds a task title to.
 pub const HARNESS_TASK_RESULT_WHY_MAX_BYTES: usize = 256;
 
 macro_rules! opaque_id {
@@ -108,7 +102,6 @@ opaque_id!(HarnessDeliveryRef, "hdelivery_", "delivery reference");
 opaque_id!(HarnessContinuationRef, "hcontinuation_", "continuation reference");
 opaque_id!(HarnessExecutionSpecId, "hespec_", "execution specification id");
 opaque_id!(HarnessTaskLaunchIssuanceId, "hissue_", "task launch issuance id");
-opaque_id!(HarnessMailMessageId, "hmail_", "mail message id");
 
 impl HarnessResultRef {
     /// Derives the result reference for `run_id` by reprefixing its hex
@@ -405,16 +398,12 @@ impl HarnessRetryTaskRequestV1 {
 /// own task by default -- the tool's contract), never system-wide the way
 /// the operator's own `HarnessCreateTaskRequestV1` can. `Created` names the
 /// minted id and its first revision; every other variant is a named
-/// refusal, never prose -- the same discipline `HarnessMailSendResultV1`
-/// (`gate4agent-harness-api`) established for mail, carried one step
-/// further: each refusal is its own variant with its own typed fields
-/// rather than one `Refused { reason }` catch-all. `TitleInvalid` /
+/// refusal, never prose: each refusal is its own variant with its own typed
+/// fields rather than one `Refused { reason }` catch-all. `TitleInvalid` /
 /// `BodyInvalid` / `DependenciesInvalid` carry `why` -- the underlying
 /// `HarnessValidationError`'s own `Display` text for `InvalidTitle` /
 /// `InvalidBody` / (`SelfLink`, `CollectionTooLarge`, or
-/// `CollectionNotCanonical` on `dependencies`) respectively, verbatim, the
-/// same convention `HarnessMailSendResultV1::Refused.reason` established
-/// for `HarnessEngineError`'s text.
+/// `CollectionNotCanonical` on `dependencies`) respectively, verbatim.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessTaskCreateResultV1 {
@@ -2355,7 +2344,7 @@ impl HarnessReadPermissionsV1 {
 /// `mutate: false` rather than failing closed on the whole record -- the
 /// rule since 2026-09-05: a persisted type gains a field only behind
 /// `#[serde(default)]`, proven by a test deserializing the pre-Slice-D
-/// shape (the same discipline `SessionGrantV1.mail` already established).
+/// shape (the same discipline `read_permissions` already established).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessTaskPermissionsV1 {
@@ -2411,8 +2400,7 @@ impl HarnessGrantTargetV1 {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SessionGrantV1 {
     pub grant_id: SessionGrantId,
     pub revision: HarnessRevision,
@@ -2427,18 +2415,66 @@ pub struct SessionGrantV1 {
     pub read_permissions: HarnessReadPermissionsV1,
     pub monitoring_visibility: HarnessMonitoringVisibilityV1,
     pub context_permissions: HarnessContextPermissionsV1,
-    /// Whether a session bound to this grant may use the mailbox
-    /// (`g4a_mail_send` / `g4a_mail_inbox` / `g4a_mail_ack`, see
-    /// `allowed_tool_ids`). `#[serde(default)]` so a grant persisted before
-    /// this field existed decodes with `mail: false` rather than failing
-    /// closed on the whole record (the rule since 2026-09-05: a persisted
-    /// type gains a field only behind `#[serde(default)]`, proven by a test
-    /// deserializing the pre-mail shape).
-    #[serde(default)]
-    pub mail: bool,
     pub state: SessionGrantStateV1,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
+}
+
+/// Forward migration off the mailbox permission bit (removed 2026-09-17: the
+/// mailbox moved to its own service, see `gate4agent/CLAUDE.md`). Mirrors
+/// `SessionGrantV1` field-for-field plus the retired `mail` flag so a grant
+/// persisted while that field still existed keeps decoding under
+/// `deny_unknown_fields` instead of failing to load; the value itself is
+/// read once (to prove it decoded) and then dropped -- `SessionGrantV1` has
+/// nothing left to carry it in.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionGrantWireV1 {
+    grant_id: SessionGrantId,
+    revision: HarnessRevision,
+    actor_run_id: HarnessRunId,
+    allowed_targets: Vec<HarnessGrantTargetV1>,
+    allowed_delivery_bundles: Vec<HarnessSelectorV1>,
+    maximum_child_count: u16,
+    maximum_child_depth: u16,
+    operation_timeouts: HarnessOperationTimeoutsV1,
+    task_permissions: HarnessTaskPermissionsV1,
+    #[serde(default)]
+    read_permissions: HarnessReadPermissionsV1,
+    monitoring_visibility: HarnessMonitoringVisibilityV1,
+    context_permissions: HarnessContextPermissionsV1,
+    #[serde(default)]
+    mail: bool,
+    state: SessionGrantStateV1,
+    created_at_unix_ms: u64,
+    updated_at_unix_ms: u64,
+}
+
+impl<'de> Deserialize<'de> for SessionGrantV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SessionGrantWireV1::deserialize(deserializer)?;
+        let _retired_mail_bit = wire.mail;
+        Ok(Self {
+            grant_id: wire.grant_id,
+            revision: wire.revision,
+            actor_run_id: wire.actor_run_id,
+            allowed_targets: wire.allowed_targets,
+            allowed_delivery_bundles: wire.allowed_delivery_bundles,
+            maximum_child_count: wire.maximum_child_count,
+            maximum_child_depth: wire.maximum_child_depth,
+            operation_timeouts: wire.operation_timeouts,
+            task_permissions: wire.task_permissions,
+            read_permissions: wire.read_permissions,
+            monitoring_visibility: wire.monitoring_visibility,
+            context_permissions: wire.context_permissions,
+            state: wire.state,
+            created_at_unix_ms: wire.created_at_unix_ms,
+            updated_at_unix_ms: wire.updated_at_unix_ms,
+        })
+    }
 }
 
 impl SessionGrantV1 {
@@ -2550,11 +2586,6 @@ impl SessionGrantV1 {
             },
             monitoring_visibility: HarnessMonitoringVisibilityV1::Timeline,
             context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
-            // The fleet's default grant may write mail: the mailbox arc
-            // (gate4agent-arc-mailbox-and-task-layer, D1) exists precisely so
-            // an ACP/inline session dispatched under this default can reach
-            // g4a_mail_send/inbox/ack; it stays read-only on every other axis.
-            mail: true,
             state: SessionGrantStateV1::Active,
             created_at_unix_ms: now_unix_ms,
             updated_at_unix_ms: now_unix_ms,
@@ -2578,8 +2609,6 @@ pub enum HarnessOperationKindV1 {
     RecordRunContextPack,
     RecordRunGitFacts,
     RecordTaskResultRef,
-    SendMail,
-    AckMail,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -2710,172 +2739,9 @@ impl HarnessOperationV1 {
             HarnessOperationKindV1::CreateGrant => self.task_id.is_none() && self.run_id.is_none() && self.grant_id.is_some() && self.reconciles_operation_id.is_none() && self.expected_revision.is_none(),
             HarnessOperationKindV1::MutateGrant | HarnessOperationKindV1::RevokeGrant => self.task_id.is_none() && self.run_id.is_none() && self.grant_id.is_some() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
             HarnessOperationKindV1::Reconcile => self.task_id.is_none() && self.run_id.is_some() && self.grant_id.is_none() && self.reconciles_operation_id.is_some() && self.expected_revision.is_some(),
-            // The authorizing grant, never the mail message itself (there is
-            // no operation field for a message id) -- `grant_id` here names
-            // *whose* mail permission authorized the send/ack, not an entity
-            // being created or mutated the way CreateGrant/MutateGrant use it.
-            HarnessOperationKindV1::SendMail | HarnessOperationKindV1::AckMail => self.task_id.is_none() && self.run_id.is_none() && self.grant_id.is_some() && self.reconciles_operation_id.is_none() && self.expected_revision.is_none(),
         };
         if !valid {
             return Err(HarnessValidationError::InvalidOperationTarget);
-        }
-        Ok(())
-    }
-}
-
-/// Sender identity carried on a mail envelope. Named again here rather than
-/// reused from `ManagedSessionRecord` (`node-protocol`) for the same reason
-/// `HarnessApprovalLevelV1` mirrors `ApprovalLevel`: this crate takes no
-/// dependency outside its own bounded domain contract.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HarnessRecordRef {
-    pub record_id: HarnessSelectorV1,
-    pub provider: HarnessSelectorV1,
-}
-
-impl HarnessRecordRef {
-    pub fn validate(&self) -> Result<(), HarnessValidationError> {
-        self.record_id.validate()?;
-        self.provider.validate()
-    }
-}
-
-/// Topic addressing (D8): direct mail to a session record, or a forum
-/// message to every grant that can currently read `task_id`
-/// (`HarnessEngine::read_visibility`). Never both -- a message has exactly
-/// one addressee shape.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum HarnessMailAddressV1 {
-    Session { record_id: HarnessSelectorV1 },
-    Task { task_id: HarnessTaskId },
-}
-
-impl HarnessMailAddressV1 {
-    pub fn validate(&self) -> Result<(), HarnessValidationError> {
-        match self {
-            Self::Session { record_id } => record_id.validate(),
-            Self::Task { task_id } => task_id.validate(),
-        }
-    }
-}
-
-/// D3/C1: what one mailed reference names. All four variants are defined now
-/// so the wire is stable even though only `Run`/`Result` are fetchable today
-/// (`HarnessEngine::mail_fetch` refuses `ContextPack`/`WorkspacePath` by name,
-/// `MailRefKindNotYetFetchable` -- C2/C3 wire them). `WorkspacePath.sha256` is
-/// a bare lowercase hex digest of the file's bytes (no `sha256:` prefix,
-/// unlike `ContextPack.digest`, which reuses the context-pack digest scheme
-/// verbatim since it names the same kind of object).
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum HarnessMailRefV1 {
-    Run { run_id: HarnessRunId },
-    ContextPack { digest: String },
-    Result { result_ref: HarnessResultRef },
-    WorkspacePath {
-        workspace: HarnessSelectorV1,
-        path: String,
-        sha256: String,
-    },
-}
-
-impl HarnessMailRefV1 {
-    pub fn validate(&self) -> Result<(), HarnessValidationError> {
-        match self {
-            Self::Run { run_id } => run_id.validate(),
-            Self::ContextPack { digest } => validate_context_digest(digest),
-            Self::Result { result_ref } => result_ref.validate(),
-            Self::WorkspacePath { workspace, path, sha256 } => {
-                workspace.validate()?;
-                if path.is_empty()
-                    || path.len() > HARNESS_RUN_GIT_PATH_MAX_BYTES
-                    || path.chars().any(char::is_control)
-                {
-                    return Err(HarnessValidationError::InvalidMailRef { field: "workspace path" });
-                }
-                validate_lower_hex("workspace path sha256", sha256, 64)
-                    .map_err(|_| HarnessValidationError::InvalidMailRef { field: "workspace path sha256" })
-            }
-        }
-    }
-}
-
-/// S9's envelope, unchanged: sender, recipient, `reply_to`, bounded text.
-/// `subject` reuses the task title bound (`HARNESS_TITLE_MAX_BYTES` via
-/// `validate_title`) and `body` reuses the task body bound
-/// (`HARNESS_BODY_MAX_BYTES` via `validate_body`) -- no new size constant.
-/// `task_id` is correlation only: the harness never reads it to decide
-/// anything (D5); it exists so a panel can group mail by task.
-/// `refs` is C1's addition to an already-persisted, already-shipped shape --
-/// `#[serde(default)]` so a message written before this change (SQLite
-/// `payload` blob, or an in-flight `g4a_mail_send` caller) still deserializes
-/// with an empty ref list, never a decode failure.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HarnessMailMessageV1 {
-    pub message_id: HarnessMailMessageId,
-    pub from: HarnessRecordRef,
-    pub to: HarnessMailAddressV1,
-    pub subject: String,
-    pub body: String,
-    pub reply_to: Option<HarnessMailMessageId>,
-    pub task_id: Option<HarnessTaskId>,
-    #[serde(default)]
-    pub refs: Vec<HarnessMailRefV1>,
-    pub created_at_unix_ms: u64,
-}
-
-impl HarnessMailMessageV1 {
-    pub fn validate(&self) -> Result<(), HarnessValidationError> {
-        self.message_id.validate()?;
-        self.from.validate()?;
-        self.to.validate()?;
-        validate_title(&self.subject)?;
-        validate_body(&self.body)?;
-        if let Some(reply_to) = &self.reply_to {
-            reply_to.validate()?;
-            if reply_to == &self.message_id {
-                return Err(HarnessValidationError::SelfLink { field: "reply_to" });
-            }
-        }
-        if let Some(task_id) = &self.task_id {
-            task_id.validate()?;
-        }
-        if self.refs.len() > HARNESS_MAIL_REFS_MAX {
-            return Err(HarnessValidationError::CollectionTooLarge {
-                field: "refs",
-                maximum: HARNESS_MAIL_REFS_MAX,
-            });
-        }
-        for reference in &self.refs {
-            reference.validate()?;
-        }
-        if self.created_at_unix_ms == 0 {
-            return Err(HarnessValidationError::InvalidTimestamps);
-        }
-        Ok(())
-    }
-}
-
-/// Per-reader acknowledgement. What makes S9's at-least-once delivery
-/// terminate: dedup is `(message_id, reader_record_id)`, never the message
-/// alone -- a task-addressed message has one ack per reader, not one total.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HarnessMailAckV1 {
-    pub message_id: HarnessMailMessageId,
-    pub reader_record_id: HarnessSelectorV1,
-    pub acked_at_unix_ms: u64,
-}
-
-impl HarnessMailAckV1 {
-    pub fn validate(&self) -> Result<(), HarnessValidationError> {
-        self.message_id.validate()?;
-        self.reader_record_id.validate()?;
-        if self.acked_at_unix_ms == 0 {
-            return Err(HarnessValidationError::InvalidTimestamps);
         }
         Ok(())
     }
@@ -3065,8 +2931,6 @@ pub enum HarnessValidationError {
     InvalidContinuationLink,
     #[error("harness run git summary is empty, unbounded, unsorted, or contains a control character")]
     InvalidGitSummary,
-    #[error("mail {field} is empty, unbounded, malformed, or contains a control character")]
-    InvalidMailRef { field: &'static str },
     #[error("task result `why` value is empty, unbounded, or contains a control character")]
     InvalidTaskResultWhy,
 }
@@ -3141,7 +3005,6 @@ mod tests {
             read_permissions: HarnessReadPermissionsV1::default(),
             monitoring_visibility: HarnessMonitoringVisibilityV1::Summary,
             context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
-            mail: false,
             state: SessionGrantStateV1::Active,
             created_at_unix_ms: 1_000,
             updated_at_unix_ms: 1_000,
@@ -3333,28 +3196,18 @@ mod tests {
         );
     }
 
+    /// Forward migration (2026-09-17): the mailbox moved to its own service
+    /// and `SessionGrantV1` no longer carries a `mail` bit at all, but a
+    /// grant persisted while that field existed still has it in its stored
+    /// JSON -- this proves such a record still decodes under
+    /// `deny_unknown_fields` rather than failing to load.
     #[test]
-    fn harness_mail_grant_permission_is_legacy_safe_and_default_for_run_grants_it() {
+    fn session_grant_decodes_a_stored_record_that_still_carries_the_retired_mail_field() {
         let grant = valid_grant();
-        assert!(!grant.mail, "valid_grant() fixture predates the mail permission");
         let mut legacy_wire = serde_json::to_value(&grant).unwrap();
-        legacy_wire.as_object_mut().unwrap().remove("mail");
+        legacy_wire.as_object_mut().unwrap().insert("mail".to_owned(), serde_json::json!(true));
         let decoded: SessionGrantV1 = serde_json::from_value(legacy_wire).unwrap();
-        assert!(!decoded.mail);
-
-        let default_grant = SessionGrantV1::default_for_run(
-            grant_id('9'),
-            run_id('4'),
-            HarnessGrantTargetV1 {
-                node_id: selector("node-a"),
-                workspace_id: selector("workspace-a"),
-                provider_profile: selector("claude"),
-                mode: HarnessExecutionModeV1::Acp,
-            },
-            1_000,
-        );
-        assert!(default_grant.mail);
-        default_grant.validate().unwrap();
+        assert_eq!(decoded, grant);
     }
 
     #[test]
@@ -3391,149 +3244,6 @@ mod tests {
         assert!(default_grant.task_permissions.mutate);
         assert!(!default_grant.task_permissions.request_run, "spawning stays operator-only");
         default_grant.validate().unwrap();
-    }
-
-    fn mail_message_id(hex: char) -> HarnessMailMessageId {
-        HarnessMailMessageId::new(format!("hmail_{}", hex.to_string().repeat(24))).unwrap()
-    }
-
-    fn valid_mail_message() -> HarnessMailMessageV1 {
-        HarnessMailMessageV1 {
-            message_id: mail_message_id('1'),
-            from: HarnessRecordRef { record_id: selector("record-a"), provider: selector("claude") },
-            to: HarnessMailAddressV1::Session { record_id: selector("record-b") },
-            subject: "status".to_owned(),
-            body: "handing off the result".to_owned(),
-            reply_to: None,
-            task_id: None,
-            refs: Vec::new(),
-            created_at_unix_ms: 1_000,
-        }
-    }
-
-    #[test]
-    fn harness_mail_message_reuses_title_and_body_bounds_and_rejects_self_reply() {
-        let message = valid_mail_message();
-        message.validate().unwrap();
-
-        let mut oversized_subject = message.clone();
-        oversized_subject.subject = "x".repeat(HARNESS_TITLE_MAX_BYTES + 1);
-        assert_eq!(oversized_subject.validate(), Err(HarnessValidationError::InvalidTitle));
-
-        let mut oversized_body = message.clone();
-        oversized_body.body = "x".repeat(HARNESS_BODY_MAX_BYTES + 1);
-        assert_eq!(oversized_body.validate(), Err(HarnessValidationError::InvalidBody));
-
-        let mut self_reply = message.clone();
-        self_reply.reply_to = Some(self_reply.message_id.clone());
-        assert_eq!(
-            self_reply.validate(),
-            Err(HarnessValidationError::SelfLink { field: "reply_to" }),
-        );
-
-        let task_addressed = HarnessMailMessageV1 {
-            to: HarnessMailAddressV1::Task { task_id: task_id('1') },
-            ..message
-        };
-        task_addressed.validate().unwrap();
-    }
-
-    /// C1: a message persisted before `refs` existed (SQLite `payload` blob,
-    /// or a checkpoint written by an older binary) deserializes with an empty
-    /// ref list rather than failing -- the JSON below is exactly the old
-    /// shape, missing the `refs` key entirely.
-    #[test]
-    fn harness_mail_message_old_shape_without_refs_deserializes() {
-        let old_shape = serde_json::json!({
-            "message_id": format!("hmail_{}", "1".repeat(24)),
-            "from": { "record_id": "record-a", "provider": "claude" },
-            "to": { "kind": "session", "record_id": "record-b" },
-            "subject": "status",
-            "body": "handing off the result",
-            "reply_to": null,
-            "task_id": null,
-            "created_at_unix_ms": 1_000,
-        });
-        let decoded: HarnessMailMessageV1 = serde_json::from_value(old_shape).unwrap();
-        assert!(decoded.refs.is_empty());
-        decoded.validate().unwrap();
-    }
-
-    #[test]
-    fn harness_mail_message_refs_are_bounded_and_each_kind_validates() {
-        let mut message = valid_mail_message();
-        message.refs = vec![HarnessMailRefV1::Run { run_id: run_id('2') }];
-        message.validate().unwrap();
-
-        // Bound: HARNESS_MAIL_REFS_MAX + 1 refs is rejected by name.
-        let mut over_bound = message.clone();
-        over_bound.refs = (0..HARNESS_MAIL_REFS_MAX + 1)
-            .map(|_| HarnessMailRefV1::Run { run_id: run_id('2') })
-            .collect();
-        assert_eq!(
-            over_bound.validate(),
-            Err(HarnessValidationError::CollectionTooLarge {
-                field: "refs",
-                maximum: HARNESS_MAIL_REFS_MAX,
-            }),
-        );
-
-        // Run: an invalid opaque id is rejected.
-        let bad_run_json = serde_json::json!({ "kind": "run", "run_id": "not-a-run-id" });
-        assert!(serde_json::from_value::<HarnessMailRefV1>(bad_run_json).is_err());
-
-        // ContextPack: reuses the context-pack digest scheme.
-        let context_pack = HarnessMailRefV1::ContextPack {
-            digest: format!("sha256:{}", "a".repeat(64)),
-        };
-        context_pack.validate().unwrap();
-        let bad_context_pack = HarnessMailRefV1::ContextPack { digest: "not-a-digest".to_owned() };
-        assert_eq!(bad_context_pack.validate(), Err(HarnessValidationError::InvalidContextPackDigest));
-
-        // Result: reuses HarnessResultRef's own opaque-id validation.
-        let result_ref = HarnessMailRefV1::Result { result_ref: HarnessResultRef::for_run(&run_id('3')) };
-        result_ref.validate().unwrap();
-
-        // WorkspacePath: bare 64-hex sha256, bounded non-empty path.
-        let workspace_path = HarnessMailRefV1::WorkspacePath {
-            workspace: selector("workspace-a"),
-            path: "reports/handoff.md".to_owned(),
-            sha256: "b".repeat(64),
-        };
-        workspace_path.validate().unwrap();
-
-        let empty_path = HarnessMailRefV1::WorkspacePath {
-            workspace: selector("workspace-a"),
-            path: String::new(),
-            sha256: "b".repeat(64),
-        };
-        assert_eq!(
-            empty_path.validate(),
-            Err(HarnessValidationError::InvalidMailRef { field: "workspace path" }),
-        );
-
-        let bad_sha = HarnessMailRefV1::WorkspacePath {
-            workspace: selector("workspace-a"),
-            path: "reports/handoff.md".to_owned(),
-            sha256: "sha256:".to_owned() + &"b".repeat(64),
-        };
-        assert_eq!(
-            bad_sha.validate(),
-            Err(HarnessValidationError::InvalidMailRef { field: "workspace path sha256" }),
-        );
-    }
-
-    #[test]
-    fn harness_mail_ack_rejects_zero_timestamp() {
-        let ack = HarnessMailAckV1 {
-            message_id: mail_message_id('1'),
-            reader_record_id: selector("record-b"),
-            acked_at_unix_ms: 1_000,
-        };
-        ack.validate().unwrap();
-        let mut zero = ack;
-        zero.acked_at_unix_ms = 0;
-        assert_eq!(zero.validate(), Err(HarnessValidationError::InvalidTimestamps));
     }
 
     #[test]

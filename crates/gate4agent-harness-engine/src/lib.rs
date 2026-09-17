@@ -4,12 +4,10 @@ use gate4agent_harness_protocol::{
     HarnessActorV1, HarnessContinuationRef, HarnessContinuationStateV1,
     HarnessContinuationV1, HarnessDeliveryRef, HarnessDeliveryStateV1, HarnessDeliveryV1,
     HarnessEntityReadScopeV1, HarnessExpectedExecutionSpecRevisionV1,
-    HarnessMailAckV1, HarnessMailAddressV1, HarnessMailMessageId, HarnessMailMessageV1,
-    HarnessMailRefV1,
     HarnessOperationId, HarnessOperationKindV1,
     HarnessOperationStateV1, HarnessOperationV1, HarnessResultRef, HarnessRevision,
-    HarnessRunId, HarnessRunLifecycleV1, HarnessRunV1, HarnessSelectorV1,
-    HarnessSessionIdentityV1, HarnessTaskExecutionSpecV1,
+    HarnessRunId, HarnessRunLifecycleV1, HarnessRunV1,
+    HarnessTaskExecutionSpecV1,
     HarnessTaskExecutionSpecV2, HarnessTaskId, HarnessTaskLaunchIssuanceV1,
     HarnessTaskStateV1, HarnessTaskV1, HarnessTransferAuthorityRefV1,
     HarnessValidationError, SessionGrantId, SessionGrantStateV1, SessionGrantV1,
@@ -23,19 +21,6 @@ use thiserror::Error;
 
 pub const HARNESS_ENGINE_CHECKPOINT_VERSION_V1: u16 = 1;
 pub const HARNESS_VISIBILITY_SCAN_MAX: usize = 8_192;
-/// Ceiling on the number of stored mail messages `mail_inbox` will scan in
-/// one call. This bounds the WORK a single inbox read does -- a linear
-/// filter over an in-memory map plus a sort of the matches, cheap even at
-/// this size -- not how many messages a workspace is allowed to have ever
-/// exchanged. `HARNESS_VISIBILITY_SCAN_MAX` is deliberately not reused here:
-/// that constant bounds lineage-graph traversal cost (`read_visibility` and
-/// its helpers), an unrelated shape of work with its own scaling, and tying
-/// ordinary mail growth to it turned mail_inbox into a permanent failure for
-/// every reader once a workspace had ever exchanged more than 8192
-/// messages, with no recovery short of deleting mail. 262_144 keeps the
-/// same "cheap linear scan" guarantee at an order of magnitude no real
-/// mailbox reaches in practice.
-pub const HARNESS_MAIL_SCAN_MAX: usize = 262_144;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HarnessApplyOutcome {
@@ -99,14 +84,6 @@ pub enum HarnessMutationV1 {
         expected_revision: HarnessRevision,
         grant: SessionGrantV1,
     },
-    SendMail {
-        operation: HarnessOperationV1,
-        message: HarnessMailMessageV1,
-    },
-    AckMail {
-        operation: HarnessOperationV1,
-        ack: HarnessMailAckV1,
-    },
 }
 
 impl HarnessMutationV1 {
@@ -120,9 +97,7 @@ impl HarnessMutationV1 {
             | Self::CreateIssuedRun { operation, .. }
             | Self::ReplaceRun { operation, .. }
             | Self::CreateGrant { operation, .. }
-            | Self::ReplaceGrant { operation, .. }
-            | Self::SendMail { operation, .. }
-            | Self::AckMail { operation, .. } => operation,
+            | Self::ReplaceGrant { operation, .. } => operation,
         }
     }
 
@@ -136,9 +111,7 @@ impl HarnessMutationV1 {
             | Self::CreateIssuedRun { operation, .. }
             | Self::ReplaceRun { operation, .. }
             | Self::CreateGrant { operation, .. }
-            | Self::ReplaceGrant { operation, .. }
-            | Self::SendMail { operation, .. }
-            | Self::AckMail { operation, .. } => operation,
+            | Self::ReplaceGrant { operation, .. } => operation,
         }
     }
 
@@ -213,15 +186,12 @@ impl HarnessMutationV1 {
                 expected_revision.validate()?;
                 grant.validate()?;
             }
-            Self::SendMail { message, .. } => message.validate()?,
-            Self::AckMail { ack, .. } => ack.validate()?,
         }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct HarnessEngineCheckpointV1 {
     pub version: u16,
     pub tasks: Vec<HarnessTaskV1>,
@@ -238,10 +208,63 @@ pub struct HarnessEngineCheckpointV1 {
     pub deliveries: Vec<HarnessDeliveryV1>,
     #[serde(default)]
     pub continuations: Vec<HarnessContinuationV1>,
+}
+
+/// Forward migration off the two mailbox fields this checkpoint used to
+/// carry (removed 2026-09-17: the mailbox moved to its own service, see
+/// `gate4agent/CLAUDE.md`). `HarnessEngineCheckpointV1` is the payload half
+/// of `harness_checkpoint.payload` -- a real on-disk blob, not just an
+/// in-memory shape -- so a database written by a binary that still had
+/// `mail_messages`/`mail_acks` must keep opening under `deny_unknown_fields`.
+/// The values are never reconstructable into a real type any more (the mail
+/// message/ack shapes themselves are gone too), so both keys are accepted
+/// as opaque `IgnoredAny` and dropped, the same way `SessionGrantV1`
+/// tolerates and drops its own retired `mail` bit.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessEngineCheckpointWireV1 {
+    version: u16,
+    tasks: Vec<HarnessTaskV1>,
+    runs: Vec<HarnessRunV1>,
+    grants: Vec<SessionGrantV1>,
+    operations: Vec<HarnessOperationV1>,
     #[serde(default)]
-    pub mail_messages: Vec<HarnessMailMessageV1>,
+    execution_specs: Vec<HarnessTaskExecutionSpecV1>,
     #[serde(default)]
-    pub mail_acks: Vec<HarnessMailAckV1>,
+    issuances: Vec<HarnessTaskLaunchIssuanceV1>,
+    #[serde(default)]
+    execution_specs_v2: Vec<HarnessTaskExecutionSpecV2>,
+    #[serde(default)]
+    deliveries: Vec<HarnessDeliveryV1>,
+    #[serde(default)]
+    continuations: Vec<HarnessContinuationV1>,
+    #[serde(default)]
+    mail_messages: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    mail_acks: Option<serde::de::IgnoredAny>,
+}
+
+impl<'de> Deserialize<'de> for HarnessEngineCheckpointV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = HarnessEngineCheckpointWireV1::deserialize(deserializer)?;
+        let _retired_mail_messages = wire.mail_messages;
+        let _retired_mail_acks = wire.mail_acks;
+        Ok(Self {
+            version: wire.version,
+            tasks: wire.tasks,
+            runs: wire.runs,
+            grants: wire.grants,
+            operations: wire.operations,
+            execution_specs: wire.execution_specs,
+            issuances: wire.issuances,
+            execution_specs_v2: wire.execution_specs_v2,
+            deliveries: wire.deliveries,
+            continuations: wire.continuations,
+        })
+    }
 }
 
 /// Which of `HarnessEngineError`'s two graph-validation variants a cached
@@ -282,8 +305,6 @@ pub struct HarnessEngine {
     execution_specs_v2: BTreeMap<HarnessTaskId, HarnessTaskExecutionSpecV2>,
     deliveries: BTreeMap<HarnessDeliveryRef, HarnessDeliveryV1>,
     continuations: BTreeMap<HarnessContinuationRef, HarnessContinuationV1>,
-    mail_messages: BTreeMap<HarnessMailMessageId, HarnessMailMessageV1>,
-    mail_acks: BTreeMap<(HarnessMailMessageId, HarnessSelectorV1), HarnessMailAckV1>,
     /// Bumped exactly once per accepted (`HarnessApplyOutcome::Applied`)
     /// mutation, inside `finish` -- the single choke point every real
     /// state change already passes through before becoming a
@@ -327,8 +348,6 @@ impl PartialEq for HarnessEngine {
             && self.execution_specs_v2 == other.execution_specs_v2
             && self.deliveries == other.deliveries
             && self.continuations == other.continuations
-            && self.mail_messages == other.mail_messages
-            && self.mail_acks == other.mail_acks
     }
 }
 
@@ -378,16 +397,6 @@ impl HarnessReadVisibilityV1 {
     pub fn is_empty(&self) -> bool {
         self.task_ids.is_empty() && self.run_ids.is_empty() && self.operation_ids.is_empty()
     }
-}
-
-/// One `mail_inbox` page entry: the message itself, whether this reader has
-/// acked it, and its thread -- the transitive closure over `reply_to`
-/// (S9: "threading needs no second concept").
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HarnessMailInboxEntryV1 {
-    pub message: HarnessMailMessageV1,
-    pub acked: bool,
-    pub thread: Vec<HarnessMailMessageV1>,
 }
 
 #[derive(Clone, Debug)]
@@ -519,22 +528,6 @@ impl HarnessEngine {
 
     pub fn deliveries(&self) -> impl Iterator<Item = &HarnessDeliveryV1> {
         self.deliveries.values()
-    }
-
-    pub fn mail_message(&self, message_id: &HarnessMailMessageId) -> Option<&HarnessMailMessageV1> {
-        self.mail_messages.get(message_id)
-    }
-
-    pub fn mail_messages(&self) -> impl Iterator<Item = &HarnessMailMessageV1> {
-        self.mail_messages.values()
-    }
-
-    pub fn mail_ack(
-        &self,
-        message_id: &HarnessMailMessageId,
-        reader_record_id: &HarnessSelectorV1,
-    ) -> Option<&HarnessMailAckV1> {
-        self.mail_acks.get(&(message_id.clone(), reader_record_id.clone()))
     }
 
     pub fn scheduler_pending_dispatch(
@@ -767,203 +760,6 @@ impl HarnessEngine {
         })
     }
 
-    /// D8's forum read: mail addressed directly to `reader_record_id`
-    /// (`Session`) plus every message addressed to a task currently visible
-    /// to `grant_id` (`Task`, via `read_visibility` -- the same lineage
-    /// fence every other read tool already uses, never widened for mail).
-    /// Unacked entries sort first; each carries its `thread`. `limit` bounds
-    /// the returned page -- the caller passes a value already bounded by its
-    /// own request schema (harness MCP's `HARNESS_ENTITY_PAGE_LIMIT_MAX`,
-    /// reused there); this layer additionally caps the number of stored
-    /// messages it will scan at `HARNESS_MAIL_SCAN_MAX`, sized for the cost
-    /// of this read (a linear filter plus a sort of the matches) and
-    /// independent of `read_visibility`'s own, unrelated traversal bound --
-    /// `read_visibility(grant_id)` below still enforces that bound itself.
-    pub fn mail_inbox(
-        &self,
-        grant_id: &SessionGrantId,
-        reader_record_id: &HarnessSelectorV1,
-        since_unix_ms: Option<u64>,
-        limit: usize,
-    ) -> Result<Vec<HarnessMailInboxEntryV1>, HarnessEngineError> {
-        if self.mail_messages.len() > HARNESS_MAIL_SCAN_MAX {
-            return Err(HarnessEngineError::ReadVisibilityResourceExhausted);
-        }
-        let visibility = self.read_visibility(grant_id)?;
-        let mut matches: Vec<&HarnessMailMessageV1> = self.mail_messages.values()
-            .filter(|message| match &message.to {
-                HarnessMailAddressV1::Session { record_id } => record_id == reader_record_id,
-                HarnessMailAddressV1::Task { task_id } => visibility.task_visible(task_id),
-            })
-            .filter(|message| {
-                since_unix_ms.map_or(true, |since| message.created_at_unix_ms >= since)
-            })
-            .collect();
-        matches.sort_by(|left, right| {
-            let left_acked = self.mail_ack(&left.message_id, reader_record_id).is_some();
-            let right_acked = self.mail_ack(&right.message_id, reader_record_id).is_some();
-            left_acked.cmp(&right_acked)
-                .then(left.created_at_unix_ms.cmp(&right.created_at_unix_ms))
-                .then(left.message_id.cmp(&right.message_id))
-        });
-        matches.truncate(limit);
-        Ok(matches.into_iter()
-            .map(|message| HarnessMailInboxEntryV1 {
-                acked: self.mail_ack(&message.message_id, reader_record_id).is_some(),
-                thread: self.mail_thread(&message.message_id),
-                message: message.clone(),
-            })
-            .collect())
-    }
-
-    /// The transitive closure of `reply_to`: every message connected to
-    /// `message_id` through a chain of replies in either direction, sorted
-    /// by `created_at_unix_ms`. Bounded by `HARNESS_VISIBILITY_SCAN_MAX`, the
-    /// same scan bound the rest of this engine's read paths already use.
-    fn mail_thread(&self, message_id: &HarnessMailMessageId) -> Vec<HarnessMailMessageV1> {
-        let mut component = BTreeSet::new();
-        let mut frontier = vec![message_id.clone()];
-        while let Some(current) = frontier.pop() {
-            if component.len() > HARNESS_VISIBILITY_SCAN_MAX || !component.insert(current.clone()) {
-                continue;
-            }
-            let Some(message) = self.mail_messages.get(&current) else { continue };
-            if let Some(reply_to) = &message.reply_to {
-                if !component.contains(reply_to) {
-                    frontier.push(reply_to.clone());
-                }
-            }
-            for candidate in self.mail_messages.values() {
-                if candidate.reply_to.as_ref() == Some(&current)
-                    && !component.contains(&candidate.message_id)
-                {
-                    frontier.push(candidate.message_id.clone());
-                }
-            }
-        }
-        let mut thread: Vec<HarnessMailMessageV1> = component.iter()
-            .filter_map(|id| self.mail_messages.get(id).cloned())
-            .collect();
-        thread.sort_by_key(|message| message.created_at_unix_ms);
-        thread
-    }
-
-    /// D3/C1's dereference gate: "it was mailed to me", never lineage. Checks
-    /// membership FIRST -- exactly `mail_inbox`'s own predicate (addressed to
-    /// `reader_record_id` directly, or to a task visible under `grant_id`'s
-    /// own `read_visibility`) -- and only then resolves `ref_index`. A message
-    /// not in the reader's inbox is `MailNotForReader` by name, never
-    /// `NotFound` (that would leak whether the id exists at all to a caller it
-    /// was never mailed to). `ContextPack` resolves to the run whose own
-    /// `context_pack.digest` matches the ref -- a linear scan of `self.runs`
-    /// (bounded by the same durable-record capacity every other unbounded run
-    /// scan in this engine already accepts), never `read_visibility` -- an
-    /// unknown digest is `MailRefTargetUnknown` by name. `WorkspacePath`
-    /// resolves to the ref's own fields verbatim (C3): unlike `ContextPack`
-    /// this crate has no run or receipt to check it against -- the mailed
-    /// `workspace`/`path`/`sha256` are the entire resolution, and the caller
-    /// (`gate4agent-harness-service`) is the one with the C2/Node route and
-    /// runtime inventory needed to resolve a workspace to a node and fetch
-    /// the bytes, exactly as it already does for `ContextPack`'s run/route.
-    /// `Run`/`Result` are returned for the caller to dereference the rest of
-    /// the way -- that caller has the observation data this crate
-    /// deliberately does not depend on, and it must NOT re-consult
-    /// `read_visibility` for the resolved run: membership above is the only
-    /// gate a mailed ref crosses.
-    pub fn mail_fetch(
-        &self,
-        grant_id: &SessionGrantId,
-        reader_record_id: &HarnessSelectorV1,
-        message_id: &HarnessMailMessageId,
-        ref_index: usize,
-    ) -> Result<HarnessMailFetchResolutionV1, HarnessEngineError> {
-        let message = self.mail_messages.get(message_id)
-            .ok_or_else(|| HarnessEngineError::NotFound(message_id.to_string()))?;
-        let for_reader = match &message.to {
-            HarnessMailAddressV1::Session { record_id } => record_id == reader_record_id,
-            HarnessMailAddressV1::Task { task_id } => {
-                self.read_visibility(grant_id)?.task_visible(task_id)
-            }
-        };
-        if !for_reader {
-            return Err(HarnessEngineError::MailNotForReader { message_id: message_id.clone() });
-        }
-        let reference = message.refs.get(ref_index)
-            .ok_or_else(|| HarnessEngineError::MailRefIndexOutOfRange {
-                message_id: message_id.clone(),
-                ref_index,
-            })?;
-        match reference {
-            HarnessMailRefV1::ContextPack { digest } => {
-                let run_id = self.runs.values()
-                    .find(|run| run.context_pack.as_ref()
-                        .is_some_and(|pack| &pack.digest == digest))
-                    .map(|run| run.run_id.clone())
-                    .ok_or_else(|| HarnessEngineError::MailRefTargetUnknown {
-                        digest: digest.clone(),
-                    })?;
-                Ok(HarnessMailFetchResolutionV1::ContextPack { run_id, digest: digest.clone() })
-            }
-            HarnessMailRefV1::WorkspacePath { workspace, path, sha256 } => {
-                Ok(HarnessMailFetchResolutionV1::WorkspacePath {
-                    workspace: workspace.clone(),
-                    path: path.clone(),
-                    sha256: sha256.clone(),
-                })
-            }
-            HarnessMailRefV1::Run { run_id } => {
-                Ok(HarnessMailFetchResolutionV1::Run { run_id: run_id.clone() })
-            }
-            HarnessMailRefV1::Result { result_ref } => {
-                Ok(HarnessMailFetchResolutionV1::Result { result_ref: result_ref.clone() })
-            }
-        }
-    }
-
-    /// Retention: mail addressed to `task_id` stays readable exactly as long
-    /// as the task exists and is removed with it. Measured, not assumed:
-    /// this engine has no existing task-deletion path to hook into --
-    /// `CreateTask`/`ReplaceTask` only ever insert or replace a task in
-    /// place, a task is never removed once created (`self.tasks` only
-    /// grows). This is therefore a new primitive with no call site yet;
-    /// whichever future retention trigger decides a terminal task's mail
-    /// should stop being retained (a scheduled sweep, or the task's own
-    /// terminal-state transition) calls it.
-    pub fn delete_mail_for_task(&mut self, task_id: &HarnessTaskId) {
-        let doomed: Vec<HarnessMailMessageId> = self.mail_messages.values()
-            .filter(|message| {
-                matches!(&message.to, HarnessMailAddressV1::Task { task_id: to } if to == task_id)
-            })
-            .map(|message| message.message_id.clone())
-            .collect();
-        self.delete_mail_messages(&doomed);
-    }
-
-    /// Retention: mail addressed to `record_id` stays readable exactly as
-    /// long as the session record exists and is removed with it. This
-    /// engine has no session-record registry or deletion path to hook into
-    /// at all -- `ManagedSessionRecord` lifecycle lives in `node-protocol`
-    /// and `node/server.rs`, components harness-engine has no dependency on
-    /// and no visibility into. The hook this retention rule needs is
-    /// therefore outside this crate: whoever removes or forgets a
-    /// `ManagedSessionRecord` must also call this.
-    pub fn delete_mail_for_record(&mut self, record_id: &HarnessSelectorV1) {
-        let doomed: Vec<HarnessMailMessageId> = self.mail_messages.values()
-            .filter(|message| {
-                matches!(&message.to, HarnessMailAddressV1::Session { record_id: to } if to == record_id)
-            })
-            .map(|message| message.message_id.clone())
-            .collect();
-        self.delete_mail_messages(&doomed);
-    }
-
-    fn delete_mail_messages(&mut self, message_ids: &[HarnessMailMessageId]) {
-        for message_id in message_ids {
-            self.mail_messages.remove(message_id);
-            self.mail_acks.retain(|(id, _), _| id != message_id);
-        }
-    }
-
     pub fn checkpoint(&self) -> HarnessEngineCheckpointV1 {
         HarnessEngineCheckpointV1 {
             version: HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
@@ -976,8 +772,6 @@ impl HarnessEngine {
             execution_specs_v2: self.execution_specs_v2.values().cloned().collect(),
             deliveries: self.deliveries.values().cloned().collect(),
             continuations: self.continuations.values().cloned().collect(),
-            mail_messages: self.mail_messages.values().cloned().collect(),
-            mail_acks: self.mail_acks.values().cloned().collect(),
         }
     }
 
@@ -1070,22 +864,6 @@ impl HarnessEngine {
             if engine.continuations.insert(continuation_ref.clone(), continuation).is_some() {
                 return Err(HarnessEngineError::DuplicateCheckpointId(
                     continuation_ref.to_string(),
-                ));
-            }
-        }
-        for message in checkpoint.mail_messages {
-            message.validate()?;
-            let message_id = message.message_id.clone();
-            if engine.mail_messages.insert(message_id.clone(), message).is_some() {
-                return Err(HarnessEngineError::DuplicateCheckpointId(message_id.to_string()));
-            }
-        }
-        for ack in checkpoint.mail_acks {
-            ack.validate()?;
-            let key = (ack.message_id.clone(), ack.reader_record_id.clone());
-            if engine.mail_acks.insert(key, ack).is_some() {
-                return Err(HarnessEngineError::DuplicateCheckpointId(
-                    "mail ack".to_owned(),
                 ));
             }
         }
@@ -1568,51 +1346,6 @@ impl HarnessEngine {
                 }
                 validate_grant_transition(current, &grant, operation.kind)?;
                 next.grants.insert(grant.grant_id.clone(), grant);
-                next.operations.insert(operation.operation_id.clone(), operation.clone());
-                next.finish(operation, HarnessApplyOutcome::Applied)
-            }
-            HarnessMutationV1::SendMail { operation, message } => {
-                require_kind(operation.kind, HarnessOperationKindV1::SendMail)?;
-                require_operation_state(operation.state, HarnessOperationStateV1::Succeeded)?;
-                let sender_grant_id = operation.grant_id.as_ref()
-                    .ok_or(HarnessEngineError::WrongOperationKind)?;
-                let sender_grant = next.grants.get(sender_grant_id)
-                    .ok_or_else(|| HarnessEngineError::NotFound(sender_grant_id.to_string()))?;
-                if sender_grant.state != SessionGrantStateV1::Active || !sender_grant.mail {
-                    return Err(HarnessEngineError::MailPermissionDenied {
-                        grant_id: sender_grant_id.clone(),
-                    });
-                }
-                if next.mail_messages.contains_key(&message.message_id) {
-                    return Err(HarnessEngineError::AlreadyExists(message.message_id.to_string()));
-                }
-                next.validate_mail_recipient(&message.to)?;
-                next.mail_messages.insert(message.message_id.clone(), message);
-                next.operations.insert(operation.operation_id.clone(), operation.clone());
-                next.finish(operation, HarnessApplyOutcome::Applied)
-            }
-            HarnessMutationV1::AckMail { operation, ack } => {
-                require_kind(operation.kind, HarnessOperationKindV1::AckMail)?;
-                require_operation_state(operation.state, HarnessOperationStateV1::Succeeded)?;
-                let reader_grant_id = operation.grant_id.as_ref()
-                    .ok_or(HarnessEngineError::WrongOperationKind)?;
-                let reader_grant = next.grants.get(reader_grant_id)
-                    .ok_or_else(|| HarnessEngineError::NotFound(reader_grant_id.to_string()))?;
-                if reader_grant.state != SessionGrantStateV1::Active || !reader_grant.mail {
-                    return Err(HarnessEngineError::MailPermissionDenied {
-                        grant_id: reader_grant_id.clone(),
-                    });
-                }
-                if !next.mail_messages.contains_key(&ack.message_id) {
-                    return Err(HarnessEngineError::NotFound(ack.message_id.to_string()));
-                }
-                // Idempotent by construction: acking an already-acked
-                // (message_id, reader) pair from a fresh operation id is a
-                // no-op success, never a conflict -- that is what makes S9's
-                // at-least-once delivery terminate.
-                next.mail_acks
-                    .entry((ack.message_id.clone(), ack.reader_record_id.clone()))
-                    .or_insert(ack);
                 next.operations.insert(operation.operation_id.clone(), operation.clone());
                 next.finish(operation, HarnessApplyOutcome::Applied)
             }
@@ -2773,18 +2506,6 @@ impl HarnessEngine {
                 return Err(HarnessEngineError::MismatchedIdentity("run task backlink"));
             }
         }
-        for message in self.mail_messages.values() {
-            if let HarnessMailAddressV1::Task { task_id } = &message.to {
-                if !self.tasks.contains_key(task_id) {
-                    return Err(HarnessEngineError::NotFound(task_id.to_string()));
-                }
-            }
-        }
-        for ack in self.mail_acks.values() {
-            if !self.mail_messages.contains_key(&ack.message_id) {
-                return Err(HarnessEngineError::NotFound(ack.message_id.to_string()));
-            }
-        }
         self.validate_task_cycles()?;
         self.validate_run_cycles()?;
         Ok(())
@@ -3609,56 +3330,6 @@ impl HarnessEngine {
         Ok(())
     }
 
-    /// A named, fail-closed refusal (never a silent drop, per S9 §3) for an
-    /// unknown or ended mail recipient. `Task` reachability is the task's own
-    /// terminal states; `Session` reachability is read off the run bindings
-    /// that ever claimed `record_id` -- the engine has no independent record
-    /// registry (that lives in `ManagedSessionRecord`, node-protocol, outside
-    /// harness-engine's ken), so a record with no run ever bound to it is
-    /// `RecipientUnknown` and a record whose every bound run has reached a
-    /// terminal lifecycle is `RecipientEnded`.
-    fn validate_mail_recipient(&self, to: &HarnessMailAddressV1) -> Result<(), HarnessEngineError> {
-        match to {
-            HarnessMailAddressV1::Task { task_id } => {
-                let task = self.tasks.get(task_id).ok_or_else(|| {
-                    HarnessEngineError::MailRecipientUnknown { to: describe_mail_address(to) }
-                })?;
-                if matches!(
-                    task.state,
-                    HarnessTaskStateV1::Done | HarnessTaskStateV1::Failed | HarnessTaskStateV1::Cancelled
-                ) {
-                    return Err(HarnessEngineError::MailRecipientEnded { to: describe_mail_address(to) });
-                }
-                Ok(())
-            }
-            HarnessMailAddressV1::Session { record_id } => {
-                let mut seen_any = false;
-                let mut all_terminal = true;
-                for run in self.runs.values() {
-                    if session_record_id_of(run) != Some(record_id) {
-                        continue;
-                    }
-                    seen_any = true;
-                    if !matches!(
-                        run.lifecycle,
-                        HarnessRunLifecycleV1::Completed
-                            | HarnessRunLifecycleV1::Failed
-                            | HarnessRunLifecycleV1::Cancelled
-                    ) {
-                        all_terminal = false;
-                    }
-                }
-                if !seen_any {
-                    return Err(HarnessEngineError::MailRecipientUnknown { to: describe_mail_address(to) });
-                }
-                if all_terminal {
-                    return Err(HarnessEngineError::MailRecipientEnded { to: describe_mail_address(to) });
-                }
-                Ok(())
-            }
-        }
-    }
-
     fn validate_operation_links(
         &self,
         operation: &HarnessOperationV1,
@@ -3732,20 +3403,6 @@ fn visit_run(
     visiting.remove(run_id);
     complete.insert(run_id.clone());
     Ok(())
-}
-
-fn session_record_id_of(run: &HarnessRunV1) -> Option<&HarnessSelectorV1> {
-    match run.binding.as_ref()?.session {
-        HarnessSessionIdentityV1::Managed { ref record_id, .. } => Some(record_id),
-        HarnessSessionIdentityV1::Inline { .. } => None,
-    }
-}
-
-fn describe_mail_address(to: &HarnessMailAddressV1) -> String {
-    match to {
-        HarnessMailAddressV1::Session { record_id } => format!("session:{}", record_id.as_str()),
-        HarnessMailAddressV1::Task { task_id } => format!("task:{task_id}"),
-    }
 }
 
 fn same_operation_request(left: &HarnessOperationV1, right: &HarnessOperationV1) -> bool {
@@ -4567,24 +4224,6 @@ fn validate_grant_transition(
     }
 }
 
-/// `HarnessEngine::mail_fetch`'s own resolution of one mailed ref, once
-/// inbox membership authorizes it -- `Run`/`Result` mirror `HarnessMailRefV1`'s
-/// two directly-fetchable kinds verbatim; `ContextPack` additionally names the
-/// run whose `context_pack.digest` the ref named, since dereferencing it
-/// needs that run's C2/Node route -- a dependency this crate deliberately
-/// does not carry, so the caller (`gate4agent-harness-service`) resolves the
-/// route and fetches the bytes itself. `WorkspacePath` (C3) mirrors
-/// `HarnessMailRefV1::WorkspacePath` verbatim for the identical reason: this
-/// crate has no node/workspace inventory of its own, so the caller resolves
-/// `workspace` to a node and fetches the file.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HarnessMailFetchResolutionV1 {
-    Run { run_id: HarnessRunId },
-    Result { result_ref: HarnessResultRef },
-    ContextPack { run_id: HarnessRunId, digest: String },
-    WorkspacePath { workspace: HarnessSelectorV1, path: String, sha256: String },
-}
-
 #[derive(Debug, Error)]
 pub enum HarnessEngineError {
     #[error(transparent)]
@@ -4750,18 +4389,6 @@ pub enum HarnessEngineError {
     DeliveryCapacityExceeded,
     #[error("delivery restage must change only to a different current authoritative Node incarnation")]
     InvalidDeliveryRestage,
-    #[error("mail recipient {to} is unknown")]
-    MailRecipientUnknown { to: String },
-    #[error("mail recipient {to} has ended and can no longer receive mail")]
-    MailRecipientEnded { to: String },
-    #[error("grant {grant_id} does not hold the mail permission")]
-    MailPermissionDenied { grant_id: SessionGrantId },
-    #[error("mail message {message_id} is not addressed to this reader")]
-    MailNotForReader { message_id: HarnessMailMessageId },
-    #[error("mail message {message_id} has no ref at index {ref_index}")]
-    MailRefIndexOutOfRange { message_id: HarnessMailMessageId, ref_index: usize },
-    #[error("no run carries a context pack receipt with digest {digest}")]
-    MailRefTargetUnknown { digest: String },
 }
 
 #[cfg(test)]
@@ -4777,13 +4404,11 @@ mod tests {
         HarnessDeliveryBundleV1, HarnessDeliveryComponentCountV1,
         HarnessDeliveryComponentKindV1,
         HarnessDeliveryManifestDigestV2,
-        HarnessDeliveryReceiptV1, HarnessDeliveryRef, HarnessDeliveryStageReceiptV1,
+        HarnessDeliveryRef, HarnessDeliveryStageReceiptV1,
         HarnessExecutionModeV1, HarnessExecutionSpecId, HarnessFailureCategoryV1,
         HarnessFailureV1, HarnessLaunchAuthorityRefV1, HarnessLaunchPlanRefV1,
         HarnessLaunchTargetSelectionV1, HarnessLaunchWorktreeSelectionV1,
         HarnessGrantTargetV1, HarnessIdempotencyRef,
-        HarnessMailAckV1, HarnessMailAddressV1, HarnessMailMessageId, HarnessMailMessageV1,
-        HarnessRecordRef,
         HarnessMonitoringVisibilityV1, HarnessOutcomeUnknownReasonV1,
         HarnessReadPermissionsV1,
         HarnessOperationKindV1, HarnessOperationStateV1, HarnessOperationTimeoutsV1,
@@ -4870,18 +4495,6 @@ mod tests {
 
     fn grant_id() -> SessionGrantId {
         SessionGrantId::new(format!("hgrant_{}", "a".repeat(24))).unwrap()
-    }
-
-    fn numbered_grant_id(value: usize) -> SessionGrantId {
-        SessionGrantId::new(format!("hgrant_{value:024x}")).unwrap()
-    }
-
-    fn mail_message_id(hex: char) -> HarnessMailMessageId {
-        HarnessMailMessageId::new(format!("hmail_{}", hex.to_string().repeat(24))).unwrap()
-    }
-
-    fn numbered_mail_message_id(value: usize) -> HarnessMailMessageId {
-        HarnessMailMessageId::new(format!("hmail_{value:024x}")).unwrap()
     }
 
     fn revision(value: u64) -> HarnessRevision {
@@ -5148,125 +4761,9 @@ mod tests {
                 export: false,
                 restore: false,
             },
-            mail: false,
             state,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 10 + revision_value,
-        }
-    }
-
-    fn mail_grant(state: SessionGrantStateV1, revision_value: u64) -> SessionGrantV1 {
-        let mut record = grant(state, revision_value);
-        record.mail = true;
-        record
-    }
-
-    fn numbered_operation_id(value: usize) -> HarnessOperationId {
-        HarnessOperationId::new(format!("hop_{value:024x}")).unwrap()
-    }
-
-    fn managed_run(
-        id: HarnessRunId,
-        owning_task_id: HarnessTaskId,
-        operation_id_value: HarnessOperationId,
-        lifecycle: HarnessRunLifecycleV1,
-        revision_value: u64,
-        record_id: &str,
-    ) -> HarnessRunV1 {
-        let mut value = run(lifecycle, revision_value);
-        value.run_id = id;
-        value.task_id = owning_task_id;
-        value.operation_id = operation_id_value;
-        if let Some(binding) = value.binding.as_mut() {
-            binding.session = HarnessSessionIdentityV1::Managed {
-                record_id: HarnessSelectorV1::new(record_id).unwrap(),
-                active_session: Some(HarnessRuntimeIdentityV1 { instance_id: 1, generation: 1 }),
-            };
-        }
-        value
-    }
-
-    /// Inserts a run together with the `CreateRun` operation
-    /// `validate_run_links` requires every run to carry -- fixture setup
-    /// only, never the mutation path under test. Covers the two lifecycles
-    /// this file's mail tests use.
-    fn insert_managed_run(
-        engine: &mut HarnessEngine,
-        id: HarnessRunId,
-        owning_task_id: HarnessTaskId,
-        operation_id_value: HarnessOperationId,
-        lifecycle: HarnessRunLifecycleV1,
-        revision_value: u64,
-        record_id: &str,
-    ) {
-        let (state, dispatched_at, finished_at) = match lifecycle {
-            HarnessRunLifecycleV1::Requested => (HarnessOperationStateV1::Prepared, None, None),
-            HarnessRunLifecycleV1::Running => (HarnessOperationStateV1::Succeeded, Some(6), Some(8)),
-            other => panic!("insert_managed_run fixture does not cover lifecycle {other:?}"),
-        };
-        let run_record = managed_run(
-            id.clone(),
-            owning_task_id.clone(),
-            operation_id_value.clone(),
-            lifecycle,
-            revision_value,
-            record_id,
-        );
-        let operation = HarnessOperationV1 {
-            operation_id: operation_id_value,
-            revision: revision(1),
-            actor: HarnessActorV1::User { actor_id: HarnessSelectorV1::new("operator").unwrap() },
-            kind: HarnessOperationKindV1::CreateRun,
-            state,
-            task_id: Some(owning_task_id),
-            run_id: Some(id.clone()),
-            grant_id: None,
-            reconciles_operation_id: None,
-            expected_revision: Some(revision(1)),
-            request_digest: HarnessRequestDigest::new("c".repeat(64)).unwrap(),
-            idempotency_ref: HarnessIdempotencyRef::new(format!("hidem_{}", "c".repeat(24))).unwrap(),
-            failure: None,
-            outcome_unknown_reason: None,
-            reconciliation_outcome: None,
-            created_at_unix_ms: 5,
-            updated_at_unix_ms: finished_at.unwrap_or(5),
-            dispatched_at_unix_ms: dispatched_at,
-            finished_at_unix_ms: finished_at,
-        };
-        engine.operations.insert(operation.operation_id.clone(), operation);
-        engine.runs.insert(id, run_record);
-    }
-
-    fn mail_operation(
-        id: HarnessOperationId,
-        authorizing_grant_id: SessionGrantId,
-        kind: HarnessOperationKindV1,
-        digest_hex: char,
-        actor_run_id: HarnessRunId,
-    ) -> HarnessOperationV1 {
-        HarnessOperationV1 {
-            operation_id: id,
-            revision: revision(1),
-            actor: HarnessActorV1::ParentRun { run_id: actor_run_id },
-            kind,
-            state: HarnessOperationStateV1::Succeeded,
-            task_id: None,
-            run_id: None,
-            grant_id: Some(authorizing_grant_id),
-            reconciles_operation_id: None,
-            expected_revision: None,
-            request_digest: HarnessRequestDigest::new(digest_hex.to_string().repeat(64)).unwrap(),
-            idempotency_ref: HarnessIdempotencyRef::new(format!(
-                "hidem_{}",
-                digest_hex.to_string().repeat(24)
-            )).unwrap(),
-            failure: None,
-            outcome_unknown_reason: None,
-            reconciliation_outcome: None,
-            created_at_unix_ms: 10,
-            updated_at_unix_ms: 12,
-            dispatched_at_unix_ms: None,
-            finished_at_unix_ms: Some(12),
         }
     }
 
@@ -6243,8 +5740,6 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
         };
         assert!(matches!(HarnessEngine::restore(checkpoint), Err(HarnessEngineError::Cycle(_))));
     }
@@ -6334,8 +5829,6 @@ mod tests {
                 execution_specs_v2: Vec::new(),
                 deliveries: Vec::new(),
                 continuations: Vec::new(),
-                mail_messages: Vec::new(),
-                mail_acks: Vec::new(),
             }).unwrap();
             let before = engine.checkpoint();
             let mut next_run = run(next_lifecycle, 4);
@@ -6450,8 +5943,6 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
         }).unwrap()
     }
 
@@ -6632,8 +6123,6 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
         }).unwrap();
         let operation = context_pack_record_operation('6', current_run.revision, 30);
         let before = engine.checkpoint();
@@ -6872,8 +6361,6 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
         }).unwrap();
         let operation = git_facts_record_operation('6', current_run.revision, 30);
         let before = engine.checkpoint();
@@ -6948,8 +6435,6 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
         }).unwrap()
     }
 
@@ -7152,8 +6637,6 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
         }).unwrap();
 
         // Same-value replay at capacity is a legal no-op: the delta is
@@ -7224,8 +6707,6 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
         }).unwrap();
         let before = engine.checkpoint();
 
@@ -7311,8 +6792,6 @@ mod tests {
                 execution_specs_v2: Vec::new(),
                 deliveries: Vec::new(),
                 continuations: Vec::new(),
-                mail_messages: Vec::new(),
-                mail_acks: Vec::new(),
             }).unwrap();
             let before = engine.checkpoint();
             let next_lifecycle = if outcome_unknown {
@@ -7529,8 +7008,6 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
         };
         assert!(matches!(
             HarnessEngine::restore(orphan_checkpoint),
@@ -7548,8 +7025,6 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
         };
         assert!(matches!(
             HarnessEngine::restore(incoherent_checkpoint),
@@ -7572,8 +7047,6 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
         };
         assert!(matches!(
             HarnessEngine::restore(checkpoint),
@@ -7818,1599 +7291,6 @@ mod tests {
                 > HARNESS_VISIBILITY_SCAN_MAX,
         );
         assert!(engine.read_visibility(&grant_id()).is_ok());
-    }
-
-    /// The same regression, proven at the wire this pass's brief names
-    /// explicitly: `mail_inbox` calls `read_visibility` unconditionally
-    /// before it ever looks at a single message, so a store past the old
-    /// ceiling used to fail every mailbox read regardless of whether the
-    /// message being read even needed lineage visibility. A store this
-    /// large, with a structurally valid graph, must still return the
-    /// reader's own page.
-    #[test]
-    fn harness_mail_inbox_serves_a_read_above_the_old_visibility_scan_ceiling() {
-        let mut engine = visibility_fixture();
-        engine.tasks.clear();
-        for index in 0..HARNESS_VISIBILITY_SCAN_MAX {
-            let id = numbered_task_id(index + 1);
-            engine.tasks.insert(id.clone(), task(id, 1, "bounded scan"));
-        }
-        assert!(
-            engine.tasks.len() + engine.runs.len() + engine.operations.len()
-                > HARNESS_VISIBILITY_SCAN_MAX,
-        );
-
-        let reader_record_id = HarnessSelectorV1::new("record-recipient").unwrap();
-        let message = numbered_mail_message(
-            90_000,
-            HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
-            5,
-        );
-        engine.mail_messages.insert(message.message_id.clone(), message.clone());
-
-        let page = engine.mail_inbox(&grant_id(), &reader_record_id, None, 8).unwrap();
-        assert_eq!(
-            page.iter().map(|entry| entry.message.message_id.clone()).collect::<Vec<_>>(),
-            vec![message.message_id],
-        );
-    }
-
-    /// The bound this pass keeps: `validate_visibility_operation_graph`'s
-    /// own per-chain length check (unchanged; it was never the aggregate
-    /// `tasks + runs + operations` bound this pass retires) still fails
-    /// closed on a single reconciliation chain longer than
-    /// `HARNESS_VISIBILITY_SCAN_MAX`, independent of how many OTHER
-    /// operations the store holds -- a genuinely pathological graph, not
-    /// merely a long-lived one. The chain is built ascending
-    /// (`op[1]` reconciles `op[2]`, ..., `op[N-1]` reconciles `op[N]`) so
-    /// the very first outer-loop iteration (smallest key first, nothing in
-    /// `complete` yet) walks it in one pass; a descending chain would
-    /// instead complete in O(1) per node via the same memoization that
-    /// makes this validator cheap in the ordinary case.
-    #[test]
-    fn harness_read_visibility_long_reconcile_chain_fails_closed() {
-        let mut engine = HarnessEngine::new();
-        engine.runs.insert(run_id(), run(HarnessRunLifecycleV1::Running, 1));
-
-        let chain_len = HARNESS_VISIBILITY_SCAN_MAX + 10;
-        for index in 1..=chain_len {
-            let mut operation = visibility_reconcile_operation(
-                numbered_operation_id(index),
-                'a',
-                run_id(),
-                run_id(),
-                numbered_operation_id(index),
-            );
-            operation.reconciles_operation_id = if index < chain_len {
-                Some(numbered_operation_id(index + 1))
-            } else {
-                None
-            };
-            engine.operations.insert(operation.operation_id.clone(), operation);
-        }
-
-        let mut scoped_grant = grant(SessionGrantStateV1::Active, 1);
-        scoped_grant.read_permissions = HarnessReadPermissionsV1 {
-            tasks: HarnessEntityReadScopeV1::SelfOnly,
-            runs: HarnessEntityReadScopeV1::SelfOnly,
-            operations: HarnessEntityReadScopeV1::SelfOnly,
-        };
-        engine.grants.insert(scoped_grant.grant_id.clone(), scoped_grant.clone());
-
-        assert!(matches!(
-            engine.read_visibility(&scoped_grant.grant_id),
-            Err(HarnessEngineError::ReadVisibilityResourceExhausted),
-        ));
-    }
-
-    /// The cache is not stale-forever: once `mutation_generation` --
-    /// `finish`'s own choke point, see its doc comment on `HarnessEngine`
-    /// -- has moved past the generation the cache was computed at, the
-    /// very next read recomputes instead of reusing the stale answer.
-    /// This bumps the counter directly (the same effect `finish` produces
-    /// on every real accepted mutation, `HarnessApplyOutcome::Applied` or
-    /// not) so this test isolates exactly the cache's own invalidation
-    /// contract from whether any particular `prepare_*` mutation happens
-    /// to validate against this fixture -- dozens of other tests in this
-    /// file already cover `prepare`/`finish`/`accept` themselves.
-    #[test]
-    fn harness_read_visibility_cache_recomputes_after_a_mutation() {
-        let mut engine = visibility_fixture();
-        assert!(engine.read_visibility(&grant_id()).is_ok());
-
-        engine.mutation_generation += 1;
-
-        // Same corruption `harness_read_visibility_cycle_fails_closed`
-        // proves fails closed when read fresh: root(1) <-> child(2).
-        engine.runs.get_mut(&numbered_run_id(1)).unwrap().parent_run_id =
-            Some(numbered_run_id(2));
-
-        assert!(matches!(
-            engine.read_visibility(&grant_id()),
-            Err(HarnessEngineError::ReadVisibilityInvalidGraph),
-        ));
-    }
-
-    /// A second read after a successful first one reuses the cached
-    /// answer instead of redoing the traversal -- proven black-box and
-    /// timing-independent: the run graph is corrupted directly (bypassing
-    /// `prepare`/`accept`, so `mutation_generation` never moves and the
-    /// cache from the first read is never invalidated). If this second
-    /// read were re-running `validate_visibility_run_graph`, it would see
-    /// the corruption and refuse with `ReadVisibilityInvalidGraph`, exactly
-    /// as `harness_read_visibility_cycle_fails_closed` proves a fresh read
-    /// does. Getting `Ok` back instead is only possible because the
-    /// traversal was never redone.
-    #[test]
-    fn harness_read_visibility_cache_reuses_result_without_retraversal() {
-        let mut engine = visibility_fixture();
-        assert!(engine.read_visibility(&grant_id()).is_ok());
-
-        engine.runs.get_mut(&numbered_run_id(1)).unwrap().parent_run_id =
-            Some(numbered_run_id(2));
-
-        assert!(engine.read_visibility(&grant_id()).is_ok());
-    }
-
-    #[test]
-    fn continuation_export_atomically_links_target_without_prepare_mutation_and_replays_after_reopen() {
-        let target_run_id = run_id();
-        let source_run_id = HarnessRunId::new(format!(
-            "hrun_{}",
-            "c".repeat(24),
-        )).unwrap();
-        let source_operation_id = operation_id('c');
-        let continuation_ref = HarnessContinuationRef::new(format!(
-            "hcontinuation_{}",
-            "d".repeat(24),
-        )).unwrap();
-        let receipt_ref = HarnessReceiptRef::new(format!(
-            "hreceipt_{}",
-            "e".repeat(24),
-        )).unwrap();
-        let continuation_grant_id = SessionGrantId::new(format!(
-            "hgrant_{}",
-            "c".repeat(24),
-        )).unwrap();
-
-        let mut linked_task = task(task_id('a'), 1, "continuation export");
-        linked_task.state = HarnessTaskStateV1::Running;
-        linked_task.run_ids = vec![target_run_id.clone(), source_run_id.clone()];
-
-        let mut source_operation = original_run_operation(HarnessOperationStateV1::Succeeded);
-        source_operation.operation_id = source_operation_id.clone();
-        source_operation.run_id = Some(source_run_id.clone());
-        source_operation.request_digest = HarnessRequestDigest::new("c".repeat(64)).unwrap();
-        source_operation.idempotency_ref = HarnessIdempotencyRef::new(format!(
-            "hidem_{}",
-            "c".repeat(24),
-        )).unwrap();
-        source_operation.finished_at_unix_ms = Some(12);
-
-        let mut source_run = run(HarnessRunLifecycleV1::Running, 1);
-        source_run.run_id = source_run_id.clone();
-        source_run.operation_id = source_operation_id.clone();
-        let source_binding = source_run.binding.clone().unwrap();
-
-        let mut target_operation = original_run_operation(HarnessOperationStateV1::Prepared);
-        target_operation.actor = HarnessActorV1::ParentRun {
-            run_id: source_run_id.clone(),
-        };
-        let mut target_run = run(HarnessRunLifecycleV1::Requested, 1);
-        target_run.parent_run_id = Some(source_run_id.clone());
-        target_run.intent.provider_profile = HarnessSelectorV1::new("kimi").unwrap();
-        target_run.intent.continuation = Some(
-            HarnessSelectorV1::new(source_run_id.to_string()).unwrap(),
-        );
-
-        let mut active_grant = grant(SessionGrantStateV1::Active, 1);
-        active_grant.grant_id = continuation_grant_id.clone();
-        active_grant.actor_run_id = source_run_id.clone();
-        active_grant.allowed_targets = vec![HarnessGrantTargetV1 {
-            node_id: target_run.intent.node_id.clone(),
-            workspace_id: target_run.intent.workspace_id.clone(),
-            provider_profile: target_run.intent.provider_profile.clone(),
-            mode: target_run.intent.mode,
-        }];
-        active_grant.context_permissions = HarnessContextPermissionsV1 {
-            export: true,
-            restore: true,
-        };
-
-        let exporting = HarnessContinuationV1 {
-            continuation_ref: continuation_ref.clone(),
-            receipt_ref: receipt_ref.clone(),
-            revision: revision(2),
-            state: HarnessContinuationStateV1::Exporting,
-            authority: HarnessTransferAuthorityRefV1::ParentGrant {
-                grant_id: continuation_grant_id,
-                revision: revision(1),
-            },
-            source_run_id: source_run_id.clone(),
-            target_run_id: target_run_id.clone(),
-            operation_id: target_operation.operation_id.clone(),
-            node_id: source_run.intent.node_id.clone(),
-            node_incarnation: source_binding.node_incarnation.clone(),
-            workspace_id: source_run.intent.workspace_id.clone(),
-            source_provider: HarnessSelectorV1::new("claude").unwrap(),
-            source_binding,
-            context: None,
-            target_binding: None,
-            prepared_at_unix_ms: 20,
-            exporting_at_unix_ms: Some(21),
-            exported_at_unix_ms: None,
-            bound_at_unix_ms: None,
-            expired_at_unix_ms: None,
-            outcome_unknown_at_unix_ms: None,
-            outcome_unknown_reason: None,
-            cleanup_state: HarnessContinuationCleanupStateV1::Retained,
-            created_at_unix_ms: 20,
-            updated_at_unix_ms: 21,
-        };
-        let checkpoint = HarnessEngineCheckpointV1 {
-            version: HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
-            tasks: vec![linked_task],
-            runs: vec![target_run, source_run],
-            grants: vec![active_grant],
-            operations: vec![target_operation, source_operation],
-            execution_specs: Vec::new(),
-            issuances: Vec::new(),
-            execution_specs_v2: Vec::new(),
-            deliveries: Vec::new(),
-            continuations: vec![exporting.clone()],
-            mail_messages: Vec::new(),
-            mail_acks: Vec::new(),
-        };
-        let mut legacy_wire = serde_json::to_value(&checkpoint).unwrap();
-        let continuation_wire = legacy_wire.get_mut("continuations").unwrap()
-            .as_array_mut().unwrap()[0].as_object_mut().unwrap();
-        let authority_wire = continuation_wire.remove("authority").unwrap();
-        continuation_wire.insert(
-            "grant_id".to_owned(),
-            authority_wire.get("grant_id").unwrap().clone(),
-        );
-        continuation_wire.insert(
-            "grant_revision".to_owned(),
-            authority_wire.get("revision").unwrap().clone(),
-        );
-        let migrated_checkpoint: HarnessEngineCheckpointV1 =
-            serde_json::from_value(legacy_wire.clone()).unwrap();
-        assert_eq!(migrated_checkpoint, checkpoint);
-        let canonical_wire = serde_json::to_string(&migrated_checkpoint).unwrap();
-        assert!(canonical_wire.contains("\"authority\""));
-        assert!(!canonical_wire.contains("\"grant_revision\""));
-        legacy_wire.get_mut("continuations").unwrap()
-            .as_array_mut().unwrap()[0].as_object_mut().unwrap()
-            .insert("authority".to_owned(), authority_wire);
-        assert!(serde_json::from_value::<HarnessEngineCheckpointV1>(legacy_wire).is_err());
-
-        let mut engine = HarnessEngine::restore(checkpoint).unwrap();
-
-        let mut exported = exporting;
-        exported.revision = revision(3);
-        exported.state = HarnessContinuationStateV1::Exported;
-        exported.context = Some(HarnessResolvedContextPackReceiptV1 {
-            id: HarnessSelectorV1::new("context-a").unwrap(),
-            digest: format!("sha256:{}", "f".repeat(64)),
-            lineage: HarnessContextPackLineageV1 {
-                source_node_id: exported.node_id.clone(),
-                source_workspace_id: exported.workspace_id.clone(),
-                source_instance_id: 1,
-                source_generation: 1,
-                source_provider: exported.source_provider.clone(),
-            },
-            source_message_count: 2,
-            retained_message_count: 2,
-            byte_len: 128,
-            truncated: false,
-        });
-        exported.exported_at_unix_ms = Some(22);
-        exported.updated_at_unix_ms = 22;
-
-        let before_prepare = engine.checkpoint();
-        let prepared = engine.prepare_continuation_export(
-            revision(2),
-            exported.clone(),
-        ).unwrap();
-        assert_eq!(prepared.outcome(), HarnessApplyOutcome::Applied);
-        assert_eq!(engine.checkpoint(), before_prepare);
-
-        let candidate = prepared.checkpoint();
-        let candidate_target = candidate.runs.iter()
-            .find(|run| run.run_id == target_run_id).unwrap();
-        assert_eq!(candidate_target.revision, revision(2));
-        assert_eq!(candidate_target.continuation_receipt.as_ref(), Some(&receipt_ref));
-        assert_eq!(
-            candidate.continuations.iter()
-                .find(|continuation| continuation.continuation_ref == continuation_ref),
-            Some(&exported),
-        );
-        HarnessEngine::restore(candidate).unwrap();
-
-        engine.accept(prepared);
-        let accepted = engine.checkpoint();
-        assert_eq!(engine.continuation(&continuation_ref), Some(&exported));
-        assert_eq!(
-            engine.run(&target_run_id).unwrap().continuation_receipt.as_ref(),
-            Some(&receipt_ref),
-        );
-
-        let replay = engine.prepare_continuation_export(
-            revision(2),
-            exported.clone(),
-        ).unwrap();
-        assert_eq!(replay.outcome(), HarnessApplyOutcome::Replayed);
-        assert_eq!(replay.checkpoint(), accepted);
-        assert_eq!(engine.checkpoint(), accepted);
-
-        let reopened = HarnessEngine::restore(accepted.clone()).unwrap();
-        assert_eq!(reopened.continuation(&continuation_ref), Some(&exported));
-        assert_eq!(
-            reopened.run(&target_run_id).unwrap().continuation_receipt.as_ref(),
-            Some(&receipt_ref),
-        );
-        assert_eq!(
-            reopened.prepare_continuation_export(revision(2), exported).unwrap().outcome(),
-            HarnessApplyOutcome::Replayed,
-        );
-        assert_eq!(reopened.checkpoint(), accepted);
-    }
-
-    #[test]
-    fn scheduled_specialized_authorities_are_atomic_reopen_and_replay_exact() {
-        let mut engine = HarnessEngine::new();
-        let mut owning_task = task(task_id('a'), 1, "scheduled authority task");
-        owning_task.run_ids = vec![run_id()];
-        let mut requested_run = run(HarnessRunLifecycleV1::Requested, 1);
-        requested_run.intent.delivery_bundle = Some(
-            HarnessSelectorV1::new("review-kit").unwrap(),
-        );
-        engine.tasks.insert(owning_task.task_id.clone(), owning_task);
-        engine.runs.insert(requested_run.run_id.clone(), requested_run);
-        let operation = original_run_operation(HarnessOperationStateV1::Prepared);
-        engine.operations.insert(operation.operation_id.clone(), operation);
-        let mut active_grant = grant(SessionGrantStateV1::Active, 1);
-        active_grant.allowed_delivery_bundles = vec![
-            HarnessSelectorV1::new("review-kit").unwrap(),
-        ];
-        engine.grants.insert(active_grant.grant_id.clone(), active_grant);
-        engine.validate_links().unwrap();
-
-        let authority = delivery(HarnessDeliveryStateV1::Prepared, 1);
-        let prepared = engine.prepare_scheduled_run_authorities(
-            &operation_id('b'),
-            Some(authority.clone()),
-            None,
-        ).unwrap();
-        assert_eq!(prepared.outcome(), HarnessApplyOutcome::Applied);
-        assert!(engine.delivery(&delivery_ref('d')).is_none());
-        engine.accept(prepared);
-        assert_eq!(
-            engine.prepare_scheduled_run_authorities(
-                &operation_id('b'),
-                Some(authority.clone()),
-                None,
-            ).unwrap().outcome(),
-            HarnessApplyOutcome::Replayed,
-        );
-        let reopened = HarnessEngine::restore(engine.checkpoint()).unwrap();
-        assert_eq!(reopened.delivery(&delivery_ref('d')), Some(&authority));
-        let mut changed = authority;
-        changed.bundle.manifest_digest = HarnessDeliveryManifestDigestV2::new(format!(
-            "sha256:{}",
-            "f".repeat(64),
-        )).unwrap();
-        assert!(matches!(
-            reopened.prepare_scheduled_run_authorities(
-                &operation_id('b'),
-                Some(changed),
-                None,
-            ),
-            Err(HarnessEngineError::DeliveryIdConflict { .. }),
-        ));
-    }
-
-    #[test]
-    fn harness_delivery_authority_is_grant_bound_cas_and_restart_safe() {
-        let mut engine = HarnessEngine::new();
-        let mut owning_task = task(task_id('a'), 1, "delivery task");
-        owning_task.run_ids = vec![run_id()];
-        let mut requested_run = run(HarnessRunLifecycleV1::Requested, 1);
-        requested_run.intent.delivery_bundle = Some(HarnessSelectorV1::new("review-kit").unwrap());
-        engine.tasks.insert(owning_task.task_id.clone(), owning_task);
-        engine.runs.insert(requested_run.run_id.clone(), requested_run);
-        let operation = original_run_operation(HarnessOperationStateV1::Prepared);
-        engine.operations.insert(operation.operation_id.clone(), operation);
-        let mut active_grant = grant(SessionGrantStateV1::Active, 1);
-        active_grant.allowed_delivery_bundles = vec![HarnessSelectorV1::new("review-kit").unwrap()];
-        engine.grants.insert(active_grant.grant_id.clone(), active_grant);
-        engine.validate_links().unwrap();
-
-        let prepared_delivery = delivery(HarnessDeliveryStateV1::Prepared, 1);
-        for (lifecycle, operation_state) in [
-            (HarnessRunLifecycleV1::Dispatching, HarnessOperationStateV1::Dispatching),
-            (HarnessRunLifecycleV1::OutcomeUnknown, HarnessOperationStateV1::OutcomeUnknown),
-            (HarnessRunLifecycleV1::Running, HarnessOperationStateV1::Succeeded),
-        ] {
-            let mut late = engine.clone();
-            late.runs.get_mut(&run_id()).unwrap().lifecycle = lifecycle;
-            late.operations.get_mut(&operation_id('b')).unwrap().state = operation_state;
-            let unchanged = late.clone();
-            assert!(matches!(
-                late.prepare_delivery(prepared_delivery.clone()),
-                Err(HarnessEngineError::DeliveryAuthorityWindowClosed),
-            ));
-            assert_eq!(late, unchanged);
-        }
-        let checkpoint_before = engine.clone();
-        let mut denied = prepared_delivery.clone();
-        denied.bundle.selector = HarnessSelectorV1::new("unapproved-kit").unwrap();
-        assert!(matches!(
-            engine.prepare_delivery(denied),
-            Err(HarnessEngineError::InvalidDeliveryLink | HarnessEngineError::DeliveryGrantDenied),
-        ));
-        assert_eq!(engine, checkpoint_before);
-
-        let prepared = engine.prepare_delivery(prepared_delivery.clone()).unwrap();
-        engine.accept(prepared);
-        assert_eq!(
-            engine.prepare_delivery(prepared_delivery).unwrap().outcome(),
-            HarnessApplyOutcome::Replayed,
-        );
-
-        let staged = delivery(HarnessDeliveryStateV1::Staged, 2);
-        let mut late_stage = engine.clone();
-        late_stage.runs.get_mut(&run_id()).unwrap().lifecycle =
-            HarnessRunLifecycleV1::Dispatching;
-        late_stage.operations.get_mut(&operation_id('b')).unwrap().state =
-            HarnessOperationStateV1::Dispatching;
-        let unchanged_late_stage = late_stage.clone();
-        assert!(matches!(
-            late_stage.prepare_delivery_stage(revision(1), staged.clone()),
-            Err(HarnessEngineError::DeliveryAuthorityWindowClosed),
-        ));
-        assert_eq!(late_stage, unchanged_late_stage);
-        let mut changed_manifest = staged.clone();
-        changed_manifest.bundle.manifest_digest = HarnessDeliveryManifestDigestV2::new(format!(
-            "sha256:{}",
-            "f".repeat(64),
-        )).unwrap();
-        changed_manifest.stage_receipt.as_mut().unwrap().bundle =
-            changed_manifest.bundle.clone();
-        let before_changed_manifest = engine.clone();
-        assert!(matches!(
-            engine.prepare_delivery_stage(revision(1), changed_manifest),
-            Err(HarnessEngineError::InvalidDeliveryImmutableMutation),
-        ));
-        assert_eq!(engine, before_changed_manifest);
-        let prepared = engine.prepare_delivery_stage(revision(1), staged.clone()).unwrap();
-        engine.accept(prepared);
-        assert_eq!(
-            engine.prepare_delivery_stage(revision(1), staged.clone()).unwrap().outcome(),
-            HarnessApplyOutcome::Replayed,
-        );
-        let mut same_incarnation = staged.clone();
-        same_incarnation.revision = revision(3);
-        same_incarnation.updated_at_unix_ms = 30;
-        same_incarnation.stage_receipt.as_mut().unwrap().staged_at_unix_ms = 30;
-        assert!(matches!(
-            engine.prepare_delivery_stage(revision(2), same_incarnation),
-            Err(HarnessEngineError::InvalidDeliveryRestage),
-        ));
-        let mut restaged = staged.clone();
-        restaged.revision = revision(3);
-        restaged.updated_at_unix_ms = 30;
-        let restaged_receipt = restaged.stage_receipt.as_mut().unwrap();
-        restaged_receipt.node_incarnation =
-            HarnessSelectorV1::new("incarnation-b").unwrap();
-        restaged_receipt.staged_at_unix_ms = 30;
-        let prepared = engine.prepare_delivery_stage(revision(2), restaged.clone()).unwrap();
-        engine.accept(prepared);
-        let restored = HarnessEngine::restore(engine.checkpoint()).unwrap();
-        assert_eq!(restored.delivery(&delivery_ref('d')), Some(&restaged));
-
-        let binding = HarnessSessionBindingV1 {
-            node_id: HarnessSelectorV1::new("node-a").unwrap(),
-            node_incarnation: HarnessSelectorV1::new("incarnation-b").unwrap(),
-            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
-            session: HarnessSessionIdentityV1::Managed {
-                record_id: HarnessSelectorV1::new("record-a").unwrap(),
-                active_session: Some(HarnessRuntimeIdentityV1 {
-                    instance_id: 7,
-                    generation: 3,
-                }),
-            },
-        };
-        let mut dispatching_operation = engine.operation(&operation_id('b')).unwrap().clone();
-        dispatching_operation.revision = revision(2);
-        dispatching_operation.state = HarnessOperationStateV1::Dispatching;
-        dispatching_operation.updated_at_unix_ms = 20;
-        dispatching_operation.dispatched_at_unix_ms = Some(20);
-        let mut dispatching_run = engine.run(&run_id()).unwrap().clone();
-        dispatching_run.revision = revision(2);
-        dispatching_run.lifecycle = HarnessRunLifecycleV1::Dispatching;
-        dispatching_run.updated_at_unix_ms = 20;
-        let prepared = engine.prepare_run_operation_transition(
-            revision(1),
-            dispatching_run,
-            revision(1),
-            dispatching_operation,
-        ).unwrap();
-        engine.accept(prepared);
-
-        let mut committed = restaged;
-        committed.revision = revision(4);
-        committed.state = HarnessDeliveryStateV1::Committed;
-        committed.updated_at_unix_ms = 35;
-        committed.receipt = Some(HarnessDeliveryReceiptV1 {
-            receipt_ref: gate4agent_harness_protocol::HarnessReceiptRef::new(format!(
-                "hreceipt_{}",
-                "e".repeat(24),
-            )).unwrap(),
-            delivery_ref: committed.delivery_ref.clone(),
-            authority: committed.authority.clone(),
-            task_id: committed.task_id.clone(),
-            run_id: committed.run_id.clone(),
-            operation_id: committed.operation_id.clone(),
-            binding,
-            bundle: committed.bundle.clone(),
-            committed_at_unix_ms: 35,
-        });
-        let mut next_run = engine.run(&run_id()).unwrap().clone();
-        next_run.revision = revision(3);
-        next_run.updated_at_unix_ms = 35;
-        next_run.lifecycle = HarnessRunLifecycleV1::Running;
-        next_run.binding = Some(committed.receipt.as_ref().unwrap().binding.clone());
-        next_run.delivery_receipt = Some(committed.receipt.as_ref().unwrap().receipt_ref.clone());
-        let mut succeeded_operation = engine.operation(&operation_id('b')).unwrap().clone();
-        succeeded_operation.revision = revision(3);
-        succeeded_operation.state = HarnessOperationStateV1::Succeeded;
-        succeeded_operation.updated_at_unix_ms = 35;
-        succeeded_operation.finished_at_unix_ms = Some(35);
-        let before_atomic_commit = engine.clone();
-        let prepared = engine.prepare_accepted_spawn_delivery_commit(
-            revision(2),
-            next_run.clone(),
-            revision(2),
-            succeeded_operation.clone(),
-            revision(3),
-            committed.clone(),
-        ).unwrap();
-        assert_eq!(engine, before_atomic_commit);
-        engine.accept(prepared);
-        assert_eq!(engine.delivery(&delivery_ref('d')), Some(&committed));
-        assert_eq!(engine.run(&run_id()), Some(&next_run));
-        assert_eq!(engine.operation(&operation_id('b')), Some(&succeeded_operation));
-        assert_eq!(
-            engine.prepare_accepted_spawn_delivery_commit(
-                revision(3),
-                next_run,
-                revision(2),
-                succeeded_operation,
-                revision(2),
-                committed,
-            ).unwrap().outcome(),
-            HarnessApplyOutcome::Replayed,
-        );
-    }
-
-    fn mail_record_ref(record_id: &str, provider: &str) -> HarnessRecordRef {
-        HarnessRecordRef {
-            record_id: HarnessSelectorV1::new(record_id).unwrap(),
-            provider: HarnessSelectorV1::new(provider).unwrap(),
-        }
-    }
-
-    fn numbered_mail_message(
-        index: usize,
-        to: HarnessMailAddressV1,
-        created_at_unix_ms: u64,
-    ) -> HarnessMailMessageV1 {
-        HarnessMailMessageV1 {
-            message_id: numbered_mail_message_id(index),
-            from: mail_record_ref("record-sender", "claude"),
-            to,
-            subject: String::new(),
-            body: String::new(),
-            reply_to: None,
-            task_id: None,
-            refs: Vec::new(),
-            created_at_unix_ms,
-        }
-    }
-
-    #[test]
-    fn harness_mail_send_to_session_then_inbox_ack_is_idempotent() {
-        let mut engine = HarnessEngine::new();
-        let sender_run_id = numbered_run_id(101);
-        let recipient_run_id = numbered_run_id(102);
-        let sender_task_id = numbered_task_id(101);
-        let recipient_task_id = numbered_task_id(102);
-
-        let mut sender_task = task(sender_task_id.clone(), 1, "sender task");
-        sender_task.run_ids = vec![sender_run_id.clone()];
-        engine.tasks.insert(sender_task_id.clone(), sender_task);
-        insert_managed_run(
-            &mut engine,
-            sender_run_id.clone(),
-            sender_task_id,
-            numbered_operation_id(101),
-            HarnessRunLifecycleV1::Running,
-            1,
-            "record-sender",
-        );
-
-        let mut recipient_task = task(recipient_task_id.clone(), 1, "recipient task");
-        recipient_task.run_ids = vec![recipient_run_id.clone()];
-        engine.tasks.insert(recipient_task_id.clone(), recipient_task);
-        insert_managed_run(
-            &mut engine,
-            recipient_run_id.clone(),
-            recipient_task_id,
-            numbered_operation_id(102),
-            HarnessRunLifecycleV1::Running,
-            1,
-            "record-recipient",
-        );
-
-        let mut sender_grant = mail_grant(SessionGrantStateV1::Active, 1);
-        sender_grant.grant_id = numbered_grant_id(101);
-        sender_grant.actor_run_id = sender_run_id.clone();
-        engine.grants.insert(sender_grant.grant_id.clone(), sender_grant.clone());
-
-        let mut reader_grant = mail_grant(SessionGrantStateV1::Active, 1);
-        reader_grant.grant_id = numbered_grant_id(102);
-        reader_grant.actor_run_id = recipient_run_id.clone();
-        engine.grants.insert(reader_grant.grant_id.clone(), reader_grant.clone());
-
-        let message = HarnessMailMessageV1 {
-            message_id: mail_message_id('1'),
-            from: mail_record_ref("record-sender", "claude"),
-            to: HarnessMailAddressV1::Session { record_id: HarnessSelectorV1::new("record-recipient").unwrap() },
-            subject: "status".to_owned(),
-            body: "handing off the result".to_owned(),
-            reply_to: None,
-            task_id: None,
-            refs: Vec::new(),
-            created_at_unix_ms: 20,
-        };
-        let send_operation = mail_operation(
-            operation_id('1'),
-            sender_grant.grant_id.clone(),
-            HarnessOperationKindV1::SendMail,
-            '1',
-            sender_run_id,
-        );
-        let prepared = engine.prepare(HarnessMutationV1::SendMail {
-            operation: send_operation,
-            message: message.clone(),
-        }).unwrap();
-        assert_eq!(prepared.outcome(), HarnessApplyOutcome::Applied);
-        engine.accept(prepared);
-        assert!(engine.mail_message(&message.message_id).is_some());
-
-        let reader_record_id = HarnessSelectorV1::new("record-recipient").unwrap();
-        let inbox_before_ack = engine.mail_inbox(&reader_grant.grant_id, &reader_record_id, None, 64).unwrap();
-        assert_eq!(inbox_before_ack.len(), 1);
-        assert!(!inbox_before_ack[0].acked);
-        assert_eq!(inbox_before_ack[0].message.message_id, message.message_id);
-
-        let ack = HarnessMailAckV1 {
-            message_id: message.message_id.clone(),
-            reader_record_id: reader_record_id.clone(),
-            acked_at_unix_ms: 25,
-        };
-        let ack_operation = mail_operation(
-            operation_id('2'),
-            reader_grant.grant_id.clone(),
-            HarnessOperationKindV1::AckMail,
-            '2',
-            recipient_run_id.clone(),
-        );
-        let prepared = engine.prepare(HarnessMutationV1::AckMail {
-            operation: ack_operation,
-            ack: ack.clone(),
-        }).unwrap();
-        engine.accept(prepared);
-        assert!(engine.mail_ack(&message.message_id, &reader_record_id).is_some());
-
-        let inbox_after_ack = engine.mail_inbox(&reader_grant.grant_id, &reader_record_id, None, 64).unwrap();
-        assert_eq!(inbox_after_ack.len(), 1);
-        assert!(inbox_after_ack[0].acked);
-
-        // Second ack, a fresh operation id targeting the same (message, reader)
-        // pair: idempotent no-op success, never a conflict.
-        let second_ack_operation = mail_operation(
-            operation_id('3'),
-            reader_grant.grant_id.clone(),
-            HarnessOperationKindV1::AckMail,
-            '3',
-            recipient_run_id,
-        );
-        let prepared = engine.prepare(HarnessMutationV1::AckMail {
-            operation: second_ack_operation,
-            ack,
-        }).unwrap();
-        assert_eq!(prepared.outcome(), HarnessApplyOutcome::Applied);
-        engine.accept(prepared);
-        assert!(engine.mail_ack(&message.message_id, &reader_record_id).is_some());
-    }
-
-    /// The regression this fixes: `mail_inbox` used to refuse for EVERY
-    /// reader once the whole store held more than `HARNESS_VISIBILITY_SCAN_MAX`
-    /// messages -- a ceiling sized for lineage-graph traversal cost, not
-    /// mailbox growth. A store well past that old ceiling must still
-    /// resolve, and must still return exactly the reader's own page.
-    #[test]
-    fn harness_mail_inbox_returns_the_correct_page_above_the_old_visibility_ceiling() {
-        let mut engine = HarnessEngine::new();
-        let reader_record_id = HarnessSelectorV1::new("record-recipient").unwrap();
-        let other_record_id = HarnessSelectorV1::new("record-other").unwrap();
-        let mut grant = mail_grant(SessionGrantStateV1::Active, 1);
-        grant.grant_id = numbered_grant_id(201);
-        engine.grants.insert(grant.grant_id.clone(), grant.clone());
-
-        let store_size = HARNESS_VISIBILITY_SCAN_MAX + 500;
-        assert!(store_size > HARNESS_VISIBILITY_SCAN_MAX);
-        for index in 0..store_size {
-            let to = if index % 2 == 0 {
-                HarnessMailAddressV1::Session { record_id: reader_record_id.clone() }
-            } else {
-                HarnessMailAddressV1::Session { record_id: other_record_id.clone() }
-            };
-            let message = numbered_mail_message(index, to, index as u64);
-            engine.mail_messages.insert(message.message_id.clone(), message);
-        }
-
-        let page = engine.mail_inbox(&grant.grant_id, &reader_record_id, None, 4).unwrap();
-        let expected_ids: Vec<HarnessMailMessageId> = [0_usize, 2, 4, 6]
-            .into_iter()
-            .map(numbered_mail_message_id)
-            .collect();
-        assert_eq!(
-            page.iter().map(|entry| entry.message.message_id.clone()).collect::<Vec<_>>(),
-            expected_ids,
-        );
-        for entry in &page {
-            assert_eq!(
-                entry.message.to,
-                HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
-            );
-            assert!(!entry.acked);
-        }
-    }
-
-    /// `limit`, `since_unix_ms`, and the acked/created-at/message-id sort
-    /// order all still hold once the store is well past the old
-    /// `HARNESS_VISIBILITY_SCAN_MAX` ceiling -- this pass changes which
-    /// ceiling gates the scan, never the shape of the page it returns.
-    #[test]
-    fn harness_mail_inbox_limit_since_and_sort_hold_above_the_old_ceiling() {
-        let mut engine = HarnessEngine::new();
-        let reader_record_id = HarnessSelectorV1::new("record-recipient").unwrap();
-        let other_record_id = HarnessSelectorV1::new("record-other").unwrap();
-        let mut grant = mail_grant(SessionGrantStateV1::Active, 1);
-        grant.grant_id = numbered_grant_id(202);
-        engine.grants.insert(grant.grant_id.clone(), grant.clone());
-
-        // Filler addressed to a DIFFERENT reader: pushes the whole store
-        // past the old `HARNESS_VISIBILITY_SCAN_MAX` ceiling without
-        // inflating the page this test actually inspects (`mail_inbox`
-        // truncates to `limit` before it builds a `thread` for each
-        // returned entry, so the filler's cost stays a single cheap linear
-        // pass, never `limit x store size`).
-        let filler_count = HARNESS_VISIBILITY_SCAN_MAX + 300;
-        for index in 0..filler_count {
-            let message = numbered_mail_message(
-                index,
-                HarnessMailAddressV1::Session { record_id: other_record_id.clone() },
-                index as u64,
-            );
-            engine.mail_messages.insert(message.message_id.clone(), message);
-        }
-        assert!(engine.mail_messages.len() > HARNESS_VISIBILITY_SCAN_MAX);
-
-        // The reader's own five messages, ids well past the filler range
-        // so nothing collides. `tie_a`/`tie_b` share a `created_at` to
-        // exercise the message-id tie-break; `acked_oldest`/`acked_next`
-        // are older than every unacked message and acked, to exercise
-        // "unacked sorts first" winning over created-at order.
-        let tie_a = numbered_mail_message(
-            filler_count + 1,
-            HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
-            50,
-        );
-        let tie_b = numbered_mail_message(
-            filler_count + 2,
-            HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
-            50,
-        );
-        let newest = numbered_mail_message(
-            filler_count + 3,
-            HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
-            80,
-        );
-        let acked_oldest = numbered_mail_message(
-            filler_count + 4,
-            HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
-            10,
-        );
-        let acked_next = numbered_mail_message(
-            filler_count + 5,
-            HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
-            20,
-        );
-        for message in [&tie_a, &tie_b, &newest, &acked_oldest, &acked_next] {
-            engine.mail_messages.insert(message.message_id.clone(), message.clone());
-        }
-        for message in [&acked_oldest, &acked_next] {
-            engine.mail_acks.insert(
-                (message.message_id.clone(), reader_record_id.clone()),
-                HarnessMailAckV1 {
-                    message_id: message.message_id.clone(),
-                    reader_record_id: reader_record_id.clone(),
-                    acked_at_unix_ms: 999,
-                },
-            );
-        }
-
-        // `tie_a` sorts before `tie_b`: same `created_at`, message-id
-        // breaks the tie.
-        let by_id_tie = engine.mail_inbox(&grant.grant_id, &reader_record_id, None, 2).unwrap();
-        assert_eq!(
-            by_id_tie.iter().map(|entry| entry.message.message_id.clone()).collect::<Vec<_>>(),
-            vec![tie_a.message_id.clone(), tie_b.message_id.clone()],
-        );
-        assert!(by_id_tie.iter().all(|entry| !entry.acked));
-
-        // `since_unix_ms` excludes the oldest acked message (`created_at`
-        // 10) but keeps everything from 20 up -- the filter runs before
-        // the sort, not after.
-        let since_page = engine
-            .mail_inbox(&grant.grant_id, &reader_record_id, Some(15), 10)
-            .unwrap();
-        assert_eq!(
-            since_page.iter().map(|entry| entry.message.message_id.clone()).collect::<Vec<_>>(),
-            vec![
-                tie_a.message_id.clone(),
-                tie_b.message_id.clone(),
-                newest.message_id.clone(),
-                acked_next.message_id.clone(),
-            ],
-        );
-
-        // Unbounded `since`, full page: acked-first-false wins over
-        // created-at -- both unacked entries (`created_at` 50, 80) precede
-        // both acked ones (`created_at` 10, 20) despite being newer.
-        let full_page = engine.mail_inbox(&grant.grant_id, &reader_record_id, None, 10).unwrap();
-        assert_eq!(
-            full_page.iter().map(|entry| entry.message.message_id.clone()).collect::<Vec<_>>(),
-            vec![
-                tie_a.message_id.clone(),
-                tie_b.message_id.clone(),
-                newest.message_id.clone(),
-                acked_oldest.message_id.clone(),
-                acked_next.message_id.clone(),
-            ],
-        );
-        assert_eq!(
-            full_page.iter().map(|entry| entry.acked).collect::<Vec<_>>(),
-            vec![false, false, false, true, true],
-        );
-    }
-
-    /// `read_visibility`'s own bounds are untouched by this pass -- this
-    /// proves only `mail_inbox`'s own new ceiling, `HARNESS_MAIL_SCAN_MAX`,
-    /// still fails closed once a store genuinely is that large. The
-    /// fixture is cheap to build because the refusal is the FIRST thing
-    /// `mail_inbox` checks: it returns before `read_visibility`, the
-    /// filter, or the sort ever run, so no addressing or body detail here
-    /// is load-bearing -- only the store's size is.
-    #[test]
-    fn harness_mail_inbox_refuses_above_the_new_scan_ceiling() {
-        let mut engine = HarnessEngine::new();
-        let reader_record_id = HarnessSelectorV1::new("record-recipient").unwrap();
-        let mut grant = mail_grant(SessionGrantStateV1::Active, 1);
-        grant.grant_id = numbered_grant_id(203);
-        engine.grants.insert(grant.grant_id.clone(), grant.clone());
-
-        for index in 0..=HARNESS_MAIL_SCAN_MAX {
-            let message = numbered_mail_message(
-                index,
-                HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
-                index as u64,
-            );
-            engine.mail_messages.insert(message.message_id.clone(), message);
-        }
-        assert_eq!(engine.mail_messages.len(), HARNESS_MAIL_SCAN_MAX + 1);
-
-        assert!(matches!(
-            engine.mail_inbox(&grant.grant_id, &reader_record_id, None, 8),
-            Err(HarnessEngineError::ReadVisibilityResourceExhausted),
-        ));
-    }
-
-    /// D3/C1: A mails B a `Run` ref naming A's OWN run. `reader_grant`'s
-    /// `read_permissions` are the fixture default (`None` on every scope,
-    /// `mail_grant` never sets them), so B's own lineage fence
-    /// (`read_visibility`) is provably empty -- B's grant could not see
-    /// `sender_run_id` by any of the eight read tools. `mail_fetch` resolves
-    /// the ref anyway because membership ("addressed to me") is the only gate
-    /// it consults, exactly as D3 mandates. A third record never addressed by
-    /// the message gets `MailNotForReader` on the identical call, proving the
-    /// gate is message-scoped, not "any active grant".
-    #[test]
-    fn harness_mail_fetch_run_ref_crosses_a_lineage_the_readers_own_grant_cannot_see() {
-        let mut engine = HarnessEngine::new();
-        let sender_run_id = numbered_run_id(111);
-        let recipient_run_id = numbered_run_id(112);
-        let sender_task_id = numbered_task_id(111);
-        let recipient_task_id = numbered_task_id(112);
-
-        let mut sender_task = task(sender_task_id.clone(), 1, "sender task");
-        sender_task.run_ids = vec![sender_run_id.clone()];
-        engine.tasks.insert(sender_task_id.clone(), sender_task);
-        insert_managed_run(
-            &mut engine,
-            sender_run_id.clone(),
-            sender_task_id,
-            numbered_operation_id(111),
-            HarnessRunLifecycleV1::Running,
-            1,
-            "record-sender-2",
-        );
-
-        let mut recipient_task = task(recipient_task_id.clone(), 1, "recipient task");
-        recipient_task.run_ids = vec![recipient_run_id.clone()];
-        engine.tasks.insert(recipient_task_id.clone(), recipient_task);
-        insert_managed_run(
-            &mut engine,
-            recipient_run_id.clone(),
-            recipient_task_id,
-            numbered_operation_id(112),
-            HarnessRunLifecycleV1::Running,
-            1,
-            "record-recipient-2",
-        );
-
-        let mut sender_grant = mail_grant(SessionGrantStateV1::Active, 1);
-        sender_grant.grant_id = numbered_grant_id(111);
-        sender_grant.actor_run_id = sender_run_id.clone();
-        engine.grants.insert(sender_grant.grant_id.clone(), sender_grant.clone());
-
-        let mut reader_grant = mail_grant(SessionGrantStateV1::Active, 1);
-        reader_grant.grant_id = numbered_grant_id(112);
-        reader_grant.actor_run_id = recipient_run_id.clone();
-        engine.grants.insert(reader_grant.grant_id.clone(), reader_grant.clone());
-
-        // Proof that this is a real lineage boundary, not a fixture accident:
-        // the reader's own grant sees nothing at all.
-        assert!(engine.read_visibility(&reader_grant.grant_id).unwrap().is_empty());
-
-        let message = HarnessMailMessageV1 {
-            message_id: mail_message_id('a'),
-            from: mail_record_ref("record-sender-2", "codex"),
-            to: HarnessMailAddressV1::Session { record_id: HarnessSelectorV1::new("record-recipient-2").unwrap() },
-            subject: "handoff".to_owned(),
-            body: "see the attached run".to_owned(),
-            reply_to: None,
-            task_id: None,
-            refs: vec![HarnessMailRefV1::Run { run_id: sender_run_id.clone() }],
-            created_at_unix_ms: 80,
-        };
-        let send_operation = mail_operation(
-            operation_id('b'),
-            sender_grant.grant_id.clone(),
-            HarnessOperationKindV1::SendMail,
-            'b',
-            sender_run_id.clone(),
-        );
-        engine.accept(engine.prepare(HarnessMutationV1::SendMail {
-            operation: send_operation,
-            message: message.clone(),
-        }).unwrap());
-
-        let reader_record_id = HarnessSelectorV1::new("record-recipient-2").unwrap();
-        let resolved = engine.mail_fetch(&reader_grant.grant_id, &reader_record_id, &message.message_id, 0).unwrap();
-        assert_eq!(resolved, HarnessMailFetchResolutionV1::Run { run_id: sender_run_id });
-
-        // A third record, never addressed, gets the named membership refusal
-        // -- never `NotFound` (that would leak that the message id exists).
-        let stranger_record_id = HarnessSelectorV1::new("record-stranger").unwrap();
-        let mut stranger_grant = mail_grant(SessionGrantStateV1::Active, 1);
-        stranger_grant.grant_id = numbered_grant_id(113);
-        stranger_grant.actor_run_id = recipient_run_id;
-        engine.grants.insert(stranger_grant.grant_id.clone(), stranger_grant.clone());
-        match engine.mail_fetch(&stranger_grant.grant_id, &stranger_record_id, &message.message_id, 0) {
-            Err(HarnessEngineError::MailNotForReader { message_id }) => {
-                assert_eq!(message_id, message.message_id);
-            }
-            other => panic!("expected MailNotForReader, got {other:?}"),
-        }
-
-        // Out-of-range index is refused by name too, distinct from a missing
-        // recipient.
-        match engine.mail_fetch(&reader_grant.grant_id, &reader_record_id, &message.message_id, 1) {
-            Err(HarnessEngineError::MailRefIndexOutOfRange { ref_index, .. }) => assert_eq!(ref_index, 1),
-            other => panic!("expected MailRefIndexOutOfRange, got {other:?}"),
-        }
-    }
-
-    /// D3/C1+C3: an unknown-digest `ContextPack` ref is refused by name
-    /// (`MailRefTargetUnknown`) -- the resolves-to-a-real-run case is
-    /// `harness_mail_fetch_resolves_context_pack_ref_to_its_owning_run_and_refuses_unknown_digests`
-    /// above. A `WorkspacePath` ref resolves to its own fields verbatim (C3):
-    /// this crate has no node/workspace inventory to check it against, so
-    /// there is nothing more for `mail_fetch` itself to verify or refuse --
-    /// the caller (`gate4agent-harness-service`) resolves the workspace to a
-    /// node and fetches the bytes.
-    #[test]
-    fn harness_mail_fetch_refuses_unknown_context_pack_digest_and_resolves_workspace_path_by_name() {
-        let mut engine = HarnessEngine::new();
-        let sender_run_id = numbered_run_id(121);
-        let sender_task_id = numbered_task_id(121);
-        let mut sender_task = task(sender_task_id.clone(), 1, "sender task");
-        sender_task.run_ids = vec![sender_run_id.clone()];
-        engine.tasks.insert(sender_task_id.clone(), sender_task);
-        insert_managed_run(
-            &mut engine,
-            sender_run_id.clone(),
-            sender_task_id,
-            numbered_operation_id(121),
-            HarnessRunLifecycleV1::Running,
-            1,
-            "record-sender-3",
-        );
-
-        let mut sender_grant = mail_grant(SessionGrantStateV1::Active, 1);
-        sender_grant.grant_id = numbered_grant_id(121);
-        sender_grant.actor_run_id = sender_run_id.clone();
-        engine.grants.insert(sender_grant.grant_id.clone(), sender_grant.clone());
-
-        // A run must be bound to "record-recipient-3" or `validate_mail_recipient`
-        // refuses the send as `MailRecipientUnknown` before this test ever
-        // reaches `mail_fetch`.
-        let recipient_run_id = numbered_run_id(122);
-        let recipient_task_id = numbered_task_id(122);
-        let mut recipient_task = task(recipient_task_id.clone(), 1, "recipient task");
-        recipient_task.run_ids = vec![recipient_run_id.clone()];
-        engine.tasks.insert(recipient_task_id.clone(), recipient_task);
-        insert_managed_run(
-            &mut engine,
-            recipient_run_id,
-            recipient_task_id,
-            numbered_operation_id(122),
-            HarnessRunLifecycleV1::Running,
-            1,
-            "record-recipient-3",
-        );
-
-        let recipient_record_id = HarnessSelectorV1::new("record-recipient-3").unwrap();
-        let message = HarnessMailMessageV1 {
-            message_id: mail_message_id('c'),
-            from: mail_record_ref("record-sender-3", "claude"),
-            to: HarnessMailAddressV1::Session { record_id: recipient_record_id.clone() },
-            subject: "handoff".to_owned(),
-            body: "see the attached pack and file".to_owned(),
-            reply_to: None,
-            task_id: None,
-            refs: vec![
-                HarnessMailRefV1::ContextPack { digest: format!("sha256:{}", "a".repeat(64)) },
-                HarnessMailRefV1::WorkspacePath {
-                    workspace: HarnessSelectorV1::new("workspace-a").unwrap(),
-                    path: "reports/handoff.md".to_owned(),
-                    sha256: "b".repeat(64),
-                },
-            ],
-            created_at_unix_ms: 90,
-        };
-        engine.accept(engine.prepare(HarnessMutationV1::SendMail {
-            operation: mail_operation(operation_id('d'), sender_grant.grant_id.clone(), HarnessOperationKindV1::SendMail, 'd', sender_run_id),
-            message: message.clone(),
-        }).unwrap());
-
-        // The recipient's own grant does not matter for this refusal -- it is
-        // decided purely by ref kind, once `Session`-addressed membership
-        // already passed (a `Session`-addressed check never touches
-        // `read_visibility`, so the grant's own `actor_run_id` need not name
-        // a real run for this test).
-        let mut reader_grant = mail_grant(SessionGrantStateV1::Active, 1);
-        reader_grant.grant_id = numbered_grant_id(122);
-        reader_grant.actor_run_id = numbered_run_id(998);
-        engine.grants.insert(reader_grant.grant_id.clone(), reader_grant.clone());
-
-        match engine.mail_fetch(&reader_grant.grant_id, &recipient_record_id, &message.message_id, 0) {
-            Err(HarnessEngineError::MailRefTargetUnknown { digest }) => {
-                assert_eq!(digest, format!("sha256:{}", "a".repeat(64)));
-            }
-            other => panic!("expected MailRefTargetUnknown, got {other:?}"),
-        }
-        assert_eq!(
-            engine.mail_fetch(&reader_grant.grant_id, &recipient_record_id, &message.message_id, 1).unwrap(),
-            HarnessMailFetchResolutionV1::WorkspacePath {
-                workspace: HarnessSelectorV1::new("workspace-a").unwrap(),
-                path: "reports/handoff.md".to_owned(),
-                sha256: "b".repeat(64),
-            },
-        );
-    }
-
-    #[test]
-    fn harness_mail_send_to_task_visibility_gates_readers() {
-        let mut engine = HarnessEngine::new();
-        let run_a = numbered_run_id(201);
-        let run_b = numbered_run_id(202);
-        let run_c = numbered_run_id(203);
-        let shared_task_id = numbered_task_id(201);
-        let other_task_id = numbered_task_id(202);
-
-        let mut shared_task = task(shared_task_id.clone(), 1, "shared task");
-        shared_task.run_ids = vec![run_a.clone(), run_b.clone()];
-        engine.tasks.insert(shared_task_id.clone(), shared_task);
-        let mut other_task = task(other_task_id.clone(), 1, "other task");
-        other_task.run_ids = vec![run_c.clone()];
-        engine.tasks.insert(other_task_id.clone(), other_task);
-
-        for (index, (id, owner)) in [
-            (run_a.clone(), shared_task_id.clone()),
-            (run_b.clone(), shared_task_id.clone()),
-            (run_c.clone(), other_task_id),
-        ].into_iter().enumerate() {
-            insert_managed_run(
-                &mut engine,
-                id,
-                owner,
-                numbered_operation_id(210 + index),
-                HarnessRunLifecycleV1::Requested,
-                1,
-                "record-unused",
-            );
-        }
-
-        let mut grant_a = mail_grant(SessionGrantStateV1::Active, 1);
-        grant_a.grant_id = numbered_grant_id(201);
-        grant_a.actor_run_id = run_a.clone();
-        grant_a.read_permissions.tasks = HarnessEntityReadScopeV1::SelfOnly;
-        engine.grants.insert(grant_a.grant_id.clone(), grant_a.clone());
-
-        let mut grant_b = mail_grant(SessionGrantStateV1::Active, 1);
-        grant_b.grant_id = numbered_grant_id(202);
-        grant_b.actor_run_id = run_b.clone();
-        grant_b.read_permissions.tasks = HarnessEntityReadScopeV1::SelfOnly;
-        engine.grants.insert(grant_b.grant_id.clone(), grant_b.clone());
-
-        let mut grant_c = mail_grant(SessionGrantStateV1::Active, 1);
-        grant_c.grant_id = numbered_grant_id(203);
-        grant_c.actor_run_id = run_c.clone();
-        grant_c.read_permissions.tasks = HarnessEntityReadScopeV1::SelfOnly;
-        engine.grants.insert(grant_c.grant_id.clone(), grant_c.clone());
-
-        let message = HarnessMailMessageV1 {
-            message_id: mail_message_id('2'),
-            from: mail_record_ref("record-a", "claude"),
-            to: HarnessMailAddressV1::Task { task_id: shared_task_id },
-            subject: "handoff".to_owned(),
-            body: "posting the result to the shared task".to_owned(),
-            reply_to: None,
-            task_id: None,
-            refs: Vec::new(),
-            created_at_unix_ms: 30,
-        };
-        let send_operation = mail_operation(
-            operation_id('4'),
-            grant_a.grant_id.clone(),
-            HarnessOperationKindV1::SendMail,
-            '4',
-            run_a,
-        );
-        let prepared = engine.prepare(HarnessMutationV1::SendMail {
-            operation: send_operation,
-            message: message.clone(),
-        }).unwrap();
-        engine.accept(prepared);
-
-        let placeholder_record = HarnessSelectorV1::new("record-unused").unwrap();
-        let inbox_a = engine.mail_inbox(&grant_a.grant_id, &placeholder_record, None, 64).unwrap();
-        let inbox_b = engine.mail_inbox(&grant_b.grant_id, &placeholder_record, None, 64).unwrap();
-        let inbox_c = engine.mail_inbox(&grant_c.grant_id, &placeholder_record, None, 64).unwrap();
-        assert_eq!(inbox_a.len(), 1);
-        assert_eq!(inbox_a[0].message.message_id, message.message_id);
-        assert_eq!(inbox_b.len(), 1);
-        assert_eq!(inbox_b[0].message.message_id, message.message_id);
-        assert!(inbox_c.is_empty(), "a reader without task visibility must not see the message");
-    }
-
-    #[test]
-    fn harness_mail_reply_threads_under_the_original() {
-        let mut engine = HarnessEngine::new();
-        let run_a = numbered_run_id(301);
-        let run_b = numbered_run_id(302);
-        let task_a = numbered_task_id(301);
-        let task_b = numbered_task_id(302);
-        let mut owner_task_a = task(task_a.clone(), 1, "a");
-        owner_task_a.run_ids = vec![run_a.clone()];
-        engine.tasks.insert(task_a.clone(), owner_task_a);
-        let mut owner_task_b = task(task_b.clone(), 1, "b");
-        owner_task_b.run_ids = vec![run_b.clone()];
-        engine.tasks.insert(task_b.clone(), owner_task_b);
-        insert_managed_run(&mut engine, run_a.clone(), task_a, numbered_operation_id(301), HarnessRunLifecycleV1::Running, 1, "record-a");
-        insert_managed_run(&mut engine, run_b.clone(), task_b, numbered_operation_id(302), HarnessRunLifecycleV1::Running, 1, "record-b");
-
-        let mut grant_a = mail_grant(SessionGrantStateV1::Active, 1);
-        grant_a.grant_id = numbered_grant_id(301);
-        grant_a.actor_run_id = run_a.clone();
-        engine.grants.insert(grant_a.grant_id.clone(), grant_a.clone());
-        let mut grant_b = mail_grant(SessionGrantStateV1::Active, 1);
-        grant_b.grant_id = numbered_grant_id(302);
-        grant_b.actor_run_id = run_b.clone();
-        engine.grants.insert(grant_b.grant_id.clone(), grant_b.clone());
-
-        let original = HarnessMailMessageV1 {
-            message_id: mail_message_id('3'),
-            from: mail_record_ref("record-a", "claude"),
-            to: HarnessMailAddressV1::Session { record_id: HarnessSelectorV1::new("record-b").unwrap() },
-            subject: "question".to_owned(),
-            body: "can you check this?".to_owned(),
-            reply_to: None,
-            task_id: None,
-            refs: Vec::new(),
-            created_at_unix_ms: 40,
-        };
-        engine.accept(engine.prepare(HarnessMutationV1::SendMail {
-            operation: mail_operation(operation_id('5'), grant_a.grant_id.clone(), HarnessOperationKindV1::SendMail, '5', run_a.clone()),
-            message: original.clone(),
-        }).unwrap());
-
-        let reply = HarnessMailMessageV1 {
-            message_id: mail_message_id('4'),
-            from: mail_record_ref("record-b", "codex"),
-            to: HarnessMailAddressV1::Session { record_id: HarnessSelectorV1::new("record-a").unwrap() },
-            subject: "re: question".to_owned(),
-            body: "checked, looks correct".to_owned(),
-            reply_to: Some(original.message_id.clone()),
-            task_id: None,
-            refs: Vec::new(),
-            created_at_unix_ms: 45,
-        };
-        engine.accept(engine.prepare(HarnessMutationV1::SendMail {
-            operation: mail_operation(operation_id('6'), grant_b.grant_id.clone(), HarnessOperationKindV1::SendMail, '6', run_b),
-            message: reply.clone(),
-        }).unwrap());
-
-        let record_a = HarnessSelectorV1::new("record-a").unwrap();
-        let inbox = engine.mail_inbox(&grant_a.grant_id, &record_a, None, 64).unwrap();
-        let reply_entry = inbox.iter().find(|entry| entry.message.message_id == reply.message_id)
-            .expect("the reply must be in record-a's inbox");
-        assert_eq!(reply_entry.thread.len(), 2);
-        assert_eq!(reply_entry.thread[0].message_id, original.message_id);
-        assert_eq!(reply_entry.thread[1].message_id, reply.message_id);
-    }
-
-    #[test]
-    fn harness_mail_retention_deletes_with_record_and_with_task() {
-        let mut engine = HarnessEngine::new();
-        let record_id = HarnessSelectorV1::new("record-doomed").unwrap();
-        let task_for_record = numbered_task_id(401);
-        engine.mail_messages.insert(mail_message_id('5'), HarnessMailMessageV1 {
-            message_id: mail_message_id('5'),
-            from: mail_record_ref("record-other", "claude"),
-            to: HarnessMailAddressV1::Session { record_id: record_id.clone() },
-            subject: "bye".to_owned(),
-            body: "session ending".to_owned(),
-            reply_to: None,
-            task_id: None,
-            refs: Vec::new(),
-            created_at_unix_ms: 50,
-        });
-        engine.mail_acks.insert(
-            (mail_message_id('5'), record_id.clone()),
-            HarnessMailAckV1 { message_id: mail_message_id('5'), reader_record_id: record_id.clone(), acked_at_unix_ms: 51 },
-        );
-        engine.mail_messages.insert(mail_message_id('6'), HarnessMailMessageV1 {
-            message_id: mail_message_id('6'),
-            from: mail_record_ref("record-other", "claude"),
-            to: HarnessMailAddressV1::Task { task_id: task_for_record.clone() },
-            subject: "status".to_owned(),
-            body: "task wrapping up".to_owned(),
-            reply_to: None,
-            task_id: None,
-            refs: Vec::new(),
-            created_at_unix_ms: 52,
-        });
-        engine.tasks.insert(task_for_record.clone(), task(task_for_record.clone(), 1, "closing task"));
-
-        engine.delete_mail_for_record(&record_id);
-        assert!(engine.mail_message(&mail_message_id('5')).is_none());
-        assert!(engine.mail_ack(&mail_message_id('5'), &record_id).is_none());
-        assert!(engine.mail_message(&mail_message_id('6')).is_some());
-
-        engine.delete_mail_for_task(&task_for_record);
-        assert!(engine.mail_message(&mail_message_id('6')).is_none());
-    }
-
-    #[test]
-    fn harness_mail_refusals_name_their_inputs() {
-        let mut engine = HarnessEngine::new();
-        let sender_run_id = numbered_run_id(501);
-        let sender_task_id = numbered_task_id(501);
-        let ended_task_id = numbered_task_id(502);
-        let mut sender_task = task(sender_task_id.clone(), 1, "sender");
-        sender_task.run_ids = vec![sender_run_id.clone()];
-        engine.tasks.insert(sender_task_id, sender_task);
-        insert_managed_run(
-            &mut engine,
-            sender_run_id.clone(),
-            numbered_task_id(501),
-            numbered_operation_id(501),
-            HarnessRunLifecycleV1::Running,
-            1,
-            "record-sender",
-        );
-        let mut ended_task = task(ended_task_id.clone(), 1, "ended");
-        ended_task.state = HarnessTaskStateV1::Done;
-        engine.tasks.insert(ended_task_id.clone(), ended_task);
-
-        let mut sender_grant = mail_grant(SessionGrantStateV1::Active, 1);
-        sender_grant.grant_id = numbered_grant_id(501);
-        sender_grant.actor_run_id = sender_run_id.clone();
-        engine.grants.insert(sender_grant.grant_id.clone(), sender_grant.clone());
-
-        let mut no_mail_grant = mail_grant(SessionGrantStateV1::Active, 1);
-        no_mail_grant.grant_id = numbered_grant_id(502);
-        no_mail_grant.actor_run_id = sender_run_id.clone();
-        no_mail_grant.mail = false;
-        engine.grants.insert(no_mail_grant.grant_id.clone(), no_mail_grant.clone());
-
-        let base_message = HarnessMailMessageV1 {
-            message_id: mail_message_id('7'),
-            from: mail_record_ref("record-sender", "claude"),
-            to: HarnessMailAddressV1::Session { record_id: HarnessSelectorV1::new("record-nobody").unwrap() },
-            subject: "hello".to_owned(),
-            body: "is anyone there".to_owned(),
-            reply_to: None,
-            task_id: None,
-            refs: Vec::new(),
-            created_at_unix_ms: 60,
-        };
-
-        let unknown_recipient = engine.prepare(HarnessMutationV1::SendMail {
-            operation: mail_operation(operation_id('7'), sender_grant.grant_id.clone(), HarnessOperationKindV1::SendMail, '7', sender_run_id.clone()),
-            message: base_message.clone(),
-        }).unwrap_err();
-        match unknown_recipient {
-            HarnessEngineError::MailRecipientUnknown { to } => assert_eq!(to, "session:record-nobody"),
-            other => panic!("expected MailRecipientUnknown, got {other:?}"),
-        }
-
-        let ended_message = HarnessMailMessageV1 {
-            message_id: mail_message_id('8'),
-            to: HarnessMailAddressV1::Task { task_id: ended_task_id.clone() },
-            ..base_message.clone()
-        };
-        let recipient_ended = engine.prepare(HarnessMutationV1::SendMail {
-            operation: mail_operation(operation_id('8'), sender_grant.grant_id.clone(), HarnessOperationKindV1::SendMail, '8', sender_run_id.clone()),
-            message: ended_message,
-        }).unwrap_err();
-        match recipient_ended {
-            HarnessEngineError::MailRecipientEnded { to } => assert_eq!(to, format!("task:{ended_task_id}")),
-            other => panic!("expected MailRecipientEnded, got {other:?}"),
-        }
-
-        let permission_denied = engine.prepare(HarnessMutationV1::SendMail {
-            operation: mail_operation(operation_id('9'), no_mail_grant.grant_id.clone(), HarnessOperationKindV1::SendMail, '9', sender_run_id),
-            message: base_message,
-        }).unwrap_err();
-        match permission_denied {
-            HarnessEngineError::MailPermissionDenied { grant_id } => {
-                assert_eq!(grant_id, no_mail_grant.grant_id);
-            }
-            other => panic!("expected MailPermissionDenied, got {other:?}"),
-        }
-    }
-
-    /// D7, structural half: `HarnessOperationKindV1` has no interaction
-    /// authority, and this match has no wildcard arm -- if a future variant
-    /// (say, a mail-adjacent `ResolveInteraction`) is ever added, this
-    /// function stops compiling until someone consciously revisits the
-    /// claim. `SendMail`/`AckMail` are enumerated here explicitly rather than
-    /// folded into a catch-all precisely so adding them was a deliberate act,
-    /// not a silent default.
-    fn mail_kind_is_never_an_interaction_authority(kind: HarnessOperationKindV1) -> bool {
-        match kind {
-            HarnessOperationKindV1::CreateTask
-            | HarnessOperationKindV1::MutateTask
-            | HarnessOperationKindV1::MutateExecutionSpec
-            | HarnessOperationKindV1::CreateRun
-            | HarnessOperationKindV1::BindRun
-            | HarnessOperationKindV1::MutateRun
-            | HarnessOperationKindV1::CreateGrant
-            | HarnessOperationKindV1::MutateGrant
-            | HarnessOperationKindV1::RevokeGrant
-            | HarnessOperationKindV1::Reconcile
-            | HarnessOperationKindV1::RecordRunContextPack
-            | HarnessOperationKindV1::RecordRunGitFacts
-            | HarnessOperationKindV1::RecordTaskResultRef
-            | HarnessOperationKindV1::SendMail
-            | HarnessOperationKindV1::AckMail => true,
-        }
-    }
-
-    #[test]
-    fn harness_mail_kinds_are_exhaustively_accounted_and_never_authorize_interactions() {
-        for kind in [
-            HarnessOperationKindV1::CreateTask,
-            HarnessOperationKindV1::MutateTask,
-            HarnessOperationKindV1::MutateExecutionSpec,
-            HarnessOperationKindV1::CreateRun,
-            HarnessOperationKindV1::BindRun,
-            HarnessOperationKindV1::MutateRun,
-            HarnessOperationKindV1::CreateGrant,
-            HarnessOperationKindV1::MutateGrant,
-            HarnessOperationKindV1::RevokeGrant,
-            HarnessOperationKindV1::Reconcile,
-            HarnessOperationKindV1::RecordRunContextPack,
-            HarnessOperationKindV1::RecordRunGitFacts,
-            HarnessOperationKindV1::RecordTaskResultRef,
-            HarnessOperationKindV1::SendMail,
-            HarnessOperationKindV1::AckMail,
-        ] {
-            assert!(mail_kind_is_never_an_interaction_authority(kind));
-        }
-    }
-
-    /// D7, behavioural half: a message whose body reads like an approval
-    /// request is stored as mail and only as mail. `HarnessEngine`'s field
-    /// set is exhaustively {tasks, runs, grants, operations, execution_specs,
-    /// issuances, execution_specs_v2, deliveries, continuations,
-    /// mail_messages, mail_acks} -- there is no interaction state anywhere in
-    /// this engine for a `SendMail` mutation to reach, so the pending
-    /// interaction this test's counterpart would set up in harness-service
-    /// (where `ResolveInteraction` and its pending-interaction registry
-    /// actually live) is structurally unreachable from here by construction,
-    /// not by convention.
-    #[test]
-    fn harness_send_mail_with_approval_shaped_body_only_ever_stores_mail() {
-        let mut engine = HarnessEngine::new();
-        let sender_run_id = numbered_run_id(601);
-        let sender_task_id = numbered_task_id(601);
-        let mut sender_task = task(sender_task_id.clone(), 1, "sender");
-        sender_task.run_ids = vec![sender_run_id.clone()];
-        engine.tasks.insert(sender_task_id.clone(), sender_task);
-        insert_managed_run(
-            &mut engine,
-            sender_run_id.clone(),
-            sender_task_id.clone(),
-            numbered_operation_id(601),
-            HarnessRunLifecycleV1::Running,
-            1,
-            "record-sender",
-        );
-        let mut sender_grant = mail_grant(SessionGrantStateV1::Active, 1);
-        sender_grant.grant_id = numbered_grant_id(601);
-        sender_grant.actor_run_id = sender_run_id.clone();
-        sender_grant.read_permissions.tasks = HarnessEntityReadScopeV1::SelfOnly;
-        engine.grants.insert(sender_grant.grant_id.clone(), sender_grant.clone());
-
-        let message = HarnessMailMessageV1 {
-            message_id: mail_message_id('9'),
-            from: mail_record_ref("record-sender", "claude"),
-            to: HarnessMailAddressV1::Task { task_id: sender_task_id },
-            subject: "please approve".to_owned(),
-            body: "please approve my last tool call so I can continue".to_owned(),
-            reply_to: None,
-            task_id: None,
-            refs: vec![HarnessMailRefV1::Run { run_id: sender_run_id.clone() }],
-            created_at_unix_ms: 70,
-        };
-        let operation = mail_operation(operation_id('a'), sender_grant.grant_id.clone(), HarnessOperationKindV1::SendMail, 'a', sender_run_id.clone());
-        let prepared = engine.prepare(HarnessMutationV1::SendMail {
-            operation: operation.clone(),
-            message: message.clone(),
-        }).unwrap();
-        assert_eq!(
-            serde_json::to_value(&HarnessMutationV1::SendMail { operation, message: message.clone() }).unwrap()["mutation"],
-            serde_json::json!("send-mail"),
-        );
-        engine.accept(prepared);
-        assert_eq!(engine.mail_message(&message.message_id), Some(&message));
-
-        // D3/C1 closes the same loophole for the dereference path: fetching
-        // this approval-shaped message's `Run` ref returns only a plain
-        // `HarnessMailRefV1::Run` -- the type has no interaction-shaped
-        // variant and `mail_fetch`'s match is exhaustive over exactly
-        // {Run, ContextPack, Result, WorkspacePath}, so there is structurally
-        // no path from an approval-shaped mail body to `ResolveInteraction`,
-        // not merely an unexercised one.
-        let reader_record_id = HarnessSelectorV1::new("record-sender").unwrap();
-        let resolved = engine.mail_fetch(&sender_grant.grant_id, &reader_record_id, &message.message_id, 0).unwrap();
-        assert_eq!(resolved, HarnessMailFetchResolutionV1::Run { run_id: sender_run_id });
-    }
-
-    /// D3/Slice C: a `ContextPack` ref whose digest matches a real run's own
-    /// `context_pack.digest` resolves to that run -- the caller
-    /// (`gate4agent-harness-service`) fetches the bytes from that run's own
-    /// node/route. A digest that names no run at all is `MailRefTargetUnknown`
-    /// by name.
-    #[test]
-    fn harness_mail_fetch_resolves_context_pack_ref_to_its_owning_run_and_refuses_unknown_digests() {
-        let mut engine = HarnessEngine::new();
-        let sender_run_id = numbered_run_id(131);
-        let sender_task_id = numbered_task_id(131);
-        let mut sender_task = task(sender_task_id.clone(), 1, "sender task");
-        sender_task.run_ids = vec![sender_run_id.clone()];
-        engine.tasks.insert(sender_task_id.clone(), sender_task);
-        insert_managed_run(
-            &mut engine,
-            sender_run_id.clone(),
-            sender_task_id,
-            numbered_operation_id(131),
-            HarnessRunLifecycleV1::Running,
-            1,
-            "record-sender-4",
-        );
-        let receipt = context_pack_receipt('d');
-        engine.runs.get_mut(&sender_run_id).unwrap().context_pack = Some(receipt.clone());
-
-        let mut sender_grant = mail_grant(SessionGrantStateV1::Active, 1);
-        sender_grant.grant_id = numbered_grant_id(131);
-        sender_grant.actor_run_id = sender_run_id.clone();
-        engine.grants.insert(sender_grant.grant_id.clone(), sender_grant.clone());
-
-        let recipient_run_id = numbered_run_id(132);
-        let recipient_task_id = numbered_task_id(132);
-        let mut recipient_task = task(recipient_task_id.clone(), 1, "recipient task");
-        recipient_task.run_ids = vec![recipient_run_id];
-        engine.tasks.insert(recipient_task_id.clone(), recipient_task);
-        insert_managed_run(
-            &mut engine,
-            numbered_run_id(132),
-            recipient_task_id,
-            numbered_operation_id(132),
-            HarnessRunLifecycleV1::Running,
-            1,
-            "record-recipient-4",
-        );
-        let recipient_record_id = HarnessSelectorV1::new("record-recipient-4").unwrap();
-        let mut reader_grant = mail_grant(SessionGrantStateV1::Active, 1);
-        reader_grant.grant_id = numbered_grant_id(132);
-        reader_grant.actor_run_id = numbered_run_id(132);
-        engine.grants.insert(reader_grant.grant_id.clone(), reader_grant.clone());
-
-        let unknown_digest = format!("sha256:{}", "9".repeat(64));
-        let message = HarnessMailMessageV1 {
-            message_id: mail_message_id('e'),
-            from: mail_record_ref("record-sender-4", "claude"),
-            to: HarnessMailAddressV1::Session { record_id: recipient_record_id.clone() },
-            subject: "handoff".to_owned(),
-            body: "see the attached pack".to_owned(),
-            reply_to: None,
-            task_id: None,
-            refs: vec![
-                HarnessMailRefV1::ContextPack { digest: receipt.digest.clone() },
-                HarnessMailRefV1::ContextPack { digest: unknown_digest.clone() },
-            ],
-            created_at_unix_ms: 100,
-        };
-        engine.accept(engine.prepare(HarnessMutationV1::SendMail {
-            operation: mail_operation(operation_id('f'), sender_grant.grant_id.clone(), HarnessOperationKindV1::SendMail, 'f', sender_run_id),
-            message: message.clone(),
-        }).unwrap());
-
-        let resolved = engine.mail_fetch(&reader_grant.grant_id, &recipient_record_id, &message.message_id, 0).unwrap();
-        assert_eq!(
-            resolved,
-            HarnessMailFetchResolutionV1::ContextPack {
-                run_id: numbered_run_id(131),
-                digest: receipt.digest,
-            },
-        );
-
-        match engine.mail_fetch(&reader_grant.grant_id, &recipient_record_id, &message.message_id, 1) {
-            Err(HarnessEngineError::MailRefTargetUnknown { digest }) => {
-                assert_eq!(digest, unknown_digest);
-            }
-            other => panic!("expected MailRefTargetUnknown, got {other:?}"),
-        }
     }
 
     #[test]

@@ -155,55 +155,6 @@ impl HarnessReadClient {
         }
     }
 
-    pub fn mail_send(
-        &self,
-        to: HarnessMailAddressV1,
-        subject: String,
-        body: String,
-        reply_to: Option<HarnessMailMessageId>,
-        refs: Vec<HarnessMailRefV1>,
-    ) -> Result<HarnessMailSendResultV1, HarnessReadClientError> {
-        match self.send(HarnessReadRequestV1::MailSend { to, subject, body, reply_to, refs })? {
-            HarnessReadResponseV1::MailSend(value) => Ok(value),
-            _ => Err(HarnessReadClientError::UnexpectedResponse),
-        }
-    }
-
-    pub fn mail_inbox(
-        &self,
-        since_unix_ms: Option<u64>,
-        limit: u16,
-    ) -> Result<HarnessMailInboxPageV1, HarnessReadClientError> {
-        match self.send(HarnessReadRequestV1::MailInbox { since_unix_ms, limit })? {
-            HarnessReadResponseV1::MailInbox(value) => Ok(value),
-            _ => Err(HarnessReadClientError::UnexpectedResponse),
-        }
-    }
-
-    pub fn mail_ack(
-        &self,
-        message_id: HarnessMailMessageId,
-    ) -> Result<HarnessMailAckResultV1, HarnessReadClientError> {
-        match self.send(HarnessReadRequestV1::MailAck { message_id })? {
-            HarnessReadResponseV1::MailAck(value) => Ok(value),
-            _ => Err(HarnessReadClientError::UnexpectedResponse),
-        }
-    }
-
-    /// D3/Slice C: dereference one ref on a message already in the caller's
-    /// inbox. See `HarnessReadRequestV1::MailFetch`'s own doc comment for the
-    /// authorization rule (message membership, not lineage).
-    pub fn mail_fetch(
-        &self,
-        message_id: HarnessMailMessageId,
-        ref_index: u16,
-    ) -> Result<HarnessMailFetchResultV1, HarnessReadClientError> {
-        match self.send(HarnessReadRequestV1::MailFetch { message_id, ref_index })? {
-            HarnessReadResponseV1::MailFetch(value) => Ok(value),
-            _ => Err(HarnessReadClientError::UnexpectedResponse),
-        }
-    }
-
     /// D5, Slice D: create a task under this grant's own subtree. See
     /// `HarnessReadRequestV1::TaskCreate`'s own doc comment for the subtree
     /// rule (`parent_task_id: None` means "under my own task").
@@ -640,25 +591,6 @@ impl HarnessOperatorClient {
             HarnessOperatorResponseV1::Run(value) => Ok(value),
             _ => Err(HarnessOperatorClientError::UnexpectedResponse),
         }
-    }
-
-    pub fn mail_inbox(
-        &self,
-        record_id: HarnessSelectorV1,
-        since_unix_ms: Option<u64>,
-        limit: u16,
-    ) -> Result<HarnessMailInboxPageV1, HarnessOperatorClientError> {
-        match self.send(HarnessOperatorRequestV1::MailInbox { record_id, since_unix_ms, limit })? {
-            HarnessOperatorResponseV1::MailInbox(value) => Ok(value),
-            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
-        }
-    }
-
-    pub fn ack_mail(
-        &self,
-        request: HarnessMailAckOperatorRequestV1,
-    ) -> Result<HarnessOperatorMutationOutcomeV1, HarnessOperatorClientError> {
-        self.send_mutation(HarnessOperatorRequestV1::AckMail { request })
     }
 
     pub fn run_correlation_get(

@@ -46,7 +46,7 @@ use gate4agent_harness_api::{
     HARNESS_WORKSPACE_FILE_MAX_BYTES, HARNESS_WORKSPACE_TREE_ENTRIES_MAX,
 };
 use gate4agent_node_protocol::{
-    context_pack_digest, CapabilityId, ContextPackBytesRead, DeliveryBlobChunkHexV1,
+    CapabilityId, DeliveryBlobChunkHexV1,
     DeliveryBlobDigestV1, DeliveryBundleManifestV2,
     DeliveryCommitReceiptV1, DeliveryStageId, HarnessMcpActivationDigest,
     HarnessMcpCallId, HarnessMcpRejectReasonV1, HarnessMcpReplyChunkHexV1,
@@ -59,7 +59,7 @@ use gate4agent_node_protocol::{
     ResolvedSpawnReceipt, ResolvedSpawnSpec,
     GitDiff, GitDiffMode, GitDiffRequest, GitHistoryPage, GitObjectId,
     GitSignatureStatus, HostDirectoryListing, OpaqueHostPath, RepositoryPath,
-    SpawnContextDigest, SpawnContextId,
+    SpawnContextId,
     WorkspaceEntryKind, WorkspaceFileContent,
     WorkspaceFileRead, WorkspaceFileRevision, WorktreeServiceMode,
     SessionAddress, SessionKey, SessionMode,
@@ -3429,13 +3429,12 @@ pub fn correlate_session_record_mutation_response(
 /// `provider_session`/`last_error`), the type every session-record `C2NodeResponse`
 /// carries.
 ///
-/// `blocked_count`/`last_blocked_at_ms`/`unread_mail` are always `0`/`None`/
-/// `0` here, same as in `redact_runtime_inventory`: this function has no
-/// `ObservationService` or `HarnessEngine` in scope (it runs off a C2
-/// mutation-completion reply, not an operator read), and only
-/// `fill_managed_session_blocked_stats` in `runtime.rs` (the
-/// `RuntimeInventoryList` reply path) fills all three from the harness's own
-/// state.
+/// `blocked_count`/`last_blocked_at_ms` are always `0`/`None` here, same as
+/// in `redact_runtime_inventory`: this function has no `ObservationService`
+/// or `HarnessEngine` in scope (it runs off a C2 mutation-completion reply,
+/// not an operator read), and only `fill_managed_session_blocked_stats` in
+/// `runtime.rs` (the `RuntimeInventoryList` reply path) fills both from the
+/// harness's own state.
 fn project_c2_managed_session(
     record: C2ManagedSessionRecord,
 ) -> Result<HarnessRuntimeManagedSessionV1, HarnessC2Error> {
@@ -3477,7 +3476,6 @@ fn project_c2_managed_session(
         updated_at_unix_ms: record.updated_at_unix_ms,
         blocked_count: 0,
         last_blocked_at_ms: None,
-        unread_mail: 0,
     })
 }
 
@@ -5300,178 +5298,6 @@ impl PendingDurableContextPackResolve {
     }
 }
 
-/// D3/Slice C2's fetch-only node round trip for one mailed `ContextPack` ref
-/// already resolved by `HarnessEngine::mail_fetch` to an owning run:
-/// `binding` is that run's own stored session binding (the node/incarnation
-/// it last dispatched to), `digest` its context pack's own digest. No
-/// durable authority is consulted here (unlike `start_context_pack_export`'s
-/// continuation authority) -- this is a plain read of bytes the harness
-/// already knows exist, gated by mail membership alone (see
-/// `HarnessEngine::mail_fetch`'s own doc comment).
-impl HarnessC2Adapter {
-    pub(crate) fn start_context_pack_fetch(
-        &self,
-        binding: &HarnessSessionBindingV1,
-        digest: &str,
-    ) -> Result<PendingContextPackFetch, HarnessC2Error> {
-        let node_id = NodeId::new(binding.node_id.as_str())
-            .map_err(|_| HarnessC2Error::InvalidContextPackFetchRequest)?;
-        let expected_incarnation_id = binding.node_incarnation.as_str().parse()
-            .map_err(|_| HarnessC2Error::InvalidContextPackFetchRequest)?;
-        let route = NodeRoute { node_id, expected_incarnation_id };
-        self.ensure_current_incarnation(&route)?;
-        let context_digest = SpawnContextDigest::new(digest)
-            .map_err(|_| HarnessC2Error::InvalidContextPackFetchRequest)?;
-        let pending = self.control.start_request(
-            route.clone(),
-            NodeRequest::ReadContextPack { digest: context_digest.clone() },
-        ).map_err(HarnessC2Error::ContextPackFetchEnqueue)?;
-        Ok(PendingContextPackFetch {
-            route,
-            digest: context_digest,
-            started_at: Instant::now(),
-            pending: Some(pending),
-        })
-    }
-}
-
-pub(crate) struct PendingContextPackFetch {
-    route: NodeRoute,
-    digest: SpawnContextDigest,
-    started_at: Instant,
-    pending: Option<C2PendingRequest>,
-}
-
-impl PendingContextPackFetch {
-    pub(crate) async fn finish(mut self) -> Result<ContextPackBytesRead, HarnessC2Error> {
-        let pending = self.pending.take()
-            .expect("pending context pack fetch owns exactly one C2 waiter");
-        match pending.finish().await {
-            Err(C2ControlError::Closed)
-                if self.started_at.elapsed() >= RUN_READ_TIMEOUT_FLOOR => {
-                    Err(HarnessC2Error::ContextPackFetchDeadline)
-                }
-            Err(error) => Err(HarnessC2Error::ContextPackFetchTransport(error)),
-            Ok(routed) if routed.node_id != self.route.node_id
-                || routed.incarnation_id != self.route.expected_incarnation_id => {
-                    Err(HarnessC2Error::ContextPackFetchRouteMismatch)
-                }
-            Ok(routed) => match routed.response {
-                Err(failure) => Err(HarnessC2Error::ContextPackFetchRejected { code: failure.code }),
-                Ok(response) => correlate_context_pack_fetch_response(&self.digest, response),
-            },
-        }
-    }
-}
-
-fn correlate_context_pack_fetch_response(
-    digest: &SpawnContextDigest,
-    response: C2NodeResponse,
-) -> Result<ContextPackBytesRead, HarnessC2Error> {
-    match response {
-        C2NodeResponse::ContextPackBytesRead { pack } if &pack.digest == digest => Ok(pack),
-        _ => Err(HarnessC2Error::ContextPackFetchCorrelationMismatch),
-    }
-}
-
-/// Recomputes a fetched context pack's digest over the lineage this run's
-/// own receipt carries plus the bytes the Node just returned -- so bytes
-/// that don't hash to the digest a mailed ref actually named (a corrupted
-/// store, a stale pack) are caught here rather than trusted on the wire's
-/// say-so alone. The formula itself lives once in
-/// `gate4agent_node_protocol::context_pack_digest`, shared with
-/// `gate4agent-node`'s own export path; `harness_context_to_node` already
-/// reconstructs the exact `ContextPackLineageReceipt` value node serialized
-/// when it first computed this digest, so the JSON bytes hashed here are
-/// byte-identical to node's own.
-pub(crate) fn recompute_context_pack_digest(
-    receipt: &HarnessResolvedContextPackReceiptV1,
-    bytes: &[u8],
-) -> Result<String, HarnessC2Error> {
-    let node_receipt = harness_context_to_node(receipt)?;
-    Ok(context_pack_digest(&node_receipt.lineage, bytes).to_string())
-}
-
-/// D3/Slice C3's fetch-only node round trip for one mailed `WorkspacePath`
-/// ref already resolved by `HarnessEngine::mail_fetch` to its own fields
-/// verbatim (there is no run or durable receipt to check it against, unlike
-/// `ContextPack`) and by the caller (`prepare_workspace_path_fetch`) to
-/// exactly one connected node. Unlike `start_context_pack_fetch`, there is
-/// no stored session binding to derive a route from -- the route is
-/// resolved live via `exact_route`, the same way `PreparedNodeWorkspaceRead`
-/// resolves one for the operator-facing node/workspace read family this
-/// mirrors the wire shape of (`NodeRequest::ReadWorkspaceFile` /
-/// `C2NodeResponse::WorkspaceFileRead`), but kept as its own narrow pending
-/// type rather than routed through that family's `WorkspaceReadKind`: this
-/// fetch answers plain `WorkspaceFileRead` for `finish_workspace_path_fetch`
-/// to project into `HarnessMailFetchResultV1` directly, never
-/// `HarnessOperatorResponseV1`.
-impl HarnessC2Adapter {
-    pub(crate) fn start_workspace_path_fetch(
-        &self,
-        node_id: &NodeId,
-        workspace_id: WorkspaceId,
-        path: RepositoryPath,
-    ) -> Result<PendingWorkspacePathFetch, HarnessC2Error> {
-        let route = self.exact_route(node_id)?;
-        let pending = self.control.start_request(
-            route.clone(),
-            NodeRequest::ReadWorkspaceFile { workspace_id: workspace_id.clone(), path: path.clone() },
-        ).map_err(HarnessC2Error::WorkspacePathFetchEnqueue)?;
-        Ok(PendingWorkspacePathFetch {
-            route,
-            workspace_id,
-            path,
-            started_at: Instant::now(),
-            pending: Some(pending),
-        })
-    }
-}
-
-pub(crate) struct PendingWorkspacePathFetch {
-    route: NodeRoute,
-    workspace_id: WorkspaceId,
-    path: RepositoryPath,
-    started_at: Instant,
-    pending: Option<C2PendingRequest>,
-}
-
-impl PendingWorkspacePathFetch {
-    pub(crate) async fn finish(mut self) -> Result<WorkspaceFileRead, HarnessC2Error> {
-        let pending = self.pending.take()
-            .expect("pending workspace path fetch owns exactly one C2 waiter");
-        match pending.finish().await {
-            Err(C2ControlError::Closed)
-                if self.started_at.elapsed() >= RUN_READ_TIMEOUT_FLOOR => {
-                    Err(HarnessC2Error::WorkspacePathFetchDeadline)
-                }
-            Err(error) => Err(HarnessC2Error::WorkspacePathFetchTransport(error)),
-            Ok(routed) if routed.node_id != self.route.node_id
-                || routed.incarnation_id != self.route.expected_incarnation_id => {
-                    Err(HarnessC2Error::WorkspacePathFetchRouteMismatch)
-                }
-            Ok(routed) => match routed.response {
-                Err(failure) => Err(HarnessC2Error::WorkspacePathFetchRejected { code: failure.code }),
-                Ok(response) => {
-                    correlate_workspace_path_fetch_response(&self.workspace_id, &self.path, response)
-                }
-            },
-        }
-    }
-}
-
-fn correlate_workspace_path_fetch_response(
-    workspace_id: &WorkspaceId,
-    path: &RepositoryPath,
-    response: C2NodeResponse,
-) -> Result<WorkspaceFileRead, HarnessC2Error> {
-    match response {
-        C2NodeResponse::WorkspaceFileRead { file }
-            if &file.workspace_id == workspace_id && &file.path == path => Ok(file),
-        _ => Err(HarnessC2Error::WorkspacePathFetchCorrelationMismatch),
-    }
-}
-
 #[derive(Debug)]
 struct PreparedSpawnHarnessMcp {
     reservation_id: HarnessMcpReservationId,
@@ -6471,32 +6297,6 @@ pub enum HarnessC2Error {
     NodeWorkspaceReadTooLarge,
     #[error("Node rejected node workspace read with {code:?}")]
     NodeWorkspaceReadRejected { code: NodeFailureCode },
-    #[error("mailed context pack fetch request is invalid")]
-    InvalidContextPackFetchRequest,
-    #[error("mailed context pack fetch was not enqueued: {0}")]
-    ContextPackFetchEnqueue(C2ControlError),
-    #[error("mailed context pack fetch transport failed: {0}")]
-    ContextPackFetchTransport(C2ControlError),
-    #[error("mailed context pack fetch deadline elapsed")]
-    ContextPackFetchDeadline,
-    #[error("mailed context pack fetch response route or incarnation does not match")]
-    ContextPackFetchRouteMismatch,
-    #[error("mailed context pack fetch response does not exactly correlate with the request")]
-    ContextPackFetchCorrelationMismatch,
-    #[error("Node rejected mailed context pack fetch with {code:?}")]
-    ContextPackFetchRejected { code: NodeFailureCode },
-    #[error("mailed workspace path fetch was not enqueued: {0}")]
-    WorkspacePathFetchEnqueue(C2ControlError),
-    #[error("mailed workspace path fetch transport failed: {0}")]
-    WorkspacePathFetchTransport(C2ControlError),
-    #[error("mailed workspace path fetch deadline elapsed")]
-    WorkspacePathFetchDeadline,
-    #[error("mailed workspace path fetch response route or incarnation does not match")]
-    WorkspacePathFetchRouteMismatch,
-    #[error("mailed workspace path fetch response does not exactly correlate with the request")]
-    WorkspacePathFetchCorrelationMismatch,
-    #[error("Node rejected mailed workspace path fetch with {code:?}")]
-    WorkspacePathFetchRejected { code: NodeFailureCode },
     #[error("node workspace write request is invalid")]
     InvalidNodeWorkspaceWriteRequest,
     #[error("node workspace write was not enqueued: {0}")]

@@ -4,9 +4,7 @@ use crate::{
     HarnessService,
 };
 use gate4agent_harness_api::*;
-use gate4agent_harness_engine::{
-    HarnessEngineError, HarnessMailFetchResolutionV1, HarnessReadVisibilityV1,
-};
+use gate4agent_harness_engine::HarnessReadVisibilityV1;
 use gate4agent_harness_protocol::{
     HarnessActorV1, HarnessEntityReadScopeV1, HarnessMonitoringVisibilityV1,
     HarnessSessionIdentityV1, HarnessWorktreeIntentV1, SessionGrantV1,
@@ -31,14 +29,13 @@ enum ObservationAudience {
 /// Collapse a mutating agent-tool call's error into the wire's `Internal`
 /// WITHOUT losing it.
 ///
-/// The `MailSend`/`MailAck`/`TaskCreate`/`TaskMove` arms each used a bare
-/// `map_err(|_| Internal)`, and `Internal` reaches the calling agent as
-/// "harness read unavailable" -- so mail refused on grant scope, a task moved
-/// to a state it may not reach, and a genuine store failure were one
-/// indistinguishable message whose cause existed in no log anywhere.
-/// Measured live 2026-09-09: a cross-provider `g4a_mail_send` came back
-/// `served=false` against a valid grant, with no other line recorded at all.
-/// The returned error is unchanged; only the silence is.
+/// The `TaskCreate`/`TaskMove` arms each used a bare `map_err(|_| Internal)`,
+/// and `Internal` reaches the calling agent as "harness read unavailable" --
+/// so a task moved to a state it may not reach and a genuine store failure
+/// were one indistinguishable message whose cause existed in no log
+/// anywhere. Measured live 2026-09-09: a cross-provider agent write came
+/// back `served=false` against a valid grant, with no other line recorded
+/// at all. The returned error is unchanged; only the silence is.
 fn internal_naming<E: std::fmt::Debug>(
     operation: &'static str,
 ) -> impl Fn(E) -> HarnessReadHostErrorV1 {
@@ -63,14 +60,7 @@ pub(crate) fn verify_and_execute_read(
     verify_observation_binding(observation, support, &claims)?;
     let runtime_inventory = crate::runtime::HarnessRuntimeInventoryCache::default();
     let dispatch = execute_read(harness, observation, support, &claims, request, &runtime_inventory)?;
-    // This test-only wrapper has no C2/Node adapter (and no runtime
-    // inventory), so it cannot complete a `ContextPack` or `WorkspacePath`
-    // fetch -- see `dispatch_mail_fetch`'s own doc comment.
-    let response = match dispatch {
-        ReadDispatch::Response(response) => response,
-        ReadDispatch::ContextPackFetch(_) => return Err(HarnessReadHostErrorV1::Internal),
-        ReadDispatch::WorkspacePathFetch(_) => return Err(HarnessReadHostErrorV1::Internal),
-    };
+    let ReadDispatch::Response(response) = dispatch;
     response.validate().map_err(|_| HarnessReadHostErrorV1::Internal)?;
     Ok(response)
 }
@@ -207,9 +197,6 @@ pub(crate) fn execute_read(
     request: HarnessReadRequestV1,
     runtime_inventory: &crate::runtime::HarnessRuntimeInventoryCache,
 ) -> Result<ReadDispatch, HarnessReadHostErrorV1> {
-    if let HarnessReadRequestV1::MailFetch { message_id, ref_index } = request {
-        return dispatch_mail_fetch(harness, observation, support, &claims.binding, message_id, ref_index);
-    }
     execute_exact_binding_read(
         harness,
         observation,
@@ -267,7 +254,14 @@ pub(crate) fn execute_exact_binding_read(
     support: &ObservationSupportRegistry,
     binding: &CredentialBindingV1,
     request: HarnessReadRequestV1,
-    runtime_inventory: &crate::runtime::HarnessRuntimeInventoryCache,
+    // No longer read: the mailbox moved to its own service (2026-09-17) and
+    // took with it the one caller (`resolve_caller_record_ref`) that needed
+    // the runtime inventory here. Kept on the signature rather than removed
+    // -- every other `execute_read`/`prepare_harness_mcp_read_call` call
+    // site (production and the ~20 in this file's own tests) still passes
+    // one through, and `execute_read` itself still needs its own copy for
+    // dispatch elsewhere on that same path.
+    _runtime_inventory: &crate::runtime::HarnessRuntimeInventoryCache,
 ) -> Result<HarnessReadResponseV1, HarnessReadHostErrorV1> {
     request.validate().map_err(|_| HarnessReadHostErrorV1::InvalidRequest)?;
     let engine = harness.engine();
@@ -280,42 +274,13 @@ pub(crate) fn execute_exact_binding_read(
     let visibility = engine.read_visibility(&grant.grant_id)
         .map_err(|_| HarnessReadHostErrorV1::Internal)?;
     authorize_request(grant, &request)?;
-    // Everything below this line that mutates (`SendMail`/`AckMail`/
-    // `TaskCreate`/`TaskMove`/`RunFinish`) reads only owned values out of
-    // `grant`/`binding` first, then calls into `harness` -- never
-    // `engine`/`grant`/`visibility` again in that same arm -- so the
-    // immutable borrow of `harness` those two hold ends before the mutable
-    // one `HarnessService::send_mail`/`ack_mail`/`agent_create_task`/
+    // Everything below this line that mutates (`TaskCreate`/`TaskMove`/
+    // `RunFinish`) reads only owned values out of `grant`/`binding` first,
+    // then calls into `harness` -- never `engine`/`grant`/`visibility` again
+    // in that same arm -- so the immutable borrow of `harness` those two
+    // hold ends before the mutable one `HarnessService::agent_create_task`/
     // `agent_move_task`/`crate::runtime::agent_finish_run` needs begins.
     match request {
-        HarnessReadRequestV1::MailSend { to, subject, body, reply_to, refs } => {
-            let grant_id = grant.grant_id.clone();
-            let actor_run_id = binding.actor_run_id.clone();
-            let now_unix_ms = unix_time_ms();
-            let from = resolve_caller_record_ref(binding, runtime_inventory);
-            let result = harness.send_mail(
-                grant_id, actor_run_id, from, to, subject, body, reply_to, refs, now_unix_ms,
-            ).map_err(internal_naming("g4a_mail_send"))?;
-            Ok(HarnessReadResponseV1::MailSend(result))
-        }
-        HarnessReadRequestV1::MailInbox { since_unix_ms, limit } => {
-            let page = mail_inbox_page(engine, &grant.grant_id, &binding.record_id, since_unix_ms, limit)?;
-            Ok(HarnessReadResponseV1::MailInbox(page))
-        }
-        HarnessReadRequestV1::MailAck { message_id } => {
-            let grant_id = grant.grant_id.clone();
-            let reader_record_id = binding.record_id.clone();
-            let actor_run_id = binding.actor_run_id.clone();
-            let now_unix_ms = unix_time_ms();
-            harness.ack_mail(
-                grant_id,
-                HarnessActorV1::ParentRun { run_id: actor_run_id },
-                reader_record_id,
-                message_id,
-                now_unix_ms,
-            ).map_err(internal_naming("g4a_mail_ack"))?;
-            Ok(HarnessReadResponseV1::MailAck(HarnessMailAckResultV1 { acked: true }))
-        }
         HarnessReadRequestV1::TaskCreate { title, body, parent_task_id } => {
             let grant_id = grant.grant_id.clone();
             let actor_run_id = binding.actor_run_id.clone();
@@ -334,8 +299,7 @@ pub(crate) fn execute_exact_binding_read(
             ).map_err(internal_naming("g4a_task_move"))?;
             Ok(HarnessReadResponseV1::TaskMove(result))
         }
-        HarnessReadRequestV1::RunFinish { outcome, summary } => {
-            let grant_id = grant.grant_id.clone();
+        HarnessReadRequestV1::RunFinish { outcome, summary: _ } => {
             let actor_run_id = binding.actor_run_id.clone();
             let now_unix_ms = unix_time_ms();
             let node_id = gate4agent_observation_api::NodeId::new(binding.node_id.as_str())
@@ -346,42 +310,15 @@ pub(crate) fn execute_exact_binding_read(
             let result = crate::runtime::agent_finish_run(
                 harness, &actor_run_id, &node_id, incarnation_id, outcome, now_unix_ms,
             ).map_err(internal_naming("g4a_run_finish"))?;
-            // D4/S10: the summary rides the proven mail channel, posted only
-            // once the finish is already committed -- a mail failure (a
-            // refusal, or a genuine send error) must never undo or block a
-            // finish that already happened, so it is logged and swallowed,
-            // never propagated as this call's own error.
-            if let HarnessRunFinishResultV1::Finished { task_id, .. } = &result {
-                if let Some(summary) = summary {
-                    let from = resolve_caller_record_ref(binding, runtime_inventory);
-                    let subject = run_finish_mail_subject(outcome);
-                    match harness.send_mail(
-                        grant_id,
-                        actor_run_id,
-                        from,
-                        HarnessMailAddressV1::Task { task_id: task_id.clone() },
-                        subject,
-                        summary,
-                        None,
-                        Vec::new(),
-                        now_unix_ms,
-                    ) {
-                        Ok(HarnessMailSendResultV1::Accepted { .. }) => {}
-                        Ok(HarnessMailSendResultV1::Refused { reason }) => {
-                            tracing::warn!(
-                                reason,
-                                "g4a_run_finish: summary mail refused; the run is already finished",
-                            );
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                error = ?error,
-                                "g4a_run_finish: summary mail failed; the run is already finished",
-                            );
-                        }
-                    }
-                }
-            }
+            // Mailbox removed 2026-09-17 (moved to its own service): this
+            // call used to post `summary` to the task's forum address as a
+            // best-effort notification once the finish above had already
+            // committed. That announcement was a second copy of a fact the
+            // kernel already holds -- the run's own outcome and the task it
+            // lands in -- so nothing replaces it; a board reads the same
+            // fact off the run/task directly. `summary` stays accepted on
+            // the wire (see `HarnessReadRequestV1::RunFinish`'s own doc
+            // comment) but has no effect here.
             Ok(HarnessReadResponseV1::RunFinish(result))
         }
         _ => execute_exact_binding_read_only(harness.engine(), observation, support, binding, grant, &visibility, request),
@@ -497,253 +434,22 @@ fn execute_exact_binding_read_only(
                 .ok_or(HarnessReadHostErrorV1::NotFoundOrDenied)?;
             Ok(HarnessReadResponseV1::Operation(redact_operation(operation, visibility)))
         }
-        HarnessReadRequestV1::MailFetch { message_id, ref_index } => {
-            mail_fetch(engine, observation, support, grant, binding, message_id, ref_index)
-        }
-        // `MailSend`/`MailInbox`/`MailAck`/`TaskCreate`/`TaskMove`/
-        // `RunFinish` never reach this function -- `execute_exact_binding_
-        // read` dispatches all six itself, before ever delegating here.
-        // Never reached in practice; refused rather than panicking if it
-        // somehow were.
-        HarnessReadRequestV1::MailSend { .. }
-        | HarnessReadRequestV1::MailInbox { .. }
-        | HarnessReadRequestV1::MailAck { .. }
-        | HarnessReadRequestV1::TaskCreate { .. }
+        // `TaskCreate`/`TaskMove`/`RunFinish` never reach this function --
+        // `execute_exact_binding_read` dispatches all three itself, before
+        // ever delegating here. Never reached in practice; refused rather
+        // than panicking if it somehow were.
+        HarnessReadRequestV1::TaskCreate { .. }
         | HarnessReadRequestV1::TaskMove { .. }
         | HarnessReadRequestV1::RunFinish { .. } => Err(HarnessReadHostErrorV1::InvalidRequest),
     }
 }
 
-/// D3/Slice C's `g4a_mail_fetch`: first verifies the message is in
-/// `binding.record_id`'s inbox (`HarnessEngine::mail_fetch`'s own membership
-/// predicate -- the same one `mail_inbox` uses), then resolves the ref. An
-/// engine refusal (not addressed to this reader, an out-of-range index)
-/// travels back as `HarnessMailFetchResultV1::Refused` with the engine's own
-/// `Display` text -- a named domain refusal, never a host error, same
-/// pattern as `MailSend` -- except `HarnessEngineError::MailRefTargetUnknown`
-/// (no run's own `context_pack` receipt carries the ref's digest), which
-/// `mail_fetch_engine_error_result` maps onto its own typed
-/// `MailRefContextPackUnknown` instead, mirroring `WorkspacePath`'s typed
-/// refusal family (D3/Slice C2). Deliberately does NOT call
-/// `authorized_monitor_run` -- that enforces the caller's own lineage
-/// (`visibility.run_visible`), which a mailed `Run` ref is explicitly allowed
-/// to cross; the ONLY gate here is `HarnessEngine::mail_fetch`'s own
-/// inbox-membership check.
-///
-/// A resolved `ContextPack` or `WorkspacePath` is refused locally here --
-/// this function (via `execute_exact_binding_read_only`) has no C2/Node
-/// adapter (and, for `WorkspacePath`, no runtime inventory to resolve a
-/// node from), so it cannot complete either byte fetch. The one caller that
-/// CAN, `execute_read`'s own `HostCommand::Read` production path, never
-/// reaches this function for a `MailFetch` request at all: it intercepts
-/// the request before delegating down (see `dispatch_mail_fetch`), resolves
-/// the ref itself, and only falls through to `project_resolved_mail_fetch`
-/// for `Run`/`Result`. Direct test callers of `execute_exact_binding_read`
-/// and the harness-MCP relay path (`relay_harness_mcp_read_call`) still
-/// reach this function and its local refusals.
-fn mail_fetch(
-    engine: &gate4agent_harness_engine::HarnessEngine,
-    observation: &ObservationService,
-    support: &ObservationSupportRegistry,
-    grant: &SessionGrantV1,
-    binding: &CredentialBindingV1,
-    message_id: HarnessMailMessageId,
-    ref_index: u16,
-) -> Result<HarnessReadResponseV1, HarnessReadHostErrorV1> {
-    let resolved = match engine.mail_fetch(
-        &grant.grant_id,
-        &binding.record_id,
-        &message_id,
-        usize::from(ref_index),
-    ) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            return Ok(HarnessReadResponseV1::MailFetch(mail_fetch_engine_error_result(error)));
-        }
-    };
-    if let HarnessMailFetchResolutionV1::ContextPack { digest, .. } = &resolved {
-        return Ok(HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused {
-            reason: format!(
-                "mailed context pack {digest} requires the node-connected read path",
-            ),
-        }));
-    }
-    if let HarnessMailFetchResolutionV1::WorkspacePath { workspace, path, .. } = &resolved {
-        return Ok(HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused {
-            reason: format!(
-                "mailed workspace path {}:{path} requires the node-connected read path",
-                workspace.as_str(),
-            ),
-        }));
-    }
-    project_resolved_mail_fetch(engine, observation, support, resolved)
-        .map(HarnessReadResponseV1::MailFetch)
-}
-
-/// Maps `HarnessEngine::mail_fetch`'s error onto the wire, shared by both of
-/// this crate's call sites (`mail_fetch` above and `dispatch_mail_fetch`
-/// below): `MailRefTargetUnknown` (no run's own `context_pack` receipt
-/// carries the ref's digest) is a typed refusal in its own right --
-/// `MailRefContextPackUnknown`, naming its input as a field rather than
-/// prose, the same doctrine `WorkspacePath`'s own named refusals (D3/Slice
-/// C3) already follow. Every other engine error (`MailNotForReader`,
-/// `MailRefIndexOutOfRange`, and a `NotFound` unknown message id) has no
-/// bounded, reusable set of inputs the way that one does, so it stays
-/// `Refused` with the engine's own `Display` text verbatim.
-fn mail_fetch_engine_error_result(error: HarnessEngineError) -> HarnessMailFetchResultV1 {
-    match error {
-        HarnessEngineError::MailRefTargetUnknown { digest } => {
-            HarnessMailFetchResultV1::MailRefContextPackUnknown { digest }
-        }
-        other => HarnessMailFetchResultV1::Refused { reason: other.to_string() },
-    }
-}
-
-/// The `Run`/`Result` projection half of `mail_fetch`, split out so
-/// `dispatch_mail_fetch` (the C2-connected production path) can reuse it
-/// without re-resolving the ref through the engine a second time. Returns
-/// `HarnessReadHostErrorV1::Internal` if given the `ContextPack` or
-/// `WorkspacePath` resolution -- every caller special-cases both variants
-/// itself first (see each caller's own doc comment).
-fn project_resolved_mail_fetch(
-    engine: &gate4agent_harness_engine::HarnessEngine,
-    observation: &ObservationService,
-    support: &ObservationSupportRegistry,
-    resolved: HarnessMailFetchResolutionV1,
-) -> Result<HarnessMailFetchResultV1, HarnessReadHostErrorV1> {
-    match resolved {
-        HarnessMailFetchResolutionV1::Run { run_id } => {
-            if engine.run(&run_id).is_none() {
-                return Ok(HarnessMailFetchResultV1::Refused {
-                    reason: format!("mailed run {run_id} no longer exists"),
-                });
-            }
-            let HarnessReadResponseV1::Monitor(monitor_value) = monitor(
-                engine,
-                observation,
-                support,
-                HarnessMonitoringVisibilityV1::Timeline,
-                &run_id,
-                ObservationAudience::GrantBound,
-            )? else {
-                return Err(HarnessReadHostErrorV1::Internal);
-            };
-            let HarnessReadResponseV1::Timeline(timeline_value) = timeline(
-                engine,
-                observation,
-                support,
-                &run_id,
-                None,
-                HARNESS_TIMELINE_PAGE_LIMIT_MAX,
-                ObservationAudience::GrantBound,
-            )? else {
-                return Err(HarnessReadHostErrorV1::Internal);
-            };
-            Ok(HarnessMailFetchResultV1::Run { monitor: monitor_value, timeline: timeline_value })
-        }
-        HarnessMailFetchResolutionV1::Result { result_ref } => {
-            let Ok(run_id) = result_ref.run_id() else {
-                return Ok(HarnessMailFetchResultV1::Refused {
-                    reason: format!("mailed result reference {result_ref} is malformed"),
-                });
-            };
-            let Some(run) = engine.run(&run_id) else {
-                return Ok(HarnessMailFetchResultV1::Refused {
-                    reason: format!("mailed result reference names a run that no longer exists: {run_id}"),
-                });
-            };
-            // The lineage fence stays closed for cross-references reachable
-            // FROM this run (its own parent/task/operation) -- only the run
-            // the ref names was authorized by the mail, not its lineage.
-            Ok(HarnessMailFetchResultV1::Result {
-                run: redact_run(run, &HarnessReadVisibilityV1::default()),
-            })
-        }
-        HarnessMailFetchResolutionV1::ContextPack { .. } => Err(HarnessReadHostErrorV1::Internal),
-        HarnessMailFetchResolutionV1::WorkspacePath { .. } => Err(HarnessReadHostErrorV1::Internal),
-    }
-}
-
-/// D3/Slice C2+C3: the one call site of `execute_read` that can complete a
-/// resolved `ContextPack` or `WorkspacePath` ref's byte fetch
-/// (`HostCommand::Read`'s production arm in `runtime.rs`, which owns a
-/// `HarnessC2Adapter` and the runtime inventory a `WorkspacePath` ref needs
-/// to resolve a node). Re-does the small slice of `execute_exact_binding_
-/// read`'s prologue that applies to `MailFetch` (request validation, the
-/// exact grant/binding CAS check, the `grant.mail` gate `authorize_request`
-/// enforces for every other MailFetch path) rather than routing through
-/// that function, so either C2-capable resolution can be signalled back as
-/// its own `ReadDispatch` variant instead of a `HarnessReadResponseV1`.
-pub(crate) fn dispatch_mail_fetch(
-    harness: &mut HarnessService,
-    observation: &ObservationService,
-    support: &ObservationSupportRegistry,
-    binding: &CredentialBindingV1,
-    message_id: HarnessMailMessageId,
-    ref_index: u16,
-) -> Result<ReadDispatch, HarnessReadHostErrorV1> {
-    message_id.validate().map_err(|_| HarnessReadHostErrorV1::InvalidRequest)?;
-    let engine = harness.engine();
-    let grant = engine.grant(&binding.grant_id)
-        .filter(|grant| {
-            grant.revision == binding.grant_revision
-                && grant.actor_run_id == binding.actor_run_id
-        })
-        .ok_or(HarnessReadHostErrorV1::Unauthorized)?;
-    if !grant.mail {
-        return Err(HarnessReadHostErrorV1::NotFoundOrDenied);
-    }
-    match engine.mail_fetch(&grant.grant_id, &binding.record_id, &message_id, usize::from(ref_index)) {
-        Ok(HarnessMailFetchResolutionV1::ContextPack { run_id, digest }) => {
-            Ok(ReadDispatch::ContextPackFetch(ContextPackFetchIntent { run_id, digest }))
-        }
-        Ok(HarnessMailFetchResolutionV1::WorkspacePath { workspace, path, sha256 }) => {
-            Ok(ReadDispatch::WorkspacePathFetch(WorkspacePathFetchIntent {
-                workspace: workspace.as_str().to_owned(),
-                path,
-                sha256,
-            }))
-        }
-        Ok(resolved) => project_resolved_mail_fetch(engine, observation, support, resolved)
-            .map(|result| ReadDispatch::Response(HarnessReadResponseV1::MailFetch(result))),
-        Err(error) => Ok(ReadDispatch::Response(HarnessReadResponseV1::MailFetch(
-            mail_fetch_engine_error_result(error),
-        ))),
-    }
-}
-
-/// `execute_read`'s outcome: either a complete response, or -- for a
-/// `MailFetch` request whose ref resolved to a `ContextPack` or a
-/// `WorkspacePath` -- the intent the caller (`HostCommand::Read`'s
-/// production arm) must start a C2/Node round trip for before it can reply.
+/// `execute_read`'s outcome. The only variant left after the mailbox moved
+/// to its own service (2026-09-17): this used to also carry a deferred
+/// `ContextPack`/`WorkspacePath` fetch intent for a `g4a_mail_fetch` call
+/// whose ref needed a node round trip before it could reply.
 pub(crate) enum ReadDispatch {
     Response(HarnessReadResponseV1),
-    ContextPackFetch(ContextPackFetchIntent),
-    WorkspacePathFetch(WorkspacePathFetchIntent),
-}
-
-/// `dispatch_mail_fetch`'s deferred outcome: the run whose own
-/// `context_pack.digest` matched the mailed ref, and that digest itself
-/// (`HarnessEngine::mail_fetch` already proved they match). The caller
-/// resolves that run's stored node binding and starts the fetch; this type
-/// carries no node/route information itself since this crate's read layer
-/// does not depend on C2.
-pub(crate) struct ContextPackFetchIntent {
-    pub(crate) run_id: HarnessRunId,
-    pub(crate) digest: String,
-}
-
-/// `dispatch_mail_fetch`'s deferred outcome for a `WorkspacePath` ref
-/// (D3/Slice C3): the ref's own fields verbatim, exactly as `HarnessEngine::
-/// mail_fetch` resolved them -- unlike `ContextPackFetchIntent`, this names
-/// no run at all, since a `WorkspacePath` ref carries no run binding to
-/// resolve a node from. The caller resolves `workspace` to a node from its
-/// own runtime inventory instead (`HarnessRuntimeInventoryCache::
-/// all_nodes`), a lookup this crate's read layer does not depend on either.
-pub(crate) struct WorkspacePathFetchIntent {
-    pub(crate) workspace: String,
-    pub(crate) path: String,
-    pub(crate) sha256: String,
 }
 
 fn authorize_request(
@@ -763,13 +469,6 @@ fn authorize_request(
         }
         HarnessReadRequestV1::OperationGet { .. }
             if grant.read_permissions.operations == HarnessEntityReadScopeV1::None =>
-        {
-            return Err(HarnessReadHostErrorV1::NotFoundOrDenied);
-        }
-        HarnessReadRequestV1::MailSend { .. }
-        | HarnessReadRequestV1::MailInbox { .. }
-        | HarnessReadRequestV1::MailAck { .. }
-        | HarnessReadRequestV1::MailFetch { .. } if !grant.mail =>
         {
             return Err(HarnessReadHostErrorV1::NotFoundOrDenied);
         }
@@ -821,7 +520,6 @@ fn context(
         monitoring_visibility: grant.monitoring_visibility,
         child_task_count: engine.task_child_count(&run.task_id),
         child_task_subtree_depth: engine.task_subtree_depth(&run.task_id),
-        mail: grant.mail,
         task_create: grant.task_permissions.create,
         task_mutate: grant.task_permissions.mutate,
         allowed_tool_ids: allowed_tool_ids(grant),
@@ -1059,9 +757,6 @@ pub(crate) fn allowed_tool_ids(grant: &SessionGrantV1) -> Vec<String> {
     if grant.read_permissions.operations != HarnessEntityReadScopeV1::None {
         tools.push("g4a_operation_get");
     }
-    if grant.mail {
-        tools.extend(["g4a_mail_send", "g4a_mail_inbox", "g4a_mail_ack", "g4a_mail_fetch"]);
-    }
     if grant.task_permissions.create {
         tools.push("g4a_task_create");
     }
@@ -1086,10 +781,6 @@ pub(crate) fn harness_mcp_tool_id(request: &HarnessReadRequestV1) -> &'static st
         HarnessReadRequestV1::RunsList { .. } => "g4a_runs_list",
         HarnessReadRequestV1::RunGet { .. } => "g4a_runs_get",
         HarnessReadRequestV1::OperationGet { .. } => "g4a_operation_get",
-        HarnessReadRequestV1::MailSend { .. } => "g4a_mail_send",
-        HarnessReadRequestV1::MailInbox { .. } => "g4a_mail_inbox",
-        HarnessReadRequestV1::MailAck { .. } => "g4a_mail_ack",
-        HarnessReadRequestV1::MailFetch { .. } => "g4a_mail_fetch",
         HarnessReadRequestV1::TaskCreate { .. } => "g4a_task_create",
         HarnessReadRequestV1::TaskMove { .. } => "g4a_task_move",
         HarnessReadRequestV1::RunFinish { .. } => "g4a_run_finish",
@@ -1100,156 +791,6 @@ fn unix_time_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(1).max(1)
-}
-
-/// The short, fixed subject `g4a_run_finish`'s own summary mail carries --
-/// never caller-supplied prose (the summary itself is the body); just names
-/// which of the two outcomes this notice is about.
-fn run_finish_mail_subject(outcome: HarnessRunFinishOutcomeV1) -> String {
-    match outcome {
-        HarnessRunFinishOutcomeV1::Done => "run finished: done".to_owned(),
-        HarnessRunFinishOutcomeV1::Failed => "run finished: failed".to_owned(),
-    }
-}
-
-/// The sender identity a mail message's `from` carries -- read once, at send
-/// time, off the harness's own cached runtime inventory
-/// (`gate4agent-harness-service::runtime::HarnessRuntimeInventoryCache`, the
-/// same source `HarnessRuntimeManagedSessionV1.provider` already reads);
-/// never recomputed on a later `g4a_mail_inbox` read, which returns the
-/// stored `HarnessMailMessageV1.from` verbatim. Falls back to the literal
-/// `"unknown"` -- itself always a valid `HarnessSelectorV1` -- when the
-/// cache has no entry yet for this record (a fresh session, or an `Inline`
-/// caller with no `ManagedSessionRecord` at all): informational only, S9's
-/// mailbox never reads `from` to decide anything.
-fn resolve_caller_record_ref(
-    binding: &CredentialBindingV1,
-    runtime_inventory: &crate::runtime::HarnessRuntimeInventoryCache,
-) -> gate4agent_harness_protocol::HarnessRecordRef {
-    let provider_name = gate4agent_observation_api::NodeId::new(binding.node_id.as_str())
-        .ok()
-        .and_then(|node_id| runtime_inventory.node(&node_id))
-        .and_then(|node| {
-            node.inventory.managed_sessions.iter()
-                .find(|session| session.record_id == binding.record_id.as_str())
-                .map(|session| session.provider.clone())
-        });
-    let provider = provider_name
-        .and_then(|name| HarnessSelectorV1::new(name).ok())
-        .unwrap_or_else(|| {
-            HarnessSelectorV1::new("unknown")
-                .expect("the literal \"unknown\" satisfies HarnessSelectorV1's charset and length bound")
-        });
-    gate4agent_harness_protocol::HarnessRecordRef {
-        record_id: binding.record_id.clone(),
-        provider,
-    }
-}
-
-/// Builds the `g4a_mail_inbox` / operator `MailInbox` page for
-/// `reader_record_id` under `grant_id`'s own visibility
-/// (`HarnessEngine::mail_inbox`), converting each engine entry to the wire
-/// shape and counting unacked entries.
-fn mail_inbox_page(
-    engine: &gate4agent_harness_engine::HarnessEngine,
-    grant_id: &SessionGrantId,
-    reader_record_id: &HarnessSelectorV1,
-    since_unix_ms: Option<u64>,
-    limit: u16,
-) -> Result<HarnessMailInboxPageV1, HarnessReadHostErrorV1> {
-    // Shared by the operator wire and by every agent's own `g4a_mail_inbox`, so
-    // a swallowed error here reads as an unexplained `Internal` on both. Seen
-    // live 2026-09-09: `mail inbox` refused every record on a stack whose
-    // agents were simultaneously failing to read their own mail.
-    let entries = engine.mail_inbox(grant_id, reader_record_id, since_unix_ms, usize::from(limit))
-        .map_err(internal_naming("mail-inbox-page"))?;
-    let unacked = entries.iter().filter(|entry| !entry.acked).count() as u64;
-    let messages = entries.into_iter().map(|entry| HarnessMailInboxEntryV1 {
-        message_id: entry.message.message_id,
-        from: entry.message.from,
-        to: entry.message.to,
-        subject: entry.message.subject,
-        body: entry.message.body,
-        reply_to: entry.message.reply_to,
-        task_id: entry.message.task_id,
-        refs: entry.message.refs,
-        created_at_unix_ms: entry.message.created_at_unix_ms,
-        acked: entry.acked,
-        thread: entry.thread.into_iter()
-            .map(|message| message.message_id)
-            .take(usize::from(HARNESS_MAIL_THREAD_IDS_MAX))
-            .collect(),
-    }).collect();
-    Ok(HarnessMailInboxPageV1 { messages, unacked })
-}
-
-/// The operator wire's `MailInbox`, keyed by a bare `record_id` rather than
-/// a grant -- resolves the record's own current mail-permitted grant
-/// (`crate::mail_grant_for_record`) and reuses `mail_inbox_page` when one
-/// exists. Without one (a dormant record with no currently mail-permitted
-/// run bound to it), falls back to a direct scan of session-addressed mail
-/// only: task-addressed/forum mail needs a grant's own visibility and stays
-/// unavailable without one, and this fallback's entries carry an empty
-/// `thread` (the transitive `reply_to` closure is `HarnessEngine::mail_inbox`'s
-/// own internal algorithm, not reproduced here without a grant to call it
-/// through).
-pub(crate) fn operator_mail_inbox(
-    engine: &gate4agent_harness_engine::HarnessEngine,
-    record_id: &HarnessSelectorV1,
-    since_unix_ms: Option<u64>,
-    limit: u16,
-) -> Result<HarnessMailInboxPageV1, HarnessReadHostErrorV1> {
-    if let Some(grant_id) = crate::mail_grant_for_record(engine, record_id) {
-        return mail_inbox_page(engine, &grant_id, record_id, since_unix_ms, limit);
-    }
-    let mut matches: Vec<_> = engine.mail_messages()
-        .filter(|message| matches!(
-            &message.to,
-            HarnessMailAddressV1::Session { record_id: to } if to == record_id
-        ))
-        .filter(|message| since_unix_ms.map_or(true, |since| message.created_at_unix_ms >= since))
-        .cloned()
-        .collect();
-    matches.sort_by(|left, right| {
-        let left_acked = engine.mail_ack(&left.message_id, record_id).is_some();
-        let right_acked = engine.mail_ack(&right.message_id, record_id).is_some();
-        left_acked.cmp(&right_acked)
-            .then(left.created_at_unix_ms.cmp(&right.created_at_unix_ms))
-            .then(left.message_id.cmp(&right.message_id))
-    });
-    matches.truncate(usize::from(limit));
-    let unacked = matches.iter()
-        .filter(|message| engine.mail_ack(&message.message_id, record_id).is_none())
-        .count() as u64;
-    let messages = matches.into_iter().map(|message| {
-        let acked = engine.mail_ack(&message.message_id, record_id).is_some();
-        HarnessMailInboxEntryV1 {
-            message_id: message.message_id,
-            from: message.from,
-            to: message.to,
-            subject: message.subject,
-            body: message.body,
-            reply_to: message.reply_to,
-            task_id: message.task_id,
-            refs: message.refs,
-            created_at_unix_ms: message.created_at_unix_ms,
-            acked,
-            thread: Vec::new(),
-        }
-    }).collect();
-    Ok(HarnessMailInboxPageV1 { messages, unacked })
-}
-
-/// The `unread_mail` fill for one managed session (`runtime.rs`'s
-/// `fill_managed_session_blocked_stats`): the same page `operator_mail_inbox`
-/// would build for this record right now, counted rather than paged.
-pub(crate) fn count_unread_mail(
-    engine: &gate4agent_harness_engine::HarnessEngine,
-    record_id: &HarnessSelectorV1,
-) -> u64 {
-    operator_mail_inbox(engine, record_id, None, HARNESS_ENTITY_PAGE_LIMIT_MAX)
-        .map(|page| page.unacked)
-        .unwrap_or(0)
 }
 
 fn redact_task(
@@ -1935,7 +1476,6 @@ mod tests {
             read_permissions: HarnessReadPermissionsV1::default(),
             monitoring_visibility: HarnessMonitoringVisibilityV1::None,
             context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
-            mail: false,
             state: SessionGrantStateV1::Active,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
@@ -3020,246 +2560,6 @@ mod tests {
         close_observation(observation, &path);
     }
 
-    /// D3/Slice C, end to end through `execute_exact_binding_read`: A mails
-    /// B a `Run` ref naming A's own run plus a `ContextPack` ref. B's own
-    /// grant (`HarnessReadPermissionsV1::default()`, same fixture default
-    /// every grant in this file uses) has empty `read_visibility` -- B
-    /// cannot see A's run by lineage at all -- yet `g4a_mail_fetch` resolves
-    /// the `Run` ref because the message was addressed to B, never
-    /// consulting that empty visibility. A third record, C, never addressed
-    /// by the message, gets the named membership refusal
-    /// (`MailNotForReader`) on the identical fetch; B's second ref
-    /// (`ContextPack`, a digest no run in this fixture carries) is refused
-    /// as `MailRefContextPackUnknown`.
-    #[test]
-    fn mail_fetch_crosses_lineage_for_the_addressed_reader_and_refuses_everyone_and_everything_else() {
-        let path = observation_path("mail-fetch");
-        let mut checkpoint = crate::credential::tests::engine(
-            1,
-            SessionGrantStateV1::Active,
-            1,
-            HarnessRunLifecycleV1::Running,
-        ).checkpoint();
-        // Sender A already exists in the base fixture (task/run/grant
-        // 'a'*24, bound to "record-a"); flip on the mail permission it
-        // starts without.
-        checkpoint.grants[0].mail = true;
-
-        let node_incarnation = HarnessSelectorV1::new(
-            gate4agent_node_protocol::NodeIncarnationId::from_bytes([4; 16]).to_string(),
-        ).unwrap();
-
-        let recipient_task_id = HarnessTaskId::new(format!("htask_{}", "b".repeat(24))).unwrap();
-        let recipient_run_id = HarnessRunId::new(format!("hrun_{}", "b".repeat(24))).unwrap();
-        let recipient_grant_id = SessionGrantId::new(format!("hgrant_{}", "b".repeat(24))).unwrap();
-        let recipient_operation_id = HarnessOperationId::new(format!("hop_{}", "b".repeat(24))).unwrap();
-
-        let stranger_task_id = HarnessTaskId::new(format!("htask_{}", "c".repeat(24))).unwrap();
-        let stranger_run_id = HarnessRunId::new(format!("hrun_{}", "c".repeat(24))).unwrap();
-        let stranger_grant_id = SessionGrantId::new(format!("hgrant_{}", "c".repeat(24))).unwrap();
-        let stranger_operation_id = HarnessOperationId::new(format!("hop_{}", "c".repeat(24))).unwrap();
-
-        for (task_id, run_id, grant_id, operation_id, record_id, digest_hex) in [
-            (recipient_task_id, recipient_run_id.clone(), recipient_grant_id.clone(), recipient_operation_id, "record-b", 'b'),
-            (stranger_task_id, stranger_run_id.clone(), stranger_grant_id.clone(), stranger_operation_id, "record-c", 'c'),
-        ] {
-            checkpoint.tasks.push(HarnessTaskV1 {
-                task_id: task_id.clone(),
-                revision: HarnessRevision::new(1).unwrap(),
-                title: "recipient fixture".to_owned(),
-                body: String::new(),
-                creator: HarnessActorV1::User { actor_id: selector("operator") },
-                parent_task_id: None,
-                dependencies: Vec::new(),
-                state: HarnessTaskStateV1::Running,
-                run_ids: vec![run_id.clone()],
-                result_refs: Vec::new(),
-                artifact_refs: Vec::new(),
-                created_at_unix_ms: 10,
-                updated_at_unix_ms: 10,
-            });
-            checkpoint.runs.push(HarnessRunV1 {
-                run_id: run_id.clone(),
-                revision: HarnessRevision::new(1).unwrap(),
-                parent_run_id: None,
-                task_id: task_id.clone(),
-                operation_id: operation_id.clone(),
-                intent: HarnessRunIntentV1 {
-                    node_id: selector("node-a"),
-                    workspace_id: selector("workspace-a"),
-                    worktree: HarnessWorktreeIntentV1::Existing,
-                    provider_profile: selector("claude-default"),
-                    mode: HarnessExecutionModeV1::Pty,
-                    delivery_bundle: None,
-                    continuation: None,
-                },
-                delivery_receipt: None,
-                continuation_receipt: None,
-                context_pack: None,
-                git_facts: None,
-                binding: Some(HarnessSessionBindingV1 {
-                    node_id: selector("node-a"),
-                    node_incarnation: node_incarnation.clone(),
-                    workspace_id: selector("workspace-a"),
-                    session: HarnessSessionIdentityV1::Managed {
-                        record_id: selector(record_id),
-                        active_session: Some(HarnessRuntimeIdentityV1 { instance_id: 7, generation: 1 }),
-                    },
-                }),
-                lifecycle: HarnessRunLifecycleV1::Running,
-                result_disposition: None,
-                failure: None,
-                created_at_unix_ms: 10,
-                updated_at_unix_ms: 10,
-            });
-            checkpoint.grants.push(SessionGrantV1 {
-                grant_id: grant_id.clone(),
-                revision: HarnessRevision::new(1).unwrap(),
-                actor_run_id: run_id.clone(),
-                allowed_targets: vec![HarnessGrantTargetV1 {
-                    node_id: selector("node-a"),
-                    workspace_id: selector("workspace-a"),
-                    provider_profile: selector("claude-default"),
-                    mode: HarnessExecutionModeV1::Pty,
-                }],
-                allowed_delivery_bundles: Vec::new(),
-                maximum_child_count: 0,
-                maximum_child_depth: 0,
-                operation_timeouts: HarnessOperationTimeoutsV1 {
-                    dispatch_ms: 1_000,
-                    wait_ms: 1_000,
-                    reconciliation_ms: 1_000,
-                },
-                task_permissions: HarnessTaskPermissionsV1 {
-                    read: true,
-                    create: false,
-                    mutate: false,
-                    request_run: false,
-                },
-                read_permissions: HarnessReadPermissionsV1::default(),
-                monitoring_visibility: HarnessMonitoringVisibilityV1::Timeline,
-                context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
-                mail: true,
-                state: SessionGrantStateV1::Active,
-                created_at_unix_ms: 10,
-                updated_at_unix_ms: 11,
-            });
-            checkpoint.operations.push(HarnessOperationV1 {
-                operation_id: operation_id.clone(),
-                revision: HarnessRevision::new(1).unwrap(),
-                actor: HarnessActorV1::User { actor_id: selector("operator") },
-                kind: HarnessOperationKindV1::CreateRun,
-                state: HarnessOperationStateV1::Succeeded,
-                task_id: Some(task_id),
-                run_id: Some(run_id),
-                grant_id: None,
-                reconciles_operation_id: None,
-                expected_revision: Some(HarnessRevision::new(1).unwrap()),
-                request_digest: HarnessRequestDigest::new(digest_hex.to_string().repeat(64)).unwrap(),
-                idempotency_ref: HarnessIdempotencyRef::new(format!(
-                    "hidem_{}", digest_hex.to_string().repeat(24),
-                )).unwrap(),
-                failure: None,
-                outcome_unknown_reason: None,
-                reconciliation_outcome: None,
-                created_at_unix_ms: 10,
-                updated_at_unix_ms: 10,
-                dispatched_at_unix_ms: Some(10),
-                finished_at_unix_ms: Some(10),
-            });
-        }
-
-        let mut harness = HarnessService::from_engine_for_test(
-            gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
-        );
-        let observation = ObservationService::open(&path).unwrap();
-        let support = ObservationSupportRegistry::default();
-        let inventory = crate::runtime::HarnessRuntimeInventoryCache::default();
-
-        let sender_binding = crate::credential::tests::binding(1, 1);
-        let sender_run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
-        let recipient_binding = CredentialBindingV1 {
-            grant_id: recipient_grant_id.clone(),
-            grant_revision: HarnessRevision::new(1).unwrap(),
-            actor_run_id: recipient_run_id,
-            node_id: selector("node-a"),
-            workspace_id: selector("workspace-a"),
-            node_incarnation: node_incarnation.clone(),
-            record_id: selector("record-b"),
-            instance_id: 7,
-            generation: 1,
-        };
-        let stranger_binding = CredentialBindingV1 {
-            grant_id: stranger_grant_id,
-            grant_revision: HarnessRevision::new(1).unwrap(),
-            actor_run_id: stranger_run_id,
-            node_id: selector("node-a"),
-            workspace_id: selector("workspace-a"),
-            node_incarnation,
-            record_id: selector("record-c"),
-            instance_id: 7,
-            generation: 1,
-        };
-
-        let send_result = execute_exact_binding_read(
-            &mut harness, &observation, &support, &sender_binding,
-            HarnessReadRequestV1::MailSend {
-                to: HarnessMailAddressV1::Session { record_id: selector("record-b") },
-                subject: "handoff".to_owned(),
-                body: "see the attached run".to_owned(),
-                reply_to: None,
-                refs: vec![
-                    HarnessMailRefV1::Run { run_id: sender_run_id.clone() },
-                    HarnessMailRefV1::ContextPack { digest: format!("sha256:{}", "a".repeat(64)) },
-                ],
-            },
-            &inventory,
-        ).unwrap();
-        let HarnessReadResponseV1::MailSend(HarnessMailSendResultV1::Accepted { message_id }) = send_result else {
-            panic!("expected an accepted send, got {send_result:?}");
-        };
-
-        // Proof this is a real lineage boundary, not a fixture accident: B's
-        // own grant sees nothing at all.
-        assert!(harness.engine().read_visibility(&recipient_grant_id).unwrap().is_empty());
-
-        let fetched_run = execute_exact_binding_read(
-            &mut harness, &observation, &support, &recipient_binding,
-            HarnessReadRequestV1::MailFetch { message_id: message_id.clone(), ref_index: 0 },
-            &inventory,
-        ).unwrap();
-        let HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Run { monitor, .. }) = fetched_run else {
-            panic!("expected B to fetch the mailed run, got {fetched_run:?}");
-        };
-        assert_eq!(monitor.run_id, sender_run_id);
-
-        let fetched_context_pack = execute_exact_binding_read(
-            &mut harness, &observation, &support, &recipient_binding,
-            HarnessReadRequestV1::MailFetch { message_id: message_id.clone(), ref_index: 1 },
-            &inventory,
-        ).unwrap();
-        let HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::MailRefContextPackUnknown {
-            digest,
-        }) = fetched_context_pack else {
-            panic!("expected the ContextPack ref to be MailRefContextPackUnknown, got {fetched_context_pack:?}");
-        };
-        // No run in this fixture carries the fixture digest -- `MailRefTargetUnknown`
-        // from the engine, mapped to this typed refusal, not free-text `Refused`.
-        assert_eq!(digest, format!("sha256:{}", "a".repeat(64)));
-
-        let fetched_by_stranger = execute_exact_binding_read(
-            &mut harness, &observation, &support, &stranger_binding,
-            HarnessReadRequestV1::MailFetch { message_id, ref_index: 0 },
-            &inventory,
-        ).unwrap();
-        let HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused { reason }) = fetched_by_stranger else {
-            panic!("expected the stranger's fetch to be refused, got {fetched_by_stranger:?}");
-        };
-        assert!(reason.contains("not addressed to this reader"), "{reason}");
-
-        close_observation(observation, &path);
-    }
-
     /// D5, Slice D, end to end through `execute_exact_binding_read`: A
     /// (create+mutate) creates a child task under its own task and it is
     /// visible via `g4a_tasks_get` (created_by_run attribution, D5's read
@@ -3371,7 +2671,6 @@ mod tests {
                 read_permissions: HarnessReadPermissionsV1::default(),
                 monitoring_visibility: HarnessMonitoringVisibilityV1::None,
                 context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
-                mail: false,
                 state: SessionGrantStateV1::Active,
                 created_at_unix_ms: 10,
                 updated_at_unix_ms: 11,
@@ -3614,7 +2913,6 @@ mod tests {
             read_permissions: HarnessReadPermissionsV1::default(),
             monitoring_visibility: HarnessMonitoringVisibilityV1::None,
             context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
-            mail: false,
             state: SessionGrantStateV1::Active,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 10,
@@ -4027,62 +3325,19 @@ mod tests {
         close_observation(observation, &path);
     }
 
-    /// A `summary` produces exactly one mail to the task's own forum when
-    /// the grant holds `mail`, addressed and worded as the finish demands.
+    /// The mailbox moved to its own service (2026-09-17): `summary` is still
+    /// accepted on the wire (`HarnessReadRequestV1::RunFinish`'s own doc
+    /// comment), but produces no side effect any more -- the finish commits
+    /// and reports `Finished` identically with one given.
     #[test]
-    fn agent_run_finish_summary_posts_one_mail_to_the_task_forum() {
-        let path = observation_path("agent-run-finish-summary-mail");
-        let mut checkpoint = crate::credential::tests::engine(
-            1,
-            SessionGrantStateV1::Active,
-            1,
-            HarnessRunLifecycleV1::Running,
-        ).checkpoint();
-        checkpoint.grants[0].mail = true;
-        let mut harness = HarnessService::from_engine_for_test(
-            gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
-        );
-        let observation = ObservationService::open(&path).unwrap();
-        let support = ObservationSupportRegistry::default();
-        let inventory = crate::runtime::HarnessRuntimeInventoryCache::default();
-        let own_binding = crate::credential::tests::binding(1, 1);
-        let own_task_id = HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap();
-
-        let finished = execute_exact_binding_read(
-            &mut harness, &observation, &support, &own_binding,
-            HarnessReadRequestV1::RunFinish {
-                outcome: HarnessRunFinishOutcomeV1::Done,
-                summary: Some("handed off cleanly".to_owned()),
-            },
-            &inventory,
-        ).unwrap();
-        assert!(matches!(
-            finished,
-            HarnessReadResponseV1::RunFinish(HarnessRunFinishResultV1::Finished { .. }),
-        ));
-        let mail_messages = harness.engine().checkpoint().mail_messages;
-        assert_eq!(mail_messages.len(), 1);
-        assert_eq!(mail_messages[0].to, HarnessMailAddressV1::Task { task_id: own_task_id });
-        assert_eq!(mail_messages[0].body, "handed off cleanly");
-
-        close_observation(observation, &path);
-    }
-
-    /// A `summary` that cannot be posted (here: the grant holds no `mail`
-    /// permission at all, so the engine itself refuses the send) never
-    /// undoes or blocks the finish that already committed -- the run still
-    /// lands `Completed`/`Succeeded` and no mail is recorded, but the call
-    /// still reports `Finished`, not an error.
-    #[test]
-    fn agent_run_finish_survives_a_summary_mail_that_cannot_be_posted() {
-        let path = observation_path("agent-run-finish-summary-mail-refused");
+    fn agent_run_finish_accepts_a_summary_with_no_effect() {
+        let path = observation_path("agent-run-finish-summary-no-effect");
         let checkpoint = crate::credential::tests::engine(
             1,
             SessionGrantStateV1::Active,
             1,
             HarnessRunLifecycleV1::Running,
         ).checkpoint();
-        assert!(!checkpoint.grants[0].mail, "fixture must start without mail permission");
         let mut harness = HarnessService::from_engine_for_test(
             gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
         );
@@ -4096,7 +3351,7 @@ mod tests {
             &mut harness, &observation, &support, &own_binding,
             HarnessReadRequestV1::RunFinish {
                 outcome: HarnessRunFinishOutcomeV1::Done,
-                summary: Some("nobody will ever read this".to_owned()),
+                summary: Some("handed off cleanly".to_owned()),
             },
             &inventory,
         ).unwrap();
@@ -4107,7 +3362,6 @@ mod tests {
         let run = harness.engine().run(&own_run_id).unwrap();
         assert_eq!(run.lifecycle, HarnessRunLifecycleV1::Completed);
         assert_eq!(run.result_disposition, Some(HarnessResultDispositionV1::Succeeded));
-        assert!(harness.engine().checkpoint().mail_messages.is_empty());
 
         close_observation(observation, &path);
     }

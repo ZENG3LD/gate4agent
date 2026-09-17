@@ -6868,6 +6868,8 @@ fn project_harness_inventory_managed_session(
             instance_id: address.instance_id,
             generation: address.generation,
         }),
+        blocked_count: record.blocked_count,
+        last_blocked_at_ms: record.last_blocked_at_ms,
     })
 }
 
@@ -8737,6 +8739,8 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         });
         let agent = crate::app::AgentRowKey::Managed {
             node_id: "node-a".to_owned(),

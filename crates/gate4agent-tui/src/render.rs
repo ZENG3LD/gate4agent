@@ -5384,6 +5384,15 @@ fn render_agent_list(
                     .active_session
                     .as_ref()
                     .and_then(|address| app.find_session(address));
+                // `blocked_count` is a lifetime tally (the harness's own
+                // gate denying a tool call, accumulated for as long as this
+                // node incarnation lives -- it never resets when the
+                // session recovers), never a live signal. The marker/colour
+                // here mean "right now": overriding them from a count that
+                // can be hours stale would make the marker cry wolf for a
+                // session that is actually fine, which is worse than not
+                // marking it at all. Live state stays live state; the tally
+                // surfaces only in the secondary line below.
                 let (marker, color, state) = if record.state
                     == gate4agent_node_protocol::ManagedSessionState::Live
                 {
@@ -5402,6 +5411,12 @@ fn render_agent_list(
                     "{state} | {} | {} | {}",
                     record.provider, record.workspace_id, record.node_id
                 );
+                if record.blocked_count > 0 {
+                    secondary.push_str(&format!(" | blocked x{}", record.blocked_count));
+                    if let Some(last_blocked_at_ms) = record.last_blocked_at_ms {
+                        secondary.push_str(&format!(" @{last_blocked_at_ms}"));
+                    }
+                }
                 if let Some(bundle) = record.bundle.as_ref() {
                     secondary.push_str(&format!(" | b:{}@{}", bundle.id, bundle.revision));
                 }
@@ -7738,6 +7753,17 @@ fn session_monitor_lines(app: &App, monitor: &SessionMonitorView) -> Vec<String>
                                 "no active runtime"
                             },
                         ));
+                        if record.blocked_count > 0 {
+                            lines.push(format!(
+                                "Blocked: {} time(s) by the harness gate{}",
+                                record.blocked_count,
+                                record.last_blocked_at_ms
+                                    .map(|last_blocked_at_ms| format!(
+                                        " | last at {last_blocked_at_ms}",
+                                    ))
+                                    .unwrap_or_default(),
+                            ));
+                        }
                     } else {
                         lines.push("Managed record: unavailable | retained facts".to_owned());
                     }
@@ -9533,18 +9559,34 @@ fn render_harness_task_detail(
                 .map(|task_id| task_id.as_str())
                 .unwrap_or("none");
             let loaded_runs = app.harness_task_runs(&task.task_id).len();
-            let lines = [
+            let mut lines = vec![
                 format!("ID: {}", task.task_id),
                 format!("Created by: {:?} | created {} | updated {}", task.creator, task.created_at_unix_ms, task.updated_at_unix_ms),
                 format!("Parent: {parent} | dependencies: {}", task.dependency_ids.len()),
-                format!("Runs: {} linked | {loaded_runs} loaded", task.run_ids.len()),
-                format!("Results: {} | artifacts: {}", task.result_refs.len(), task.artifact_refs.len()),
-                String::new(),
-                format!("Body: {}", task.body),
             ];
+            // Resolved against the task list this app already holds
+            // (`harness_kanban.tasks`, populated by the same `tasks_list`
+            // poll the board itself reads) -- never a second read. An id
+            // this app has not (yet) fetched is still shown bare rather
+            // than dropped: an unresolvable dependency is information an
+            // operator needs, not an error to hide.
+            for dependency_id in &task.dependency_ids {
+                lines.push(match app.harness_kanban.tasks.get(dependency_id) {
+                    Some(dependency) => format!(
+                        "  depends on {dependency_id} | {} | {:?}",
+                        dependency.title, dependency.state,
+                    ),
+                    None => format!("  depends on {dependency_id} | not in the held task list"),
+                });
+            }
+            lines.push(format!("Runs: {} linked | {loaded_runs} loaded", task.run_ids.len()));
+            lines.push(format!("Results: {} | artifacts: {}", task.result_refs.len(), task.artifact_refs.len()));
+            lines.push(String::new());
+            lines.push(format!("Body: {}", task.body));
+            let body_index = lines.len().saturating_sub(1);
             for (index, line) in lines.iter().take(body.height as usize).enumerate() {
                 Paragraph::new(truncate_cells(line, body.width as usize))
-                    .style(Style::default().fg(if index == 6 { theme.text } else { theme.dim }).bg(theme.surface))
+                    .style(Style::default().fg(if index == body_index { theme.text } else { theme.dim }).bg(theme.surface))
                     .render(Rect::new(body.x, body.y + index as u16, body.width, 1), buf);
             }
         }
@@ -16484,6 +16526,79 @@ mod tests {
         }));
     }
 
+    /// The Overview section resolves each `dependency_ids` entry against
+    /// `harness_kanban.tasks` (the same list the board itself already
+    /// polled) rather than merely counting them -- a task the app has not
+    /// (yet) fetched still shows its bare id instead of being dropped from
+    /// the list.
+    #[test]
+    fn harness_task_detail_overview_lists_dependencies_by_id_title_and_state() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.harness_kanban.enabled = true;
+        app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
+        app.surface.open_in_focused(SurfaceTab::AgentBoard);
+        let dependency = RedactedTaskV1 {
+            task_id: HarnessTaskId::new("htask_bbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            title: "prerequisite review".to_owned(),
+            body: String::new(),
+            creator: TaskCreatorCategoryV1::User,
+            parent_task_id: None,
+            dependency_ids: Vec::new(),
+            state: HarnessTaskStateV1::Review,
+            run_ids: Vec::new(),
+            references_redacted: false,
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let unresolved_dependency_id =
+            HarnessTaskId::new("htask_cccccccccccccccccccccccc").unwrap();
+        let task = RedactedTaskV1 {
+            task_id: HarnessTaskId::new("htask_aaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            title: "blocked by prerequisite".to_owned(),
+            body: "waiting on the review".to_owned(),
+            creator: TaskCreatorCategoryV1::User,
+            parent_task_id: None,
+            dependency_ids: vec![dependency.task_id.clone(), unresolved_dependency_id.clone()],
+            state: HarnessTaskStateV1::Backlog,
+            run_ids: Vec::new(),
+            references_redacted: false,
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone(), dependency.clone()], Vec::new());
+        app.harness_kanban.detail = Some(crate::app::HarnessTaskDetailState {
+            task_id: task.task_id,
+            section: crate::app::HarnessTaskDetailSection::Overview,
+            selected_run: None,
+            scroll: 0,
+        });
+
+        let mut buf = TerminalBuffer::new(120, 28);
+        render(&app, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("dependencies: 2"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "depends on {} | prerequisite review | Review",
+                dependency.task_id,
+            )),
+            "{text}",
+        );
+        assert!(
+            text.contains(&format!(
+                "depends on {unresolved_dependency_id} | not in the held task list",
+            )),
+            "{text}",
+        );
+    }
+
     #[test]
     fn harness_task_detail_transfers_render_explicit_states_and_mouse_controls() {
         let mut app = fixture(PtyColorMode::Inherited);
@@ -18133,6 +18248,8 @@ mod tests {
                 context: None,
                 task_binding: None,
                 active_session: address,
+                blocked_count: 0,
+                last_blocked_at_ms: None,
             }];
             app.nodes.push(node);
         }
@@ -18495,6 +18612,8 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         });
 
         assert_eq!(
@@ -18525,6 +18644,8 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         });
         app.managed_agent_preferences.insert(
             ("node-a".to_owned(), "record-local-render".to_owned()),
@@ -19873,6 +19994,8 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         });
         let key = crate::app::PreviewTabKey::ManagedRecord {
             node_id: "node-a".to_owned(),
@@ -22389,6 +22512,8 @@ mod tests {
             context: receipt.context,
             task_binding: None,
             active_session: None,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         });
         let mut buf = TerminalBuffer::new(120, 6);
         let mut layout = LayoutRects::default();
@@ -22405,6 +22530,53 @@ mod tests {
         let text = buffer_text(&buf);
         assert!(text.contains("b:bundle-a@bundle-r3"));
         assert!(text.contains("c:context-a"));
+    }
+
+    /// `blocked_count` is a lifetime tally (it never resets while the same
+    /// harness-observed node incarnation lives), never a live signal, so a
+    /// non-zero count must NOT repaint the roster row's live marker/label --
+    /// a session blocked twice an hour ago and healthy since must still
+    /// read as `dormant`, not as an ongoing `blocked` that sends an
+    /// operator looking for a problem that already resolved. The tally
+    /// belongs, unambiguous, only in the secondary line.
+    #[test]
+    fn managed_roster_row_keeps_the_live_marker_when_blocked_count_is_a_stale_tally() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.nodes[0].session_records.push(ManagedSessionView {
+            node_id: "node-a".to_owned(),
+            record_id: "record-gated".to_owned(),
+            display_name: "gated session".to_owned(),
+            provider: provider("codex"),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id: "workspace-a".to_owned(),
+            canonical_root: None,
+            has_provider_session_identity: true,
+            bundle: None,
+            context_id: None,
+            context: None,
+            task_binding: None,
+            active_session: None,
+            blocked_count: 3,
+            last_blocked_at_ms: Some(2_000),
+        });
+        let mut buf = TerminalBuffer::new(120, 6);
+        let mut layout = LayoutRects::default();
+        render_agent_list(
+            &app,
+            Rect::new(0, 0, 120, 6),
+            &mut buf,
+            &mut layout,
+            Theme::for_mode(app.color_mode),
+            false,
+        );
+        let text = buffer_text(&buf);
+        // The live marker/label text is still exactly "dormant" -- a
+        // non-zero tally never becomes "blocked" there.
+        assert!(
+            text.contains("dormant | codex | workspace-a | node-a | blocked x3 @2000"),
+            "{text}",
+        );
     }
 
     #[test]
@@ -22536,6 +22708,8 @@ mod tests {
                     ManagedSessionState::Live | ManagedSessionState::IdentityPending
                 )
                     .then_some(live_address.clone()),
+                blocked_count: 0,
+                last_blocked_at_ms: None,
             });
         }
         // 26, not 24: the agents panel's own control-plane strip now costs
@@ -25050,6 +25224,8 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         });
         assert!(app.apply_managed_record_inventory("node-a", incarnation, true));
         app.open_session_monitor(AgentRowKey::Managed {

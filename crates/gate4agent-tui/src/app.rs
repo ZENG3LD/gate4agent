@@ -251,6 +251,17 @@ pub struct ManagedSessionView {
     pub context: Option<ResolvedContextPackReceipt>,
     pub task_binding: Option<SessionTaskBindingV1>,
     pub active_session: Option<SessionAddress>,
+    /// Lifetime tally of `ActionBlocked` observations against this managed
+    /// session (the harness's own gate denying a tool call, e.g.
+    /// `rule=deny-write`) -- populated server-side by the harness's
+    /// `fill_managed_session_blocked_stats`. Never reset by an unblock: a
+    /// session that was blocked once and later proceeded still carries the
+    /// count, which is the point -- an operator needs to see that it
+    /// happened, not just whether it is happening right now.
+    pub blocked_count: u64,
+    /// `observed_at_unix_ms` of the LATEST such observation, or `None` if
+    /// `blocked_count` is `0`.
+    pub last_blocked_at_ms: Option<u64>,
 }
 
 impl ManagedSessionView {
@@ -25931,6 +25942,8 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         }, operation_token, "node-a", "workspace-a", &provider("codex"), "019f-session-native", true);
         assert!(app.existing_session.is_none());
         assert_eq!(app.focus, Focus::Agents);
@@ -26565,6 +26578,8 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         }];
         app.nodes.push(other_node);
 
@@ -27306,6 +27321,7 @@ mod tests {
             workspace_id: "workspace-a".to_owned(), canonical_root: None,
             has_provider_session_identity: true, bundle: None, context_id: None,
             context: None, task_binding: None, active_session: Some(address.clone()),
+            blocked_count: 0, last_blocked_at_ms: None,
         };
         assert_eq!(
             app.complete_existing_session_resume(&record("node-b"), 91),
@@ -27331,6 +27347,7 @@ mod tests {
             workspace_id: "workspace-a".to_owned(), canonical_root: None,
             has_provider_session_identity: true, bundle: None, context_id: None,
             context: None, task_binding: None, active_session: None,
+            blocked_count: 0, last_blocked_at_ms: None,
         };
         app.upsert_managed_session(record);
         app.selected_agent = app
@@ -27384,6 +27401,7 @@ mod tests {
             workspace_id: "workspace-a".to_owned(), canonical_root: None,
             has_provider_session_identity: true, bundle: None, context_id: None,
             context: None, task_binding: None, active_session: None,
+            blocked_count: 0, last_blocked_at_ms: None,
         };
         let action = app.complete_existing_session_import(
             record, 55, "node-a", "workspace-a", &provider("codex"), "native-7", true,
@@ -27414,6 +27432,7 @@ mod tests {
             workspace_id: "workspace-a".to_owned(), canonical_root: None,
             has_provider_session_identity: true, bundle: None, context_id: None,
             context: None, task_binding: None, active_session: None,
+            blocked_count: 0, last_blocked_at_ms: None,
         };
         let action = app.complete_existing_session_import(
             stale, 54, "node-a", "workspace-a", &provider("codex"), "native-7", true,
@@ -27456,6 +27475,8 @@ mod tests {
             context: None,
             task_binding: None,
             active_session,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         });
         AgentRowKey::Managed {
             node_id: "node-a".to_owned(),
@@ -30668,6 +30689,8 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         };
         let token = match app.start_managed_session_preview(record) {
             AppAction::PreviewSessionRecord { token, .. } => token,
@@ -30780,6 +30803,8 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         };
         assert!(matches!(
             app.complete_native_session_index(
@@ -30915,6 +30940,8 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         };
         let records_before = app.nodes[0].session_records.clone();
 
@@ -30990,6 +31017,8 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         };
         assert_eq!(
             app.complete_native_session_index(
@@ -31193,6 +31222,8 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         };
         assert_eq!(
             app.complete_native_session_index(
@@ -34187,6 +34218,8 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: Some(address.clone()),
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         });
         let managed_key = AgentRowKey::Managed {
             node_id: "node-a".to_owned(),

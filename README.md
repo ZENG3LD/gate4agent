@@ -253,6 +253,13 @@ install them.
 
 ## Versioning
 
+- **0.4.0** — breaking: non-fleet vendors cut (Gemini, OpenCode, Qwen
+  parsers, pipe builders and history readers removed); the `rusqlite`
+  dependency is gone, so the transport core no longer pins
+  `libsqlite3-sys` against consumers on `rusqlite` 0.32+; the harness
+  mailbox moved out into its own service. Same first crates.io wave:
+  `gate4agent-pty`, `gate4agent-types`, `gate4agent-adapters`,
+  `gate4agent-catalog`, `gate4agent`, `g4a`.
 - **0.3.0** — **the workspace era.** The repo is an agent workbench
   (node / c2 / harness / TUI over the transport core), not a single-crate
   library; the vendored `portable-pty` fork is replaced by the in-house

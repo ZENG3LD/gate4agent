@@ -1,54 +1,13 @@
 # gate4agent
 
-gate4agent is an agent workbench, not just a transport library: a
-node/c2/harness/TUI stack for running, observing, and orchestrating CLI
-coding-agent sessions (first tier: Claude Code, Codex, Kimi, Grok) on top of a provider
-transport core. A node wraps one machine's providers (PTY/inline sessions, the
-file browser, local git, worktrees); c2 relays any number of nodes to their
-clients; a harness — light or full — is the one stateful backend a client app
-talks to, behind a single app-facing protocol, adding task kanban, session
-context, and delivery on top of the c2 transport; the TUI is the current
-client, and it speaks only the harness operator wire in either mode. The library that
-started this repo — spawn, stream, resume CLI-agent subprocesses through one
-API — is still here, still usable standalone, and is now the substrate the
-rest of the stack builds on; see [Transport core](#transport-core) below.
-
-## Layers
-
-One direction of wrapping: providers → node → c2 → harness → client app. All
-crate names below are prefixed `gate4agent-` (e.g. `-node` = `gate4agent-node`).
-
-- **Providers** — blackbox vendor CLIs (Claude Code, Codex, Kimi, Grok,
-  qwen-code) wrapped by the transport core: root crate `gate4agent` (`src/`),
-  `-pty`, `-types`, `-adapters`, `-provider-ports`, `-catalog`,
-  `-engine`, `-kernel`, `-handle`, `-tool-protocol`, `-tool-engine`,
-  `-shell-history`, `-shell-capabilities`, `-shell-hooks`,
-  `-shell-managed-hooks`, `-shell-one-shot`, `-shell-native`,
-  `-runtime-native`.
-- **Observation** — read-only monitoring facts projected from provider
-  sessions, never prompts/transcripts/credentials: `-observation-protocol`,
-  `-observation-api`, `-observation-engine`, `-observation-store`,
-  `-observation-service`.
-- **Node** — wraps providers on one machine: PTY/inline sessions, the file
-  browser, local git, worktrees: `-node-protocol`, `-node-wire`, `-node`
-  (bin `gate4agent-node`).
-- **C2** — relays any number of nodes to their clients and routes commands
-  (spawn, session control) down to nodes: `-c2-protocol`, `-c2-client`
-  (bin `gate4agent-c2ctl`), `-c2` (bin `gate4agent-c2`).
-- **Harness** — the stateful backend behind one app-facing protocol: task
-  kanban over SQLite, session extraction/continuation, delivery of
-  skills/plugins/MCP config, an operator surface: `-harness-protocol`,
-  `-harness-engine`, `-harness-service` (bin `gate4agent-harness`),
-  `-harness-api`, `-harness-client` (bin `gate4agent-harnessctl`),
-  `-harness-mcp` (bin `gate4agent-harness-mcp`), `-harness-delivery`,
-  `-harness-light` (stateless, serves the same operator wire straight over
-  c2 with no task kernel behind it).
-- **Client** — `crates/gate4agent-tui`, its own nested cargo workspace: bins
-  `gate4agent-tui` (against a durable harness) and `gate4agent-tui-light`
-  (hosts `gate4agent-harness-light` in-process). Neither app speaks c2
-  itself.
-- **Testing** — `gate4agent-testkit`: authentication-free provider fixtures
-  and the Windows headless test supervisor.
+gate4agent is a library that drives CLI coding agents — Claude Code, Codex,
+Kimi, Grok — over PTY, pipe, ACP, and daemon transports behind one API:
+spawn, stream, resume; see [Transport core](#transport-core) below. On top
+of that transport core it also carries the session runtime a node embeds to
+run those agents as managed sessions: an adapter/tool catalog, a session
+kernel, the native runtime, and per-CLI process hooks and history readers.
+The node/c2/harness/TUI stack that used to live in this repository is now
+`hatchery`, built on this library.
 
 ## Provider tiers
 
@@ -61,48 +20,39 @@ crate names below are prefixed `gate4agent-` (e.g. `-node` = `gate4agent-node`).
 | qwen-code | wired, unverified | adapter registry entry exists; no verification claim |
 | Gemini, OpenCode | legacy | transport-core paths last live-verified in the 0.2.5–0.2.6 era; outside the product target |
 
-## Repository layout: `src/` vs `crates/`
+## Repository layout
 
-The root `src/` tree is the **transport core** — the original library this
-repo started as, still published as the `gate4agent` crate and still the
-substrate the node embeds for spawning/streaming provider processes. It is
-maintained, not legacy — but it is no longer where the product grows.
+The root `src/` tree is the **transport core** — spawning, streaming,
+resuming, and owning interactive CLI-agent subprocesses through one API,
+published as the `gate4agent` crate. See [Source layout](#source-layout)
+below for its internal module structure.
 
-Everything else lives in `crates/`: the workbench layers (node, c2, harness,
-TUI), the engine substrate under them, and `gate4agent-pty` (the in-house
-PTY backend). **All new development happens in `crates/`**; the root library
-changes only when the transport core itself does.
+`crates/` holds the session runtime that a node embeds on top of the
+transport core, plus the in-house PTY backend:
 
-## Local endpoints
+- `gate4agent-pty` — the in-house PTY backend (std-only, zero external PTY
+  dependencies: Windows ConPTY + a unix macOS/Linux backend).
+- `gate4agent-types` — shared wire/data types.
+- `gate4agent-adapters` — the adapter registry (Grok, qwen-code, and other
+  CLIs wired outside the transport core's own pipe/PTY clients).
+- `gate4agent-catalog` — the CLI interop reference registry.
+- `gate4agent-engine`, `gate4agent-kernel`, `gate4agent-handle` — the
+  session runtime substrate: `catalog` → `kernel` → `runtime-native` call
+  down into the root crate's transports.
+- `gate4agent-tool-protocol`, `gate4agent-tool-engine` — tool-call wire
+  types and execution.
+- `gate4agent-shell-history`, `-shell-capabilities`, `-shell-hooks`,
+  `-shell-managed-hooks`, `-shell-one-shot`, `-shell-native` — per-CLI
+  shell integration: history readers, capability probing, hook wiring.
+- `gate4agent-runtime-native` — the native runtime a node embeds to run a
+  managed session end to end.
+- `gate4agent-provider-ports` — the provider-facing port/trait boundary.
+- `gate4agent-testkit` — authentication-free provider fixtures and the
+  Windows headless test supervisor (`windows-headless-supervisor`).
+- `g4a` — a placeholder crate reserving the crates.io name.
 
-| Layer | Local pipe | API |
-|---|---|---|
-| Node | `\\.\pipe\gate4agent-node` (Unix: local socket) | `127.0.0.1:18310` |
-| C2 | `\\.\pipe\gate4agent-c2` (Unix: local socket) | `127.0.0.1:18320` |
-| Harness | — | operator surface on `127.0.0.1:18330` |
-
-The harness does not share the primary c2 — it connects out through a second
-c2 instance of its own, on pipe `gate4agent-c2-harness` with API
-`127.0.0.1:18321`. A live stack is therefore **four** processes: node, two
-c2, harness. Bring one up without that second instance and the harness fails
-at startup with a bare connect error.
-
-Only node's `18310` and c2's `18320` are compiled-in defaults. `18321` and
-`18330` are conventions passed on the command line (`--api-listen`,
-`--read-bind`), so grepping the source for them finds nothing.
-
-All of it is loopback/local-only; nothing here is reachable off the host by
-default.
-
-## Credentials
-
-Env vars only — never pass a token as argv, never commit a value:
-
-- `GATE4AGENT_NODE_TOKEN`, or `GATE4AGENT_NODE_TOKEN_<NORMALIZED_ID>` for a
-  per-node override (id uppercased, non-alphanumeric characters replaced with
-  `_`)
-- `GATE4AGENT_C2_TOKEN`
-- `GATE4AGENT_HARNESS_OPERATOR_TOKEN`
+**All new development happens in `crates/`; the root library changes only
+when the transport core itself does.**
 
 ## Tests
 
@@ -120,12 +70,6 @@ a full copy of the dependency build and they pile up fast; when two builds
 overlap, Cargo's build lock simply makes the second wait. Tests gated by
 `require_windows_headless_supervisor_for_test()` reject themselves outright if
 run any other way.
-
-## The TUI's uzor dependency
-
-`crates/gate4agent-tui` depends on the `uzor-tui` crate from crates.io (the
-uzor UI framework, maintained by the same owner). A fresh clone of this repo
-builds every crate, the TUI included, with no sibling checkouts.
 
 ## Transport core
 
@@ -304,7 +248,9 @@ install them.
 - **0.2.33** — **fix(capabilities)**: correct context windows and model IDs for all 4 CLIs — Claude Opus/Sonnet 4.6 → 1M tokens, Codex all → 272K, Gemini preview IDs fixed, OpenCode models updated to current.
 - **0.2.32** — **Fix context_percent always 0%**: Initialize `ContextTracker` from model capabilities at `SessionStart` (matches model ID → `context_window`). Reset tracker on new session spawn so stale data doesn't persist across sessions.
 
-See [ROADMAP.md](ROADMAP.md) for what's next.
+The phased roadmap (P1–P4: one app↔harness protocol, light-harness
+extraction, full node-surface relay, cowork) was for the node/c2/harness/TUI
+stack and now lives in `hatchery`'s ROADMAP.md, not here.
 
 ## Migration guide
 

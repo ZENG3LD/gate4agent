@@ -3,18 +3,6 @@
 version = 4
 
 [[package]]
-name = "ahash"
-version = "0.8.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
-dependencies = [
- "cfg-if",
- "once_cell",
- "version_check",
- "zerocopy",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -173,18 +161,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fallible-iterator"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
-
-[[package]]
-name = "fallible-streaming-iterator"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
-
-[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -304,61 +280,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gate4agent-build-stamp"
-version = "0.1.0"
-
-[[package]]
-name = "gate4agent-c2"
-version = "0.2.37"
-dependencies = [
- "gate4agent-c2-client",
- "gate4agent-c2-protocol",
- "gate4agent-catalog",
- "gate4agent-node",
- "gate4agent-node-protocol",
- "gate4agent-node-wire",
- "gate4agent-observation-api",
- "gate4agent-observation-engine",
- "gate4agent-observation-service",
- "gate4agent-runtime-native",
- "gate4agent-testkit",
- "gate4agent-types",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "vt100",
-]
-
-[[package]]
-name = "gate4agent-c2-client"
-version = "0.2.37"
-dependencies = [
- "gate4agent-c2-protocol",
- "gate4agent-node-protocol",
- "gate4agent-node-wire",
- "gate4agent-types",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "gate4agent-c2-protocol"
-version = "0.2.37"
-dependencies = [
- "gate4agent-build-stamp",
- "gate4agent-node-protocol",
- "gate4agent-types",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "gate4agent-catalog"
 version = "0.4.0"
 dependencies = [
@@ -386,134 +307,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gate4agent-harness-api"
-version = "0.2.37"
-dependencies = [
- "gate4agent-build-stamp",
- "gate4agent-harness-protocol",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "gate4agent-harness-client"
-version = "0.2.37"
-dependencies = [
- "gate4agent-harness-api",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "gate4agent-harness-delivery"
-version = "0.2.37"
-dependencies = [
- "gate4agent-node-protocol",
- "libc",
- "ring",
- "thiserror",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "gate4agent-harness-engine"
-version = "0.2.37"
-dependencies = [
- "gate4agent-harness-protocol",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "gate4agent-harness-light"
-version = "0.4.0"
-dependencies = [
- "gate4agent-c2",
- "gate4agent-c2-client",
- "gate4agent-c2-protocol",
- "gate4agent-harness-api",
- "gate4agent-harness-client",
- "gate4agent-harness-service",
- "gate4agent-node",
- "gate4agent-node-protocol",
- "gate4agent-node-wire",
- "gate4agent-observation-api",
- "gate4agent-types",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "gate4agent-harness-mcp"
-version = "0.2.37"
-dependencies = [
- "gate4agent-c2",
- "gate4agent-c2-client",
- "gate4agent-harness-client",
- "gate4agent-harness-engine",
- "gate4agent-harness-protocol",
- "gate4agent-harness-service",
- "gate4agent-node",
- "gate4agent-node-protocol",
- "gate4agent-node-wire",
- "gate4agent-observation-service",
- "gate4agent-testkit",
- "gate4agent-types",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "gate4agent-harness-protocol"
-version = "0.2.37"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "gate4agent-harness-service"
-version = "0.2.37"
-dependencies = [
- "gate4agent-c2",
- "gate4agent-c2-client",
- "gate4agent-c2-protocol",
- "gate4agent-catalog",
- "gate4agent-harness-api",
- "gate4agent-harness-client",
- "gate4agent-harness-delivery",
- "gate4agent-harness-engine",
- "gate4agent-harness-protocol",
- "gate4agent-node",
- "gate4agent-node-protocol",
- "gate4agent-node-wire",
- "gate4agent-observation-api",
- "gate4agent-observation-engine",
- "gate4agent-observation-protocol",
- "gate4agent-observation-service",
- "gate4agent-types",
- "ring",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "gate4agent-kernel"
 version = "0.2.37"
 dependencies = [
@@ -522,124 +315,6 @@ dependencies = [
  "gate4agent-tool-engine",
  "gate4agent-tool-protocol",
  "gate4agent-types",
- "thiserror",
-]
-
-[[package]]
-name = "gate4agent-node"
-version = "0.2.37"
-dependencies = [
- "gate4agent-adapters",
- "gate4agent-catalog",
- "gate4agent-handle",
- "gate4agent-node-protocol",
- "gate4agent-node-wire",
- "gate4agent-runtime-native",
- "gate4agent-shell-managed-hooks",
- "gate4agent-testkit",
- "gate4agent-types",
- "libc",
- "ring",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "gate4agent-node-protocol"
-version = "0.2.37"
-dependencies = [
- "gate4agent-build-stamp",
- "gate4agent-observation-protocol",
- "gate4agent-types",
- "ring",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "gate4agent-node-wire"
-version = "0.2.37"
-dependencies = [
- "gate4agent-node-protocol",
- "gate4agent-types",
- "libc",
- "ring",
- "thiserror",
- "tokio",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "gate4agent-observation-api"
-version = "0.2.37"
-dependencies = [
- "gate4agent-node-protocol",
- "gate4agent-observation-protocol",
- "gate4agent-types",
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "gate4agent-observation-engine"
-version = "0.2.37"
-dependencies = [
- "gate4agent-c2",
- "gate4agent-c2-client",
- "gate4agent-c2-protocol",
- "gate4agent-node",
- "gate4agent-node-protocol",
- "gate4agent-node-wire",
- "gate4agent-observation-api",
- "gate4agent-observation-protocol",
- "gate4agent-testkit",
- "gate4agent-types",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "gate4agent-observation-protocol"
-version = "0.2.37"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "gate4agent-observation-service"
-version = "0.2.37"
-dependencies = [
- "gate4agent-node-protocol",
- "gate4agent-observation-api",
- "gate4agent-observation-engine",
- "gate4agent-observation-protocol",
- "gate4agent-observation-store",
- "gate4agent-types",
- "rusqlite",
- "thiserror",
-]
-
-[[package]]
-name = "gate4agent-observation-store"
-version = "0.2.37"
-dependencies = [
- "gate4agent-observation-api",
- "gate4agent-observation-engine",
- "rusqlite",
- "serde",
- "serde_json",
  "thiserror",
 ]
 
@@ -836,15 +511,6 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.14.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
-dependencies = [
- "ahash",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
@@ -857,15 +523,6 @@ name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
-
-[[package]]
-name = "hashlink"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
-dependencies = [
- "hashbrown 0.14.5",
-]
 
 [[package]]
 name = "heck"
@@ -1188,17 +845,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
-name = "libsqlite3-sys"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c10584274047cb335c23d3e61bcef8e323adae7c5c8c760540f73610177fc3f"
-dependencies = [
- "cc",
- "pkg-config",
- "vcpkg",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1516,20 +1162,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rusqlite"
-version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b838eba278d213a8beaf485bd313fd580ca4505a00d5871caeb1457c55322cae"
-dependencies = [
- "bitflags",
- "fallible-iterator",
- "fallible-streaming-iterator",
- "hashlink",
- "libsqlite3-sys",
- "smallvec",
 ]
 
 [[package]]
@@ -2098,12 +1730,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
-name = "version_check"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
 name = "vt100"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2544,26 +2170,6 @@ dependencies = [
  "quote",
  "syn",
  "synstructure",
-]
-
-[[package]]
-name = "zerocopy"
-version = "0.8.48"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eed437bf9d6692032087e337407a86f04cd8d6a16a37199ed57949d415bd68e9"
-dependencies = [
- "zerocopy-derive",
-]
-
-[[package]]
-name = "zerocopy-derive"
-version = "0.8.48"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70e3cd084b1788766f53af483dd21f93881ff30d7320490ec3ef7526d203bad4"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]

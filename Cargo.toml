@@ -61,25 +61,11 @@ tokio = { version = "1", features = ["full", "test-util"] }
 [workspace]
 members = [
     "crates/g4a",
-    "crates/gate4agent-build-stamp",
     "crates/gate4agent-types",
     "crates/gate4agent-adapters",
     "crates/gate4agent-provider-ports",
     "crates/gate4agent-catalog",
     "crates/gate4agent-engine",
-    "crates/gate4agent-observation-protocol",
-    "crates/gate4agent-observation-api",
-    "crates/gate4agent-observation-engine",
-    "crates/gate4agent-observation-store",
-    "crates/gate4agent-observation-service",
-    "crates/gate4agent-harness-protocol",
-    "crates/gate4agent-harness-engine",
-    "crates/gate4agent-harness-service",
-    "crates/gate4agent-harness-api",
-    "crates/gate4agent-harness-light",
-    "crates/gate4agent-harness-client",
-    "crates/gate4agent-harness-mcp",
-    "crates/gate4agent-harness-delivery",
     "crates/gate4agent-tool-protocol",
     "crates/gate4agent-tool-engine",
     "crates/gate4agent-kernel",
@@ -91,16 +77,7 @@ members = [
     "crates/gate4agent-shell-one-shot",
     "crates/gate4agent-shell-native",
     "crates/gate4agent-runtime-native",
-    "crates/gate4agent-node-protocol",
-    "crates/gate4agent-node-wire",
-    "crates/gate4agent-node",
-    "crates/gate4agent-c2-protocol",
-    "crates/gate4agent-c2-client",
-    "crates/gate4agent-c2",
     "crates/gate4agent-testkit",
     "crates/gate4agent-pty",
-]
-exclude = [
-    "crates/gate4agent-tui",
 ]
 resolver = "2"

@@ -1492,6 +1492,33 @@ impl AcpSession {
     }
 }
 
+/// Kill the subprocess if the reader loop is still running when a session is
+/// dropped without an explicit [`kill`](AcpSession::kill)/[`stop`](AcpSession::stop).
+///
+/// `acp_reader_loop` (`acp/reader.rs`) is a `spawn_blocking` loop that polls
+/// the process every 10 ms and only returns once the child stops running --
+/// it holds its own `Arc` clone of `process`, so a still-alive child keeps
+/// that loop, and the blocking-pool thread running it, alive too. Without
+/// this, an `AcpSession` dropped without a kill leaks both the child process
+/// and that thread forever. Mirrors `PtySession`'s `Drop` (`pty/session.rs`):
+/// the kill itself is the same synchronous `AcpProcess::kill` call
+/// [`kill`](AcpSession::kill) performs inside `spawn_blocking`, run directly
+/// here because `Drop` cannot `.await`; a poisoned mutex is recovered via
+/// `into_inner` rather than skipped, so a session that panicked mid-operation
+/// still does not leak its child.
+impl Drop for AcpSession {
+    fn drop(&mut self) {
+        if self.reader_task.is_finished() {
+            return;
+        }
+        let mut guard = match self.process.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let _ = guard.kill();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -2329,7 +2356,47 @@ while True:
     // `send_cancel_notification`'s write has a real process to target; it
     // never needs to answer. Both use `tokio::time::pause`/`advance`, never
     // a real sleep, per the task's own requirement.
+    //
+    // Observing a paused-clock timer actually fire needs a genuine suspend,
+    // not a `try_recv`/`yield_now` spin: `tokio::time::advance` only moves
+    // the frozen clock forward (plus one internal `yield_now`, which just
+    // re-queues the calling task without ever emptying the run queue).
+    // Tokio's timer driver only checks a paused clock's new value against
+    // pending timers when the runtime actually parks (goes idle with
+    // nothing left ready to run) -- a self-requeuing `yield_now` spin never
+    // reaches that state, so no number of extra yields after `advance` can
+    // observe a timer-driven fire (measured live 2026-09-25: a bare
+    // `tokio::spawn(sleep(..).await)` behind `pause`+`advance`+100
+    // `yield_now`s never completed either, ruling out anything specific to
+    // this watchdog's own `select!`). `recv_bounded_by_real_time` below
+    // fixes this by racing the real event against a background OS thread's
+    // real (wall-clock, never paused) timer inside a `select!` -- a genuine
+    // suspend that lets the runtime park, while still bounding the wait so
+    // a genuinely broken watchdog fails the test instead of hanging it.
     // -------------------------------------------------------------------
+
+    /// Await the next broadcast event, bounded by a REAL wall-clock
+    /// duration rather than the paused tokio clock -- see the section
+    /// comment above for why a `try_recv`/`yield_now` spin cannot observe
+    /// a paused-clock timer's fire at all, no matter how many iterations.
+    /// Racing `events.recv()` against a real background-thread timer forces
+    /// the calling task to genuinely suspend (both branches legitimately
+    /// `Pending`), which is what lets the runtime park and its timer driver
+    /// notice an already-elapsed `tokio::time::sleep` and wake it.
+    async fn recv_bounded_by_real_time(
+        events: &mut broadcast::Receiver<AgentEvent>,
+        real_bound: Duration,
+    ) -> Option<AgentEvent> {
+        let (bail_tx, bail_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(real_bound);
+            let _ = bail_tx.send(());
+        });
+        tokio::select! {
+            event = events.recv() => event.ok(),
+            _ = bail_rx => None,
+        }
+    }
 
     #[tokio::test]
     async fn start_prompt_watchdog_survives_activity_past_the_old_120s_mark() {
@@ -2355,21 +2422,47 @@ while True:
         tokio::task::yield_now().await;
 
         // Nine 15s gaps, each well under the 20s idle window, total 135s --
-        // more than the old fixed 120s bound this watchdog replaced.
+        // more than the old fixed 120s bound this watchdog replaced. Each
+        // `notify_one` is a DIRECT waker fire, not timer-driven, so (unlike
+        // `advance` alone) it reliably drives the watchdog's `select!` to
+        // consume the activity branch and restart its idle window fresh.
         for _ in 0..9 {
             tokio::time::advance(Duration::from_secs(15)).await;
             turn_activity.notify_one();
             tokio::task::yield_now().await;
         }
 
+        // Proof this test can actually fail (is not vacuous): advance to
+        // just short of the fresh 20s window the last reset opened, and
+        // confirm nothing has fired yet using a real, bounded, fully-parked
+        // wait -- then advance PAST the window and confirm the SAME
+        // watchdog now does fire. Without this second phase, "no event
+        // arrived" would be true regardless of whether activity resets the
+        // window at all, since a broken watchdog that never fires under any
+        // circumstance would pass the first assertion just as easily.
+        tokio::time::advance(Duration::from_secs(19)).await;
         assert!(
-            events.try_recv().is_err(),
-            "activity that keeps resetting the idle window must never interrupt the turn"
+            recv_bounded_by_real_time(&mut events, Duration::from_secs(2))
+                .await
+                .is_none(),
+            "activity that keeps resetting the idle window must never interrupt the turn before it elapses"
         );
         assert_eq!(
             session.pending.len(),
             1,
-            "the request must still be pending -- the watchdog never fired"
+            "the request must still be pending -- the watchdog must not have fired yet"
+        );
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let fired = recv_bounded_by_real_time(&mut events, Duration::from_secs(5))
+            .await
+            .expect(
+                "the watchdog must be ABLE to fire once its idle window elapses -- otherwise \
+                 the earlier 'nothing fired' assertion would be vacuous",
+            );
+        assert!(
+            matches!(&fired, AgentEvent::Error { message } if message.contains("idle")),
+            "expected an idle Error event, got {fired:?}"
         );
 
         watchdog.abort();
@@ -2398,17 +2491,29 @@ while True:
         ));
         tokio::task::yield_now().await;
 
-        // No activity at all for the entire idle window.
-        tokio::time::advance(idle_timeout).await;
-        tokio::task::yield_now().await;
+        // No activity at all for the entire idle window. See
+        // `recv_bounded_by_real_time`'s doc comment: `advance` alone never
+        // drives the watchdog's `sleep` branch to completion, so the wait
+        // for the resulting event must be a genuine suspend, bounded by
+        // real time rather than the (now frozen) tokio clock. Advancing by
+        // exactly `idle_timeout` lands the paused clock AT the sleep's
+        // deadline, not past it -- tokio's timer wheel treats that as not
+        // yet elapsed (measured live 2026-09-25: advancing by exactly
+        // `idle_timeout` never fired the watchdog even once fully parked;
+        // one extra millisecond past it fired reliably), so advance one
+        // millisecond past the deadline rather than exactly onto it.
+        tokio::time::advance(idle_timeout + Duration::from_millis(1)).await;
+        let first_event = recv_bounded_by_real_time(&mut events, Duration::from_secs(5))
+            .await
+            .expect("watchdog did not fire even once fully parked after the idle window elapsed");
 
-        match events.try_recv().expect("Error event") {
+        match first_event {
             AgentEvent::Error { message } => {
                 assert!(message.contains("idle"), "message was: {message}");
             }
             other => panic!("expected Error, got {other:?}"),
         }
-        match events.try_recv().expect("TurnInterrupted event") {
+        match events.recv().await.expect("TurnInterrupted event") {
             AgentEvent::TurnInterrupted { reason } => {
                 assert!(reason.contains("idle"), "reason was: {reason}");
             }
@@ -2420,5 +2525,46 @@ while True:
         );
 
         let _ = session.kill().await;
+    }
+
+    // -------------------------------------------------------------------
+    // Drop -- a session dropped without kill()/stop() must still reap its
+    // child. `acp_reader_loop` only exits once the child stops running, so
+    // without `Drop` a forgotten `AcpSession` leaks both the process and
+    // the blocking-pool thread polling it forever.
+    // -------------------------------------------------------------------
+
+    /// Whether `pid` is in the OS process table. A probe failure panics
+    /// instead of reading as "gone": an unreadable table must not let the
+    /// drop test below pass without having looked.
+    fn process_is_listed(pid: u32) -> bool {
+        crate::pty::os_process::query_process_tree_rows()
+            .expect("the OS process table must be readable")
+            .iter()
+            .any(|row| row.pid == pid)
+    }
+
+    #[tokio::test]
+    async fn dropping_a_session_without_kill_reaps_the_child_process() {
+        let session = spawn_fixture_acp_session(acp_ignore_eof_launch()).await;
+        let pid = session.process_id().expect("fixture process must report a pid");
+        // Dropped on purpose without `kill()`/`stop()` -- exercising exactly
+        // the leak `Drop` exists to close.
+        assert!(
+            process_is_listed(pid),
+            "the probe must see the live fixture (pid={pid}) before the drop, or the check below proves nothing"
+        );
+        drop(session);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !process_is_listed(pid) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("dropping the AcpSession did not reap its child process (pid={pid})");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }

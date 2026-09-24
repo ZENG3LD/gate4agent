@@ -254,6 +254,33 @@ impl PipeSession {
     }
 }
 
+/// Kill the child process if the reader loop is still running when a session
+/// is dropped without an explicit [`kill`](PipeSession::kill)/[`stop`](PipeSession::stop).
+///
+/// `reader_loop` (below) is a `spawn_blocking` loop that polls the process
+/// every 10 ms and only returns once the child stops running -- it holds its
+/// own `Arc` clone of `stdin`, so a still-alive child keeps that loop, and
+/// the blocking-pool thread running it, alive too. Without this, a
+/// `PipeSession` dropped without a kill leaks both the child process and
+/// that thread forever. Mirrors `PtySession`'s `Drop` (`pty/session.rs`) and
+/// `AcpSession`'s (`acp/session.rs`); a poisoned mutex is recovered via
+/// `into_inner` rather than skipped, so a session that panicked mid-operation
+/// still does not leak its child.
+impl Drop for PipeSession {
+    fn drop(&mut self) {
+        if self.reader_task.is_finished() {
+            return;
+        }
+        let mut guard = match self.stdin.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(process) = guard.as_mut() {
+            let _ = process.kill();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reader loop (runs on blocking thread)
 // ---------------------------------------------------------------------------
@@ -786,5 +813,54 @@ mod tests {
             start.elapsed() < Duration::from_secs(PIPE_GRACEFUL_STOP_BOUND_SECS),
             "force=true must not wait out the graceful bound"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Drop -- a session dropped without kill()/stop() must still reap its
+    // child. `reader_loop` only exits once the child stops running, so
+    // without `Drop` a forgotten `PipeSession` leaks both the process and
+    // the blocking-pool thread polling it forever.
+    // -------------------------------------------------------------------
+
+    /// Whether `pid` is in the OS process table. A probe failure panics
+    /// instead of reading as "gone": an unreadable table must not let the
+    /// drop test below pass without having looked.
+    fn process_is_listed(pid: u32) -> bool {
+        crate::pty::os_process::query_process_tree_rows()
+            .expect("the OS process table must be readable")
+            .iter()
+            .any(|row| row.pid == pid)
+    }
+
+    #[tokio::test]
+    async fn dropping_a_session_without_kill_reaps_the_child_process() {
+        let launch = ignore_stdin_launch();
+        let session = PipeSession::spawn_with_launch(
+            SessionConfig::default(),
+            "prompt",
+            &launch,
+            PipePromptDelivery::StdinClose,
+        )
+        .await
+        .expect("ignore-stdin fixture must spawn");
+        let pid = session.process_id().expect("fixture process must report a pid");
+        // Dropped on purpose without `kill()`/`stop()` -- exercising exactly
+        // the leak `Drop` exists to close.
+        assert!(
+            process_is_listed(pid),
+            "the probe must see the live fixture (pid={pid}) before the drop, or the check below proves nothing"
+        );
+        drop(session);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !process_is_listed(pid) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("dropping the PipeSession did not reap its child process (pid={pid})");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }

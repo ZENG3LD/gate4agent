@@ -213,14 +213,17 @@ while True:
 }
 
 /// Combines [`controlled_clean_exit_agent_spec`]'s deterministic
-/// marker/release/exit-0 handshake with an early `SessionStart` Hook post
-/// carrying `session_id`, so the session establishes a verified
-/// `ProviderSessionIdentity` (`provider_session: Some(_)`) before it waits
-/// for release and exits cleanly. Bind this to a Hook-capable agent id (e.g.
-/// `"claude"`) that also declares History adapter capability so a session
-/// produced by this fixture is both auto-export-at-exit eligible
-/// (`provider_session.is_some()`) and its exported pack's native history is
-/// independently loadable.
+/// marker/release/exit-0 handshake with an early `SessionStart` Hook-shaped
+/// post carrying `session_id`, originally so the session established a
+/// verified `ProviderSessionIdentity` (`provider_session: Some(_)`) before it
+/// waits for release and exits cleanly.
+///
+/// Lifecycle hooks are retired (owner ruling 2026-09-25): there is no hook
+/// ingress listening anywhere anymore, so the script's post to
+/// `$env:GATE4AGENT_HOOK_URL` no longer reaches anything and this fixture no
+/// longer establishes a verified provider session identity by itself. Kept
+/// for its marker/release/exit-0 handshake shape; callers relying on the
+/// identity side of this fixture need an ACP-sourced replacement.
 pub fn identified_clean_exit_agent_spec(
     fixture_root: &Path,
     started_marker: &Path,
@@ -316,7 +319,7 @@ while True:
         ],
     };
 
-    let mut spec = provider_spec(
+    let spec = provider_spec(
         IDENTIFIED_CLEAN_EXIT_FIXTURE_ID,
         "Controlled identified clean-exit fixture",
         launch,
@@ -327,7 +330,6 @@ while True:
             acp: None,
         },
     );
-    spec.capabilities.adapters.hook = Some(adapter(AdapterFamily::Hook, "claude-code"));
     Ok(spec)
 }
 
@@ -570,13 +572,18 @@ pub fn pty_provider_agent_spec() -> AgentSpec {
     )
 }
 
+/// A PTY fixture whose script posts a synthetic hook payload to
+/// `$env:GATE4AGENT_HOOK_URL`. Lifecycle hooks are retired (owner ruling
+/// 2026-09-25): nothing sets that env var and nothing listens on it anymore,
+/// so the post is inert. Kept as a plain PTY fixture for callers that only
+/// need its launch shape, not a working hook post.
 pub fn hook_posting_agent_spec() -> AgentSpec {
     #[cfg(windows)]
     let script = r#"[Console]::OutputEncoding=[Text.Encoding]::UTF8; $headers=@{'X-Gate4Agent-Hook-Token'=$env:GATE4AGENT_HOOK_TOKEN;'X-Gate4Agent-Hook-Route'=$env:GATE4AGENT_HOOK_ROUTE}; $body='{"hook_event_name":"UserPromptSubmit","event_id":"fixture-hook-1","payload":{"hook_event_name":"UserPromptSubmit","prompt":"fixture hook prompt"}}'; Invoke-WebRequest -UseBasicParsing -Method Post -Uri $env:GATE4AGENT_HOOK_URL -Headers $headers -ContentType 'application/json' -Body $body | Out-Null; [Console]::Write('fixture-hook-posted'); Start-Sleep -Seconds 60"#;
     #[cfg(not(windows))]
     let script = r#"python3 -c 'import json,os,urllib.request; body=json.dumps({"hook_event_name":"UserPromptSubmit","event_id":"fixture-hook-1","payload":{"hook_event_name":"UserPromptSubmit","prompt":"fixture hook prompt"}}).encode(); request=urllib.request.Request(os.environ["GATE4AGENT_HOOK_URL"],data=body,headers={"Content-Type":"application/json","X-Gate4Agent-Hook-Token":os.environ["GATE4AGENT_HOOK_TOKEN"],"X-Gate4Agent-Hook-Route":os.environ["GATE4AGENT_HOOK_ROUTE"]},method="POST"); urllib.request.urlopen(request,timeout=2).read()'; printf 'fixture-hook-posted'; sleep 60"#;
     let launch = provider_launch(script);
-    let mut spec = provider_spec(
+    let spec = provider_spec(
         HOOK_POSTING_FIXTURE_ID,
         "Control-plane Hook posting fixture",
         launch,
@@ -587,10 +594,15 @@ pub fn hook_posting_agent_spec() -> AgentSpec {
             acp: None,
         },
     );
-    spec.capabilities.adapters.hook = Some(adapter(AdapterFamily::Hook, "grok"));
     spec
 }
 
+/// A PTY fixture whose script posts a full ordered sequence of synthetic hook
+/// payloads to `$env:GATE4AGENT_HOOK_URL`. Lifecycle hooks are retired (owner
+/// ruling 2026-09-25): nothing sets that env var and nothing listens on it
+/// anymore, so the posts are inert and this fixture no longer declares a hook
+/// adapter. Kept as a plain PTY fixture for callers that only need its launch
+/// shape, not a working hook post.
 pub fn monitoring_hook_agent_spec() -> AgentSpec {
     #[cfg(windows)]
     let script = r#"[Console]::OutputEncoding=[Text.Encoding]::UTF8
@@ -646,7 +658,7 @@ Start-Sleep -Seconds 60"#;
     #[cfg(not(windows))]
     let script = "printf 'monitoring hook fixture is Windows-only'; sleep 60";
     let launch = provider_launch(script);
-    let mut spec = provider_spec(
+    let spec = provider_spec(
         MONITORING_HOOK_FIXTURE_ID,
         "Production monitoring Hook fixture",
         launch,
@@ -657,7 +669,6 @@ Start-Sleep -Seconds 60"#;
             acp: None,
         },
     );
-    spec.capabilities.adapters.hook = Some(adapter(AdapterFamily::Hook, "claude-code"));
     spec
 }
 
@@ -955,10 +966,9 @@ mod tests {
     fn monitoring_hook_fixture_posts_exact_ordered_private_provider_events() {
         let spec = monitoring_hook_agent_spec();
         assert!(spec.capabilities.transports.pty);
-        assert_eq!(
-            spec.capabilities.adapters.hook.as_ref().map(|binding| binding.id.as_str()),
-            Some("claude-code"),
-        );
+        // Lifecycle hooks are retired: this fixture no longer declares a
+        // hook adapter (see `monitoring_hook_agent_spec`'s doc comment).
+        assert!(spec.capabilities.adapters.hook.is_none());
         let script = spec.launch.fixed_args.last().unwrap();
         let events = [
             "'SessionStart' 'monitoring-hook-1'",

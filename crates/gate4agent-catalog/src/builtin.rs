@@ -202,8 +202,13 @@ fn capabilities(id: &str) -> AgentCapabilities {
         adapters: AgentAdapterCapabilities {
             // No provider in the current fleet declares a PTY sidecar.
             pty_sidecar: None,
-            hook: binding(AdapterFamily::Hook, adapter_id),
-            managed_hook: binding(AdapterFamily::ManagedHook, id),
+            // Lifecycle hooks are retired (owner ruling 2026-09-25): no
+            // provider declares a Hook or ManagedHook adapter anymore. The
+            // fields stay on `AgentAdapterCapabilities` because they are
+            // wire-visible (see `gate4agent-types::spec::AgentAdapterCapabilities`);
+            // only the catalog stops producing a value for them.
+            hook: None,
+            managed_hook: None,
             one_shot: one_shot_adapter_id
                 .and_then(|adapter| binding(AdapterFamily::OneShot, adapter)),
             history: binding(AdapterFamily::History, adapter_id),
@@ -364,7 +369,13 @@ mod tests {
 
         for id in ["claude", "codex", "grok", "kimi"] {
             let adapters = &registry.get_by_id(id).unwrap().capabilities.adapters;
-            assert!(adapters.hook.is_some(), "missing hook adapter for {id}");
+            // Lifecycle hooks are retired: no provider declares a Hook or
+            // ManagedHook adapter anymore.
+            assert!(adapters.hook.is_none(), "unexpected hook adapter for {id}");
+            assert!(
+                adapters.managed_hook.is_none(),
+                "unexpected managed Hook adapter for {id}"
+            );
             assert!(
                 adapters.history.is_some(),
                 "missing history adapter for {id}"
@@ -373,12 +384,6 @@ mod tests {
                 adapters.resume.is_some(),
                 "missing resume adapter for {id}"
             );
-            let binding = adapters
-                .managed_hook
-                .as_ref()
-                .unwrap_or_else(|| panic!("missing managed Hook adapter for {id}"));
-            assert_eq!(binding.id.as_str(), id);
-            assert_eq!(binding.revision, gate4agent_adapters::MANAGED_HOOK_REVISION);
         }
 
         for id in ["claude", "codex"] {

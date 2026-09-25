@@ -1224,12 +1224,12 @@ mod tests {
     /// tests need provider capability shapes the four-member fleet does not
     /// naturally offer on its own -- e.g. a Pipe transport still resolving
     /// through the legacy `OneShotText` one-shot path (every fleet member's
-    /// own Pipe transport is `StructuredJsonl`), a Hook binding with no
-    /// History one, a provider with no Resume adapter, or a bare PTY
+    /// own Pipe transport is `StructuredJsonl`), a provider missing its
+    /// History adapter, a provider with no Resume adapter, or a bare PTY
     /// sidecar binding -- so this clones a real fleet spec (`codex`, which
-    /// carries PTY, Hook, History, Resume, and ManagedHook) as the base and
-    /// gives it a fixture identity, leaving every adapter binding it
-    /// inherits pointed at a real, globally-registered implementation.
+    /// carries PTY, History, and Resume) as the base and gives it a fixture
+    /// identity, leaving every adapter binding it inherits pointed at a
+    /// real, globally-registered implementation.
     fn legacy_fixture(id: &str) -> gate4agent_types::AgentSpec {
         let mut spec = builtin_registry().get_by_id("codex").unwrap().clone();
         spec.id = AgentId::new(id).unwrap();
@@ -1288,7 +1288,7 @@ mod tests {
         AgentRegistry::new(builtin_registry().iter().cloned().chain([sidecar_fixture])).unwrap()
     }
 
-    /// `amp`, carrying a Hook binding but no History one.
+    /// `amp`, carrying no History adapter.
     fn legacy_no_history_fixture_catalog() -> AgentRegistry {
         let mut amp = legacy_fixture("amp");
         amp.capabilities.adapters.history = None;
@@ -1911,15 +1911,21 @@ mod tests {
             [],
         );
         let generation = started.snapshot.sessions[0].generation;
-        let grok_hook = kernel
+        // `AdapterFamily::Hook` is retired (owner ruling 2026-09-25) and
+        // `declared_provider_binding` never resolves a binding for it
+        // anymore. `Acp` is the only ingress-checked family grok declares
+        // (it has no PtySemantic/Pipe/OneShot adapter), and it exercises the
+        // same declared-binding validation this test is about.
+        let grok_acp = kernel
             .catalog()
             .get_by_id("grok")
             .unwrap()
             .capabilities
-            .adapters
-            .hook
+            .transports
+            .acp
             .clone()
-            .unwrap();
+            .unwrap()
+            .adapter;
         let accepted = kernel.step(
             [command(
                 3,
@@ -1927,12 +1933,12 @@ mod tests {
                     instance_id: instance(),
                     generation,
                     source: ProviderSource {
-                        family: AdapterFamily::Hook,
-                        binding: grok_hook,
+                        family: AdapterFamily::Acp,
+                        binding: grok_acp,
                     },
                     source_sequence: 1,
                     events: vec![ProviderEvent::TurnStarted {
-                        prompt: Some("ground hook".to_owned()),
+                        prompt: Some("ground external".to_owned()),
                     }],
                 },
             )],
@@ -1944,15 +1950,16 @@ mod tests {
             ProviderActivity::Working
         );
 
-        let kimi_hook = kernel
+        let kimi_acp = kernel
             .catalog()
             .get_by_id("kimi")
             .unwrap()
             .capabilities
-            .adapters
-            .hook
+            .transports
+            .acp
             .clone()
-            .unwrap();
+            .unwrap()
+            .adapter;
         let rejected = kernel.step(
             [command(
                 4,
@@ -1960,8 +1967,8 @@ mod tests {
                     instance_id: instance(),
                     generation,
                     source: ProviderSource {
-                        family: AdapterFamily::Hook,
-                        binding: kimi_hook,
+                        family: AdapterFamily::Acp,
+                        binding: kimi_acp,
                     },
                     source_sequence: 2,
                     events: vec![ProviderEvent::Ready],
@@ -2107,11 +2114,11 @@ mod tests {
             gate4agent_types::ControlEffect::DiscoverHistory { .. }
         ));
 
-        // Subject is a legacy `amp` fixture: it carries a hook adapter but
-        // no history one. Every fleet member now declares both together
-        // (pinned in `gate4agent-adapters`' own registry test), so this
-        // shape does not occur naturally in the fleet anymore and needs a
-        // constructed fixture to stay exercised at all.
+        // Subject is a legacy `amp` fixture with no history adapter. Every
+        // fleet member now declares one (pinned in `gate4agent-adapters`'
+        // own registry test), so this shape does not occur naturally in the
+        // fleet anymore and needs a constructed fixture to stay exercised at
+        // all.
         let mut unsupported = Gate4AgentKernel::new(legacy_no_history_fixture_catalog());
         unsupported.step([register(1, "amp")], []);
         let rejected = unsupported.step(

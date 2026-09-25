@@ -4,7 +4,7 @@ use gate4agent_types::{
     normalize_semantic_prompt, prepare_agent_command, prepare_input, prepare_shell_command,
     validate_candidate_id, validate_capability_models, validate_history_error,
     validate_resume_error, validate_session_config_value_json, validate_session_control_id,
-    ActiveProviderTool, AdapterFamily, AgentInstanceId,
+    ActiveProviderTool, AgentInstanceId,
     CapabilityProbeRequest,
     CapabilitySnapshot, CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError,
     ControlEvent, ControlEventKind, ControlHealth, ControlObservation, ControlSnapshot,
@@ -923,7 +923,7 @@ impl Gate4AgentEngine {
                 // second, sender-side notion of it. The refusal itself must
                 // not be silent either: it mints a `ProviderEvent::Error`
                 // naming the withheld capability, the same shape `ingest_
-                // provider`'s batched (Hook) refusal handling uses, so an
+                // provider`'s batched refusal handling uses, so an
                 // operator watching a live subscription sees a refusal
                 // instead of nothing.
                 let state = self
@@ -2281,16 +2281,11 @@ impl Gate4AgentEngine {
                 .iter()
                 .any(|event| !matches!(event, ProviderEvent::SessionIdentityObserved { .. }))
         {
-            // A hook-sourced batch is authenticated by the ingress route and
-            // normalized by the node's own hook adapter, not inferred from
-            // PTY terminal text -- it is gated on `HookSemantics`, never on
-            // `SemanticReadiness`. Every other source family still proves
-            // its semantics by the PTY-parsing verification chain.
-            let capability = if source.family == AdapterFamily::Hook {
-                ProviderRuntimeCapability::HookSemantics
-            } else {
-                ProviderRuntimeCapability::SemanticReadiness
-            };
+            // Lifecycle hooks are retired (owner ruling 2026-09-25): a
+            // session is observed through ACP where the provider has it, or
+            // through the PTY-parsing verification chain otherwise -- every
+            // source family proves its semantics through `SemanticReadiness`.
+            let capability = ProviderRuntimeCapability::SemanticReadiness;
             if !state.runtime_policy.admits(capability) {
                 denied_capability = Some(capability);
             }
@@ -2300,18 +2295,7 @@ impl Gate4AgentEngine {
                 .iter()
                 .any(provider_event_carries_session_identity)
         {
-            // `HookSemantics` authorizes the hook source entirely, session
-            // identity included. Splitting a hook's authority across two
-            // capabilities would invent a distinction with no trust basis
-            // behind it: the same authenticated route reports the session id
-            // and everything else in the same payload, and neither half is
-            // inferred from terminal text. `ProviderSessionIdentity` keeps
-            // guarding the sources that ARE inferred.
-            let capability = if source.family == AdapterFamily::Hook {
-                ProviderRuntimeCapability::HookSemantics
-            } else {
-                ProviderRuntimeCapability::ProviderSessionIdentity
-            };
+            let capability = ProviderRuntimeCapability::ProviderSessionIdentity;
             if !state.runtime_policy.admits(capability) {
                 denied_capability = Some(capability);
             }
@@ -4199,7 +4183,7 @@ mod tests {
     }
 
     /// The observation-ingress counterpart to `ingest_provider`'s batched
-    /// (Hook) refusal handling, and the direct regression test for the
+    /// refusal handling, and the direct regression test for the
     /// live-measured defect this fix closes: an ACP-shaped policy that still
     /// withholds `ProviderSessionIdentity` refuses a `SessionIdentityObserved`
     /// observation, but that ONE refusal must (a) not wedge the session's
@@ -4283,49 +4267,6 @@ mod tests {
             "a later, capability-clean observation must not be dropped either: {follow_up_events:?}",
         );
         assert_eq!(engine.snapshot().sessions[0].provider.sequence, 2);
-    }
-
-    /// `HookSemantics` and `SemanticReadiness` do not stand in for each
-    /// other: a policy that admits the former but not the latter accepts a
-    /// hook-sourced ingress batch and still refuses one sourced from a
-    /// PTY-parsing adapter family.
-    #[test]
-    fn hook_semantics_admits_hook_ingress_and_never_substitutes_for_semantic_readiness() {
-        let hook_only_policy =
-            ProviderRuntimePolicy::new(true, false, false, false, false, true).unwrap();
-        let (mut engine, spawn) = running_engine_with_policy(hook_only_policy);
-
-        engine
-            .apply_command(CommandEnvelope {
-                id: CommandId(5),
-                command: ControlCommand::IngestProvider {
-                    instance_id: instance(),
-                    generation: spawn.generation,
-                    source: hook_source(),
-                    source_sequence: 1,
-                    events: vec![ProviderEvent::TurnStarted {
-                        prompt: Some("ground hook".to_owned()),
-                    }],
-                },
-            })
-            .expect("hook-sourced ingress is admitted by HookSemantics alone");
-
-        assert_eq!(
-            engine.apply_command(CommandEnvelope {
-                id: CommandId(6),
-                command: ControlCommand::IngestProvider {
-                    instance_id: instance(),
-                    generation: spawn.generation,
-                    source: provider_source(),
-                    source_sequence: 1,
-                    events: vec![ProviderEvent::WorkingObserved],
-                },
-            }),
-            Err(ControlError::ProviderRuntimePolicyDenied {
-                capability: ProviderRuntimeCapability::SemanticReadiness,
-            }),
-            "a PTY-parsing-sourced batch must not be admitted by HookSemantics",
-        );
     }
 
     #[test]

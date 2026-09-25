@@ -40,10 +40,6 @@ use gate4agent_shell_capabilities::NativeCapabilityProbeAuthority;
 use gate4agent_shell_history::NativeHistoryAuthority;
 pub use gate4agent_shell_history::{orca_home_roots, NativeHistoryConfig, NativeHistoryRoot};
 pub use gate4agent_adapters::{HistorySourceLayout, OneShotSessionPersistence};
-pub use gate4agent_shell_hooks::{
-    HookIngressConfig, HookIngressEndpoint, HookIngressEventOutcomes,
-};
-use gate4agent_shell_hooks::{HookIngressControl, HookIngressServer, HookIngressStartError};
 pub use gate4agent_shell_native::{
     NativeProviderExecutor, NativeProviderExit, NativeProviderOperation,
     NativeProviderOperationError, NativeProviderResultPoll, PhysicalExitAck,
@@ -67,7 +63,7 @@ use gate4agent_types::{
     NativeSessionPreview,
     NativeSessionPreviewMessage, ObservationEnvelope, ProviderSessionIdentity,
     ProviderRuntimeCapability, ProviderRuntimePolicy,
-    PipeProtocol, ResumeAuthorityTarget, ResumeLaunchRequest, SessionGeneration, SessionStatus,
+    PipeProtocol, ResumeAuthorityTarget, ResumeLaunchRequest, SessionGeneration,
     TransportKind,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -75,7 +71,7 @@ use std::convert::Infallible;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::mpsc::{self, error::TrySendError, Receiver, Sender};
@@ -1266,7 +1262,6 @@ pub struct NativeRuntimeTick {
 pub struct NativeRuntime {
     config: NativeRuntimeConfig,
     kernel: Gate4AgentKernel,
-    handle: Gate4AgentHandle,
     tool_authority: ToolAuthorityHandle,
     tool_providers: BTreeMap<ToolProviderId, CapabilityProviderDescriptor>,
     provider_supervisors: BTreeMap<ToolProviderId, ProviderSupervisor>,
@@ -1276,7 +1271,6 @@ pub struct NativeRuntime {
     provider_ack_cursor: Option<ToolProviderId>,
     provider_fault_cursor: Option<ToolProviderId>,
     effects: NativeEffectDispatcher,
-    hook_ingress: Option<HookIngressServer>,
     /// Per-phase timing distributions for [`Self::tick`] -- see
     /// `tick_profile`'s own doc comment for why this is a fixed-window
     /// ring, not an average, and why it stays on unconditionally.
@@ -1345,7 +1339,6 @@ impl NativeRuntime {
         let runtime = Self {
             config,
             kernel,
-            handle: handle.clone(),
             tool_authority,
             tool_providers: providers
                 .into_iter()
@@ -1358,7 +1351,6 @@ impl NativeRuntime {
             provider_ack_cursor: None,
             provider_fault_cursor: None,
             effects: NativeEffectDispatcher::new(catalog, config, history),
-            hook_ingress: None,
             tick_profile: tick_profile::TickPhaseProfiler::default(),
         };
         (handle, runtime)
@@ -1719,67 +1711,6 @@ impl NativeRuntime {
         self.effects.launch_profiles.clone()
     }
 
-    /// Start the process-global loopback Hook listener. Call this before
-    /// starting agent sessions so their PTY environments receive route-scoped
-    /// endpoint coordinates.
-    pub async fn start_hook_ingress(
-        &mut self,
-        config: HookIngressConfig,
-    ) -> Result<HookIngressEndpoint, NativeHookIngressError> {
-        if let Some(server) = &self.hook_ingress {
-            if server.is_running() {
-                return Ok(server.endpoint().clone());
-            }
-        }
-        let has_started_session = self.handle.snapshot().sessions.iter().any(|session| {
-            matches!(
-                session.status,
-                SessionStatus::Starting | SessionStatus::Running | SessionStatus::Stopping
-            )
-        });
-        if self.active_native_sessions() != 0 || has_started_session {
-            return Err(NativeHookIngressError::ActiveSessions);
-        }
-        self.hook_ingress = None;
-        let server = HookIngressServer::start(self.handle.clone(), config).await?;
-        let endpoint = server.endpoint().clone();
-        self.effects.set_hook_ingress(Some(server.control()));
-        self.hook_ingress = Some(server);
-        Ok(endpoint)
-    }
-
-    pub async fn stop_hook_ingress(&mut self) {
-        self.effects.set_hook_ingress(None);
-        if let Some(server) = self.hook_ingress.take() {
-            server.stop().await;
-        }
-    }
-
-    pub fn hook_ingress_endpoint(&self) -> Option<&HookIngressEndpoint> {
-        self.hook_ingress
-            .as_ref()
-            .filter(|server| server.is_running())
-            .map(HookIngressServer::endpoint)
-    }
-
-    /// Lifetime outcome totals for every hook event the ingress accepted.
-    ///
-    /// The ingress answers `204` whether it dispatched an event, reduced it
-    /// to nothing, or refused it outright -- correct for a fire-and-forget
-    /// hook script, and the reason "why are no events arriving" had no
-    /// answer anywhere before these counters existed.
-    pub fn hook_event_outcomes(&self) -> gate4agent_shell_hooks::HookIngressEventOutcomes {
-        self.hook_ingress
-            .as_ref()
-            .map(|server| server.control().event_outcomes())
-            .unwrap_or_default()
-    }
-
-    pub fn active_hook_routes(&self) -> usize {
-        self.hook_ingress
-            .as_ref()
-            .map_or(0, |server| server.control().active_route_count())
-    }
 }
 
 fn provider_ids_after(
@@ -1824,14 +1755,6 @@ pub enum NativeProviderShutdownError {
     TimedOut { pending: Vec<ProviderSupervisorSnapshot> },
 }
 
-#[derive(Debug, Error)]
-pub enum NativeHookIngressError {
-    #[error("hook ingress must start before native agent sessions")]
-    ActiveSessions,
-    #[error(transparent)]
-    Start(#[from] HookIngressStartError),
-}
-
 struct EffectWorker {
     sender: Sender<NativeEffectRequest>,
 }
@@ -1867,7 +1790,6 @@ struct NativeWorkerContext {
     control_tx: Sender<ObservationEnvelope>,
     terminal_frames: Arc<Mutex<BTreeMap<TerminalFrameKey, ObservationEnvelope>>>,
     active_sessions: Arc<AtomicUsize>,
-    hook_ingress: Arc<RwLock<Option<HookIngressControl>>>,
     /// Shared with every other instance's worker and with
     /// `NativeEffectDispatcher` -- see `shell_efficiency`'s own doc comment
     /// for why folding here, once per worker-loop iteration, is the only
@@ -1890,7 +1812,6 @@ struct NativeEffectDispatcher {
     pending_failures: VecDeque<ObservationEnvelope>,
     terminal_frames: Arc<Mutex<BTreeMap<TerminalFrameKey, ObservationEnvelope>>>,
     active_sessions: Arc<AtomicUsize>,
-    hook_ingress: Arc<RwLock<Option<HookIngressControl>>>,
     shell_efficiency: Arc<Mutex<ShellEfficiencyProfile>>,
 }
 
@@ -1914,16 +1835,8 @@ impl NativeEffectDispatcher {
             pending_failures: VecDeque::new(),
             terminal_frames: Arc::new(Mutex::new(BTreeMap::new())),
             active_sessions: Arc::new(AtomicUsize::new(0)),
-            hook_ingress: Arc::new(RwLock::new(None)),
             shell_efficiency: Arc::new(Mutex::new(ShellEfficiencyProfile::default())),
         }
-    }
-
-    fn set_hook_ingress(&self, control: Option<HookIngressControl>) {
-        *self
-            .hook_ingress
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = control;
     }
 
     fn dispatch(&mut self, effect: EffectEnvelope) {
@@ -1971,7 +1884,6 @@ impl NativeEffectDispatcher {
                     pending = request;
                 }
                 Err(TrySendError::Full(request)) => {
-                    self.remove_hook_route(&request.effect);
                     self.pending_failures.push_back(effect_failure(
                         request.effect,
                         "native session effect queue is full".to_owned(),
@@ -1980,7 +1892,6 @@ impl NativeEffectDispatcher {
                 }
             }
         }
-        self.remove_hook_route(&pending.effect);
         self.pending_failures.push_back(effect_failure(
             pending.effect,
             "native session effect worker is unavailable".to_owned(),
@@ -2098,55 +2009,11 @@ impl NativeEffectDispatcher {
         sender
     }
 
-    fn hook_pty_env(&self, effect: &EffectEnvelope) -> Result<Vec<EnvMutation>, String> {
-        let agent_id = match &effect.effect {
-            ControlEffect::Spawn {
-                agent_id,
-                transport: gate4agent_types::TransportKind::Pty,
-                ..
-            }
-            | ControlEffect::SpawnResume {
-                agent_id,
-                transport: gate4agent_types::TransportKind::Pty,
-                ..
-            } => agent_id,
-            _ => return Ok(Vec::new()),
-        };
-        let control = self
-            .hook_ingress
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let Some(control) = control else {
-            return Ok(Vec::new());
-        };
-        let binding = self
-            .catalog
-            .get(agent_id)
-            .and_then(|spec| spec.capabilities.adapters.hook.clone());
-        let Some(binding) = binding else {
-            return Ok(Vec::new());
-        };
-        let route = control
-            .register_route(effect.instance_id, effect.generation, binding)
-            .map_err(|error| error.to_string())?;
-        Ok(route
-            .environment()
-            .into_iter()
-            .map(|(key, value)| EnvMutation {
-                key: key.into(),
-                value: Some(value.into()),
-            })
-            .collect())
-    }
-
     fn compose_spawn_overlay(
         &self,
         effect: &EffectEnvelope,
     ) -> Result<NativeSpawnOverlay, String> {
-        let mut overlay = self.profile_spawn_overlay(effect)?;
-        overlay.environment.extend(self.hook_pty_env(effect)?);
-        Ok(overlay)
+        self.profile_spawn_overlay(effect)
     }
 
     fn profile_spawn_overlay(&self, effect: &EffectEnvelope) -> Result<NativeSpawnOverlay, String> {
@@ -2186,23 +2053,6 @@ impl NativeEffectDispatcher {
             .map_err(|error| error.to_string())
     }
 
-    fn remove_hook_route(&self, effect: &EffectEnvelope) {
-        if !matches!(
-            effect.effect,
-            ControlEffect::Spawn { .. } | ControlEffect::SpawnResume { .. }
-        ) {
-            return;
-        }
-        if let Some(control) = self
-            .hook_ingress
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-        {
-            control.remove_route(effect.instance_id, effect.generation);
-        }
-    }
-
     fn worker_sender(&mut self, instance_id: AgentInstanceId) -> Sender<NativeEffectRequest> {
         if let Some(worker) = self.workers.get(&instance_id) {
             return worker.sender.clone();
@@ -2215,7 +2065,6 @@ impl NativeEffectDispatcher {
                 control_tx: self.control_tx.clone(),
                 terminal_frames: Arc::clone(&self.terminal_frames),
                 active_sessions: Arc::clone(&self.active_sessions),
-                hook_ingress: Arc::clone(&self.hook_ingress),
                 shell_efficiency: Arc::clone(&self.shell_efficiency),
                 poll_interval: Duration::from_millis(self.config.worker_poll_interval_ms.max(1)),
                 idle_timeout: Duration::from_millis(self.config.worker_idle_timeout_ms.max(1)),
@@ -2644,7 +2493,6 @@ async fn run_effect_worker(
                     )
                     .await;
                 update_active_count(&context.active_sessions, before, shell.active_session_count());
-                remove_hook_route_for_observation(&context.hook_ingress, &completion);
                 if closes_terminal_session(&completion.observation) {
                     context
                         .terminal_frames
@@ -2731,7 +2579,6 @@ async fn publish_shell_observations(
 
     let before = shell.active_session_count();
     for observation in shell.collect_exits().await {
-        remove_hook_route_for_observation(&context.hook_ingress, &observation);
         context
             .terminal_frames
             .lock()
@@ -2747,27 +2594,6 @@ async fn publish_shell_observations(
         shell.active_session_count(),
     );
     true
-}
-
-fn remove_hook_route_for_observation(
-    hook_ingress: &Arc<RwLock<Option<HookIngressControl>>>,
-    observation: &ObservationEnvelope,
-) {
-    if !matches!(
-        observation.observation,
-        ControlObservation::SpawnFailed { .. }
-            | ControlObservation::StopCompleted { .. }
-            | ControlObservation::ProcessExited { .. }
-    ) {
-        return;
-    }
-    if let Some(control) = hook_ingress
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-    {
-        control.remove_route(observation.instance_id, observation.generation);
-    }
 }
 
 fn closes_terminal_session(observation: &ControlObservation) -> bool {
@@ -2898,13 +2724,6 @@ fn effect_failure(effect: EffectEnvelope, message: String) -> ObservationEnvelop
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gate4agent_shell_hooks::{
-        HOOK_PORT_ENV, HOOK_ROUTE_ENV, HOOK_TOKEN_ENV, HOOK_URL_ENV, HOOK_VERSION_ENV,
-    };
-    use gate4agent_testkit::{
-        hook_posting_agent_spec, interactive_agent_spec, CONTROL_FIXTURE_ID,
-        HOOK_POSTING_FIXTURE_ID,
-    };
     use gate4agent_types::{ApprovalLevel, OperationId, StartRequest, TerminalSize};
 
     #[test]
@@ -3628,114 +3447,6 @@ mod tests {
                 ..
             }] if message.contains("SemanticReadiness")
         ));
-    }
-
-    #[tokio::test]
-    async fn pty_hook_spawn_attaches_route_environment_without_identity_authority() {
-        let catalog = AgentRegistry::new([hook_posting_agent_spec()]).unwrap();
-        let (_, mut runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
-        runtime
-            .start_hook_ingress(HookIngressConfig::default())
-            .await
-            .unwrap();
-        let hook_monitoring_policy =
-            ProviderRuntimePolicy::new(true, true, true, false, false, true).unwrap();
-        assert!(!hook_monitoring_policy.provider_session_identity);
-        let spawn = |operation_id, instance_id, agent_id, transport, runtime_policy| {
-            EffectEnvelope {
-                operation_id: OperationId(operation_id),
-                instance_id: AgentInstanceId(instance_id),
-                generation: SessionGeneration(1),
-                effect: ControlEffect::Spawn {
-                    agent_id: AgentId::new(agent_id).unwrap(),
-                    transport,
-                    runtime_policy,
-                    request: StartRequest {
-                        working_directory: ".".to_owned(),
-                        terminal_size: TerminalSize { rows: 24, columns: 80 },
-                        initial_prompt: None,
-                        session_options: None,
-                        approval_level: ApprovalLevel::default(),
-                    },
-                },
-            }
-        };
-
-        let hook_spawn = spawn(
-            10,
-            10,
-            HOOK_POSTING_FIXTURE_ID,
-            TransportKind::Pty,
-            hook_monitoring_policy,
-        );
-        let overlay = runtime
-            .effects
-            .compose_spawn_overlay(&hook_spawn)
-            .unwrap();
-        let environment_keys = overlay
-            .environment
-            .iter()
-            .map(|mutation| mutation.key.to_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(overlay.environment.len(), 5);
-        for key in [
-            HOOK_PORT_ENV,
-            HOOK_TOKEN_ENV,
-            HOOK_ROUTE_ENV,
-            HOOK_URL_ENV,
-            HOOK_VERSION_ENV,
-        ] {
-            assert!(environment_keys.contains(&key), "missing hook environment key {key}");
-        }
-        assert!(overlay
-            .environment
-            .iter()
-            .all(|mutation| mutation.value.is_some()));
-        assert_eq!(runtime.active_hook_routes(), 1);
-
-        runtime.effects.remove_hook_route(&hook_spawn);
-        assert_eq!(runtime.active_hook_routes(), 0);
-
-        let non_pty_hook_spawn = spawn(
-            11,
-            11,
-            HOOK_POSTING_FIXTURE_ID,
-            TransportKind::Pipe,
-            ProviderRuntimePolicy::new(true, true, true, true, true, true).unwrap(),
-        );
-        assert!(runtime
-            .effects
-            .compose_spawn_overlay(&non_pty_hook_spawn)
-            .unwrap()
-            .environment
-            .is_empty());
-        assert_eq!(runtime.active_hook_routes(), 0);
-
-        runtime.stop_hook_ingress().await;
-
-        let raw_pty_without_hook = spawn(
-            12,
-            12,
-            CONTROL_FIXTURE_ID,
-            TransportKind::Pty,
-            ProviderRuntimePolicy::raw_pty(),
-        );
-        let no_hook_catalog = AgentRegistry::new([interactive_agent_spec()]).unwrap();
-        let (_, mut no_hook_runtime) =
-            NativeRuntime::new(no_hook_catalog, NativeRuntimeConfig::default());
-        no_hook_runtime
-            .start_hook_ingress(HookIngressConfig::default())
-            .await
-            .unwrap();
-        assert!(no_hook_runtime
-            .effects
-            .compose_spawn_overlay(&raw_pty_without_hook)
-            .unwrap()
-            .environment
-            .is_empty());
-        assert_eq!(no_hook_runtime.active_hook_routes(), 0);
-
-        no_hook_runtime.stop_hook_ingress().await;
     }
 
     /// Repro for the standing observation that `gate4agent-node` burns CPU

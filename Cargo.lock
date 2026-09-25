@@ -343,8 +343,6 @@ dependencies = [
  "gate4agent-provider-ports",
  "gate4agent-shell-capabilities",
  "gate4agent-shell-history",
- "gate4agent-shell-hooks",
- "gate4agent-shell-managed-hooks",
  "gate4agent-shell-native",
  "gate4agent-testkit",
  "gate4agent-tool-engine",
@@ -373,30 +371,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uuid",
-]
-
-[[package]]
-name = "gate4agent-shell-hooks"
-version = "0.2.37"
-dependencies = [
- "gate4agent-adapters",
- "gate4agent-handle",
- "gate4agent-types",
- "serde_json",
- "thiserror",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "gate4agent-shell-managed-hooks"
-version = "0.2.37"
-dependencies = [
- "gate4agent-adapters",
- "gate4agent-shell-hooks",
- "gate4agent-types",
- "serde_json",
- "thiserror",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use gate4agent_catalog::{builtin_registry, AgentRegistry, EnvMutation};
 use gate4agent_runtime_native::{
-    HookIngressConfig, NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver,
+    NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver,
     NativeInstanceLaunchOverlay, NativeLaunchEnvironmentOverlay, NativeLaunchProfile,
     NativeLaunchProfileControl, NativeLaunchProfileError, NativeLaunchProfileId, NativeRuntime,
     NativeRuntimeConfig, OneShotSessionPersistence,
@@ -607,7 +607,6 @@ async fn native_launch_profile_revalidates_resolver_output_before_spawn() {
         .expect("profile validation failure");
     assert!(!failure.contains("sentinel-not-a-token"));
     assert_eq!(runtime.active_native_sessions(), 0);
-    assert_eq!(runtime.active_hook_routes(), 0);
 }
 
 #[tokio::test]
@@ -664,10 +663,6 @@ async fn selected_native_launch_profile_overlays_only_future_exact_pty_spawns() 
             )
             .unwrap(),
         )
-        .unwrap();
-    runtime
-        .start_hook_ingress(HookIngressConfig::default())
-        .await
         .unwrap();
     let inherited_instance = AgentInstanceId(8101);
     runtime
@@ -758,7 +753,6 @@ async fn selected_native_launch_profile_overlays_only_future_exact_pty_spawns() 
     })
     .await;
     assert_eq!(resolver_calls.load(Ordering::Acquire), 2);
-    assert_eq!(runtime.active_hook_routes(), 0);
 
     let mismatched_instance = AgentInstanceId(8104);
     runtime
@@ -828,9 +822,8 @@ async fn selected_native_launch_profile_overlays_only_future_exact_pty_spawns() 
         })
     })
     .await;
-    runtime.stop_hook_ingress().await;
     println!(
-        "profile_resolutions={} default_isolated=true child_overlay=true raw_hook_route_suppressed=true transport_mismatch_failed=true",
+        "profile_resolutions={} default_isolated=true child_overlay=true transport_mismatch_failed=true",
         resolver_calls.load(Ordering::Acquire)
     );
 }

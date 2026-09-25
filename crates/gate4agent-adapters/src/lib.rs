@@ -8,9 +8,6 @@
 
 mod capability;
 mod history;
-mod hook;
-mod hook_session;
-mod managed_hook;
 mod one_shot;
 mod pty_identity;
 mod resume;
@@ -31,19 +28,6 @@ pub use history::{
     HistoryRole, HistorySession, HistorySourceLayout, HistorySourceVariant,
     HISTORY_DOCUMENT_MAX_BYTES, HISTORY_MESSAGE_MAX_CHARS, HISTORY_METADATA_MAX_BYTES,
     HISTORY_STORED_MESSAGES_MAX,
-};
-pub use hook::{
-    normalize_hook_event, HookAdapterError, HOOK_EVENT_NAME_MAX_BYTES, HOOK_PAYLOAD_MAX_BYTES,
-    HOOK_TEXT_MAX_CHARS, MIMO_CODE_HOOK_TEXT_MAX_CHARS,
-};
-pub use hook_session::{
-    HookEventDisposition, HookEventEnvelope, HookReduction, HookSessionReducer,
-    HookSessionReducerError, HookSubagentSeed, HOOK_EVENT_ID_MAX_BYTES, HOOK_SEEN_EVENT_IDS_MAX,
-};
-pub use managed_hook::{
-    managed_hook_spec, managed_hook_specs, ManagedHookAdapterError, ManagedHookAdapterSpec,
-    ManagedHookConfigKind, ManagedHookConfigLocation, ManagedHookEventShape, ManagedHookEventSpec,
-    MANAGED_HOOK_TIMEOUT_MILLISECONDS, MANAGED_HOOK_TIMEOUT_SECONDS,
 };
 pub use one_shot::{
     one_shot_spec, one_shot_specs, resolve_one_shot_plan,
@@ -74,7 +58,6 @@ pub use session_options::{
 };
 
 pub const BUILTIN_ADAPTER_REVISION: &str = "gate4agent-adapter/v1";
-pub const MANAGED_HOOK_REVISION: &str = "gate4agent-managed-hooks/orca-d8629c4/v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdapterDescriptor {
@@ -314,16 +297,8 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
         descriptors.push(descriptor(AdapterFamily::Acp, id));
     }
     for id in ["claude-code", "codex", "grok", "kimi"] {
-        descriptors.push(descriptor(AdapterFamily::Hook, id));
         descriptors.push(descriptor(AdapterFamily::History, id));
         descriptors.push(descriptor(AdapterFamily::Resume, id));
-    }
-    for id in ["claude", "codex", "grok", "kimi"] {
-        descriptors.push(descriptor_with_revision(
-            AdapterFamily::ManagedHook,
-            id,
-            MANAGED_HOOK_REVISION,
-        ));
     }
     for id in ["claude-code", "codex"] {
         descriptors.push(descriptor_with_revision(
@@ -378,22 +353,35 @@ mod tests {
         assert!(registry.get(AdapterFamily::PtySemantic, &claude).is_some());
         assert!(registry.get(AdapterFamily::Pipe, &claude).is_some());
         assert!(registry.get(AdapterFamily::Acp, &claude).is_some());
-        assert!(registry.get(AdapterFamily::Hook, &claude).is_some());
         assert!(registry.get(AdapterFamily::History, &claude).is_some());
         for id in ["codex", "kimi"] {
             let id = AdapterId::new(id).unwrap();
             assert!(registry.get(AdapterFamily::PtySemantic, &id).is_some());
             assert!(registry.get(AdapterFamily::Pipe, &id).is_some());
             assert!(registry.get(AdapterFamily::Acp, &id).is_some());
-            assert!(registry.get(AdapterFamily::Hook, &id).is_some());
             assert!(registry.get(AdapterFamily::History, &id).is_some());
         }
         let grok = AdapterId::new("grok").unwrap();
         assert!(registry.get(AdapterFamily::PtySemantic, &grok).is_none());
         assert!(registry.get(AdapterFamily::Pipe, &grok).is_none());
         assert!(registry.get(AdapterFamily::Acp, &grok).is_some());
-        assert!(registry.get(AdapterFamily::Hook, &grok).is_some());
         assert!(registry.get(AdapterFamily::History, &grok).is_some());
+    }
+
+    /// Lifecycle hooks are retired (owner ruling 2026-09-25): sessions are
+    /// observed through ACP where a provider has it, never through a global
+    /// hook install. Neither `Hook` nor `ManagedHook` is registered anymore.
+    #[test]
+    fn hook_families_are_retired_and_unregistered() {
+        let registry = builtin_adapter_registry();
+        assert_eq!(
+            registry
+                .iter()
+                .filter(|descriptor| descriptor.family == AdapterFamily::Hook
+                    || descriptor.family == AdapterFamily::ManagedHook)
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -406,36 +394,6 @@ mod tests {
         let expected = ["claude-code", "codex", "grok", "kimi"]
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn hook_registry_matches_the_fleet_source_inventory() {
-        let actual = builtin_adapter_registry()
-            .iter()
-            .filter(|descriptor| descriptor.family == AdapterFamily::Hook)
-            .map(|descriptor| descriptor.binding.id.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        let expected = ["claude-code", "codex", "grok", "kimi"].into_iter().collect();
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn managed_hook_registry_matches_the_fleet_control_inventory() {
-        let actual = builtin_adapter_registry()
-            .iter()
-            .filter(|descriptor| descriptor.family == AdapterFamily::ManagedHook)
-            .map(|descriptor| {
-                (
-                    descriptor.binding.id.as_str(),
-                    descriptor.binding.revision.as_str(),
-                )
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        let expected = ["claude", "codex", "grok", "kimi"]
-            .into_iter()
-            .map(|id| (id, MANAGED_HOOK_REVISION))
-            .collect();
         assert_eq!(actual, expected);
     }
 

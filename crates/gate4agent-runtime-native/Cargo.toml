@@ -13,7 +13,6 @@ gate4agent-kernel = { path = "../gate4agent-kernel" }
 gate4agent-provider-ports = { path = "../gate4agent-provider-ports" }
 gate4agent-shell-history = { path = "../gate4agent-shell-history" }
 gate4agent-shell-capabilities = { path = "../gate4agent-shell-capabilities" }
-gate4agent-shell-hooks = { path = "../gate4agent-shell-hooks" }
 gate4agent-shell-native = { path = "../gate4agent-shell-native" }
 gate4agent-tool-engine = { path = "../gate4agent-tool-engine" }
 gate4agent-types = { path = "../gate4agent-types" }
@@ -21,6 +20,5 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
-gate4agent-shell-managed-hooks = { path = "../gate4agent-shell-managed-hooks" }
 gate4agent-testkit = { path = "../gate4agent-testkit" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

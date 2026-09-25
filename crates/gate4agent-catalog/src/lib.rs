@@ -36,8 +36,9 @@ pub use gate4agent_types::{
 };
 pub use launch::{
     approval_level_args, approval_level_resolution, plan_draft_launch, plan_launch,
-    ApprovalLevelResolution, EnvMutation, LaunchPlan, LaunchPlanError, LaunchRequest, ModeId,
-    MAX_LAUNCH_PROMPT_BYTES, WINDOWS_INLINE_LAUNCH_MAX_CHARS,
+    ApprovalLevelResolution, EnvMutation, LaunchPlan, LaunchPlanError, LaunchRequest,
+    McpServerSpec, McpServerSpecError, ModeId, MAX_LAUNCH_PROMPT_BYTES,
+    WINDOWS_INLINE_LAUNCH_MAX_CHARS,
 };
 pub use registry::{AgentRegistry, RegistryError};
 pub use session_options::{

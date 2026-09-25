@@ -107,8 +107,8 @@ pub struct RateLimitInfo {
     /// Providers print this in the LOCAL wall-clock time of the machine
     /// running the CLI, never with an explicit zone or offset, so this is
     /// filled by resolving that local time against `chrono::Local` (this
-    /// process's own OS zone — correct only because the harness node and
-    /// the CLI it drives run on the same machine) to the NEAREST FUTURE
+    /// process's own OS zone — correct only because the controlling node
+    /// and the CLI it drives run on the same machine) to the NEAREST FUTURE
     /// occurrence: a bare `HH:MM` that has already passed today resolves
     /// to tomorrow; a `HH:MM on D Mon` whose date has already passed this
     /// year resolves to next year. `None` when no reset time was printed,
@@ -514,7 +514,7 @@ pub enum AgentEvent {
     PtyToolApproval { tool_name: String, description: Option<String> },
 
     // --- Stream events (transport-neutral; formerly Pipe-prefixed) ---
-    /// Session initialized. Produced by all PIPE and DaemonHarness transports.
+    /// Session initialized. Produced by all PIPE and daemon transports.
     SessionStart { session_id: String, model: String, tools: Vec<String> },
     /// Streaming text delta from assistant (is_delta=true) or complete turn text.
     Text { text: String, is_delta: bool },

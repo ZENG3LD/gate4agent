@@ -7,12 +7,9 @@ mod vendor_contract;
 
 pub use launch_profiles::{
     NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver, NativeLaunchProfile,
-    NativeHarnessMcpLaunchOverlay, NativeInstanceLaunchOverlay, NativeLaunchEnvironmentOverlay,
+    NativeMcpServerLaunchOverlay, NativeInstanceLaunchOverlay, NativeLaunchEnvironmentOverlay,
     NativeLaunchProfileControl,
     NativeLaunchProfileDescriptor, NativeLaunchProfileError, NativeLaunchProfileId,
-    HARNESS_MCP_PROGRAM_ENV, HARNESS_MCP_SESSION_ENDPOINT_ENV,
-    HARNESS_MCP_SESSION_TOKEN_ENV, LEGACY_HARNESS_READ_CREDENTIAL_ENV,
-    LEGACY_HARNESS_READ_ENDPOINT_ENV,
     ZAI_GLM_ANTHROPIC_BASE_URL, ZAI_GLM_CLAUDE_OPTIONAL_ENV_KEYS,
     ZAI_GLM_CLAUDE_OWNED_ENV_KEYS, ZAI_GLM_CLAUDE_PROFILE, ZAI_GLM_CLAUDE_PROFILE_ID,
     ZAI_GLM_CLAUDE_PROFILE_REVISION, ZAI_GLM_CLAUDE_REQUIRED_ENV_KEYS,
@@ -27,7 +24,7 @@ pub use vendor_contract::{
     CLAUDE_WINDOWS_X86_64_2_1_224_CONTRACT_ID,
 };
 
-use gate4agent_catalog::{builtin_registry, AgentRegistry, EnvMutation};
+use gate4agent_catalog::{builtin_registry, AgentRegistry, EnvMutation, McpServerSpec};
 use gate4agent_handle::{
     bounded_control_plane, ControlPlaneKernelPort, Gate4AgentHandle,
     ProviderRuntimeError, PublishReport, ToolAuthorityHandle,
@@ -1843,6 +1840,7 @@ struct NativeSpawnOverlay {
     environment: Vec<EnvMutation>,
     extra_args: Vec<OsString>,
     one_shot_session_persistence: OneShotSessionPersistence,
+    mcp_server: Option<McpServerSpec>,
 }
 
 impl Default for NativeSpawnOverlay {
@@ -1851,6 +1849,7 @@ impl Default for NativeSpawnOverlay {
             environment: Vec::new(),
             extra_args: Vec::new(),
             one_shot_session_persistence: OneShotSessionPersistence::Ephemeral,
+            mcp_server: None,
         }
     }
 }
@@ -1860,6 +1859,7 @@ struct NativeEffectRequest {
     spawn_env: Vec<EnvMutation>,
     spawn_extra_args: Vec<OsString>,
     one_shot_session_persistence: OneShotSessionPersistence,
+    spawn_mcp_server: Option<McpServerSpec>,
 }
 
 #[derive(Clone)]
@@ -1960,6 +1960,7 @@ impl NativeEffectDispatcher {
             spawn_env: spawn_overlay.environment,
             spawn_extra_args: spawn_overlay.extra_args,
             one_shot_session_persistence: spawn_overlay.one_shot_session_persistence,
+            spawn_mcp_server: spawn_overlay.mcp_server,
         };
         for _ in 0..2 {
             let sender = self.worker_sender(instance_id);
@@ -1992,6 +1993,7 @@ impl NativeEffectDispatcher {
             spawn_env: Vec::new(),
             spawn_extra_args: Vec::new(),
             one_shot_session_persistence: OneShotSessionPersistence::Ephemeral,
+            spawn_mcp_server: None,
         };
         for _ in 0..2 {
             let sender = self.capability_sender();
@@ -2052,6 +2054,7 @@ impl NativeEffectDispatcher {
             spawn_env: Vec::new(),
             spawn_extra_args: Vec::new(),
             one_shot_session_persistence: OneShotSessionPersistence::Ephemeral,
+            spawn_mcp_server: None,
         };
         for _ in 0..2 {
             let sender = self.authority_sender();
@@ -2178,6 +2181,7 @@ impl NativeEffectDispatcher {
                 environment: overlay.environment,
                 extra_args: overlay.extra_args,
                 one_shot_session_persistence: overlay.one_shot_session_persistence,
+                mcp_server: overlay.mcp_server,
             })
             .map_err(|error| error.to_string())
     }
@@ -2636,6 +2640,7 @@ async fn run_effect_worker(
                         request.spawn_env,
                         request.spawn_extra_args,
                         request.one_shot_session_persistence,
+                        request.spawn_mcp_server,
                     )
                     .await;
                 update_active_count(&context.active_sessions, before, shell.active_session_count());

@@ -27,6 +27,91 @@ impl fmt::Debug for EnvMutation {
     }
 }
 
+/// Generic host-only description of one stdio MCP server a spawn should
+/// expose to its agent: an ACP-transport agent gets `name`/`program`/`args`/
+/// `env` translated into one `session/new.mcpServers` stdio entry; a
+/// PTY-transport child instead gets `env` installed into its own OS
+/// environment (whatever that child needs to reach or relaunch the same
+/// server is `env`'s job to carry -- this type never interprets a key or a
+/// value). Naming, endpoint/token shape, and any trace opt-in are entirely
+/// the caller's concern; this crate and every other gate4agent-owned crate
+/// never grow harness- or task-specific vocabulary of their own.
+///
+/// Lives here, one level below both `gate4agent-runtime-native` (which
+/// resolves it) and `gate4agent-shell-native` (whose ACP branch reads it):
+/// the dependency between those two crates runs one way only
+/// (`gate4agent-shell-native` cannot depend on `gate4agent-runtime-native`),
+/// so a type shared by both has to live below the pair, not in either one.
+/// It is carried as a plain in-process value the whole way -- never a wire
+/// or protocol type.
+#[derive(Clone)]
+pub struct McpServerSpec {
+    name: String,
+    program: OsString,
+    args: Vec<OsString>,
+    env: Vec<(OsString, OsString)>,
+}
+
+impl McpServerSpec {
+    pub fn new(
+        name: impl Into<String>,
+        program: OsString,
+        args: Vec<OsString>,
+        env: Vec<(OsString, OsString)>,
+    ) -> Result<Self, McpServerSpecError> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(McpServerSpecError::EmptyName);
+        }
+        if program.is_empty() {
+            return Err(McpServerSpecError::EmptyProgram);
+        }
+        Ok(Self {
+            name,
+            program,
+            args,
+            env,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn program(&self) -> &OsStr {
+        &self.program
+    }
+
+    pub fn args(&self) -> &[OsString] {
+        &self.args
+    }
+
+    pub fn env(&self) -> &[(OsString, OsString)] {
+        &self.env
+    }
+}
+
+impl fmt::Debug for McpServerSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpServerSpec")
+            .field("name", &self.name)
+            .field(
+                "env_keys",
+                &self.env.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum McpServerSpecError {
+    #[error("MCP server spec name must not be empty")]
+    EmptyName,
+    #[error("MCP server spec program must not be empty")]
+    EmptyProgram,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct LaunchRequest {
     pub working_dir: PathBuf,

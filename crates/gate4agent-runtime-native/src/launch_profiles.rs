@@ -1,10 +1,9 @@
 use gate4agent_adapters::OneShotSessionPersistence;
-use gate4agent_catalog::EnvMutation;
+use gate4agent_catalog::{EnvMutation, McpServerSpec, McpServerSpecError};
 use gate4agent_types::{AgentId, AgentInstanceId, TransportKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 
@@ -20,27 +19,6 @@ const NATIVE_INSTANCE_LAUNCH_ARG_MAX_BYTES: usize = 65_536;
 const NATIVE_INSTANCE_LAUNCH_ARGS_TOTAL_MAX_BYTES: usize = 262_144;
 const RESERVED_HOOK_ENV_PREFIX: &str = "GATE4AGENT_HOOK_";
 const CONTEXT_ROOT_ENVIRONMENT_KEY: &str = "GATE4AGENT_CONTEXT_ROOT";
-pub const HARNESS_MCP_SESSION_ENDPOINT_ENV: &str =
-    "GATE4AGENT_HARNESS_SESSION_ENDPOINT";
-pub const HARNESS_MCP_SESSION_TOKEN_ENV: &str =
-    "GATE4AGENT_HARNESS_SESSION_TOKEN";
-pub const HARNESS_MCP_PROGRAM_ENV: &str = "GATE4AGENT_HARNESS_MCP_PROGRAM";
-pub const LEGACY_HARNESS_READ_ENDPOINT_ENV: &str = "GATE4AGENT_HARNESS_READ_ENDPOINT";
-pub const LEGACY_HARNESS_READ_CREDENTIAL_ENV: &str = "GATE4AGENT_HARNESS_READ_CREDENTIAL";
-/// Mirror of `gate4agent_harness_mcp::HARNESS_MCP_TRACE_ENV`. This crate
-/// does not depend on `gate4agent-harness-mcp` -- nothing here needs the
-/// helper's own stdio-trace machinery, only the one env key name it reads
-/// -- so the literal is duplicated rather than imported, the same choice
-/// `gate4agent-shell-native` already made for `HARNESS_MCP_PROGRAM_ENV` and
-/// its neighbors.
-pub const HARNESS_MCP_TRACE_ENV: &str = "G4A_HARNESS_MCP_TRACE";
-/// Node-process opt-in, read once per [`NativeHarnessMcpLaunchOverlay::new`]
-/// call: when this exact process has a non-empty
-/// `G4A_HARNESS_MCP_TRACE_DIR`, the overlay gets a fourth environment
-/// mutation naming a trace file under that directory for
-/// [`HARNESS_MCP_TRACE_ENV`]. Unset, overlay construction is byte-for-byte
-/// what it was before this opt-in existed.
-pub const HARNESS_MCP_TRACE_DIR_ENV: &str = "G4A_HARNESS_MCP_TRACE_DIR";
 const RESERVED_CLAUDE_LAUNCH_FLAGS: &[&str] = &[
     "--continue",
     "--print",
@@ -238,90 +216,67 @@ pub struct NativeInstanceLaunchOverlay {
     profile_selection_required: bool,
 }
 
-/// Dedicated host-only H3B child environment for one exact instance,
-/// PTY or ACP.
+/// Host-only MCP-server launch overlay for one exact instance, PTY or ACP.
 ///
-/// The resolved mutations are the same regardless of which transport reads
-/// them: `NativeSpawnOverlay::resolve_environment`, below, does not gate this
-/// overlay by transport. A PTY child consumes them as OS environment; an ACP
-/// child never sees an environment variable this way at all --
-/// `gate4agent-shell-native`'s ACP branch instead reads the resolved
-/// `GATE4AGENT_HARNESS_MCP_PROGRAM`/`_SESSION_ENDPOINT`/`_SESSION_TOKEN`
-/// entries back out of the same resolved list and translates them into one
-/// `session/new.mcpServers` stdio entry
-/// (gate4agent-arc-mailbox-and-task-layer Slice A(ii)).
+/// Built from a caller-supplied [`McpServerSpec`] plus whatever the caller
+/// wants installed into, or scrubbed from, a PTY child's own OS environment.
+/// The two never disagree on the server's own environment entries: `env`
+/// below both becomes the PTY child's environment (as `Some` mutations,
+/// alongside `env_removals` as `None` mutations) and travels unchanged as
+/// [`McpServerSpec::env`] for an ACP-transport agent's own stdio server
+/// entry -- `NativeSpawnOverlay::resolve_environment`, below, does not gate
+/// this overlay by transport, and `gate4agent-shell-native`'s ACP branch
+/// receives the resolved spec as a typed value from
+/// `gate4agent-runtime-native`, in-process
+/// (`NativeSpawnOverlay`/`NativeEffectRequest`), never a wire type or a
+/// well-known environment key it has to re-read.
 ///
-/// Endpoint, token, and reviewed helper path never enter generic launch-profile
-/// ownership, wire state, or diagnostics.
-pub struct NativeHarnessMcpLaunchOverlay {
+/// This crate never interprets `name`, `program`, `args`, or any entry in
+/// `env`/`env_removals` -- they, and any trace opt-in a caller wants, are
+/// entirely the caller's concern.
+pub struct NativeMcpServerLaunchOverlay {
     agent_id: AgentId,
     environment: Vec<EnvMutation>,
+    mcp_server: McpServerSpec,
 }
 
-impl NativeHarnessMcpLaunchOverlay {
+impl NativeMcpServerLaunchOverlay {
+    /// `env_entries` are installed into a PTY child's OS environment and
+    /// carried unchanged as the ACP stdio entry's own `env`. `env_removals`
+    /// applies to the PTY child's OS environment only -- an ACP
+    /// `mcpServers` entry is additive, so there is nothing there to remove.
     pub fn new(
         agent_id: AgentId,
-        endpoint: OsString,
-        token: OsString,
+        name: impl Into<String>,
         program: OsString,
+        args: Vec<OsString>,
+        env_entries: Vec<(OsString, OsString)>,
+        env_removals: Vec<OsString>,
     ) -> Result<Self, NativeLaunchProfileError> {
-        let mut environment = vec![
-            EnvMutation {
-                key: OsString::from(HARNESS_MCP_SESSION_ENDPOINT_ENV),
-                value: Some(endpoint),
-            },
-            EnvMutation {
-                key: OsString::from(HARNESS_MCP_SESSION_TOKEN_ENV),
-                value: Some(token),
-            },
-            EnvMutation {
-                key: OsString::from(HARNESS_MCP_PROGRAM_ENV),
-                value: Some(program),
-            },
-        ];
-        if let Some(trace_mutation) = harness_mcp_trace_mutation() {
-            environment.push(trace_mutation);
-        }
-        environment.push(EnvMutation {
-            key: OsString::from(LEGACY_HARNESS_READ_ENDPOINT_ENV),
-            value: None,
-        });
-        environment.push(EnvMutation {
-            key: OsString::from(LEGACY_HARNESS_READ_CREDENTIAL_ENV),
-            value: None,
-        });
+        let mcp_server = McpServerSpec::new(name, program, args, env_entries.clone())?;
+        let mut environment: Vec<EnvMutation> = env_entries
+            .into_iter()
+            .map(|(key, value)| EnvMutation {
+                key,
+                value: Some(value),
+            })
+            .collect();
+        environment.extend(
+            env_removals
+                .into_iter()
+                .map(|key| EnvMutation { key, value: None }),
+        );
         validate_environment_mutations(&environment)?;
-        Ok(Self { agent_id, environment })
+        Ok(Self {
+            agent_id,
+            environment,
+            mcp_server,
+        })
     }
-}
 
-/// Numbers each harness-MCP overlay this process constructs, in
-/// construction order. `NativeHarnessMcpLaunchOverlay::new` carries no
-/// session `AgentInstanceId` or generation -- adding one would change the
-/// signature its one caller in `gate4agent-node` depends on, out of scope
-/// for this opt-in -- so [`harness_mcp_trace_mutation`] uses this
-/// process-local sequence as the overlay's own instance identity for the
-/// trace file name instead of the session's. Two overlays built back to
-/// back in one node process still get distinct trace files.
-static NEXT_HARNESS_MCP_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-/// Builds the optional fourth [`EnvMutation`] naming a stdio trace file for
-/// one harness-MCP overlay, gated on this process having opted in via
-/// [`HARNESS_MCP_TRACE_DIR_ENV`]. Returns `None` -- and therefore leaves
-/// [`NativeHarnessMcpLaunchOverlay::new`]'s output identical to before this
-/// opt-in existed -- when the directory is unset, empty, or not valid
-/// Unicode. Never creates the directory; that is the operator's job.
-fn harness_mcp_trace_mutation() -> Option<EnvMutation> {
-    let trace_dir = std::env::var(HARNESS_MCP_TRACE_DIR_ENV).ok()?;
-    if trace_dir.is_empty() {
-        return None;
+    pub(crate) fn mcp_server(&self) -> &McpServerSpec {
+        &self.mcp_server
     }
-    let sequence = NEXT_HARNESS_MCP_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let path = std::path::Path::new(&trace_dir).join(format!("harness-mcp-{sequence}.trace"));
-    Some(EnvMutation {
-        key: OsString::from(HARNESS_MCP_TRACE_ENV),
-        value: Some(path.into_os_string()),
-    })
 }
 
 impl NativeInstanceLaunchOverlay {
@@ -557,8 +512,8 @@ pub enum NativeLaunchProfileError {
     OneShotSessionPersistenceBindingMismatch,
     #[error("native instance launch overlay supports PTY transport only")]
     InstanceOverlayUnsupportedTransport,
-    #[error("native harness MCP launch overlay requires PTY or ACP transport and the exact provider binding; saw transport {transport:?}, overlay provider '{overlay_provider}', spawn provider '{spawn_provider}'")]
-    HarnessMcpOverlayBindingMismatch {
+    #[error("native MCP server launch overlay requires PTY or ACP transport and the exact provider binding; saw transport {transport:?}, overlay provider '{overlay_provider}', spawn provider '{spawn_provider}'")]
+    McpServerOverlayBindingMismatch {
         transport: TransportKind,
         overlay_provider: AgentId,
         spawn_provider: AgentId,
@@ -587,13 +542,15 @@ pub enum NativeLaunchProfileError {
     ProfileInUse,
     #[error(transparent)]
     Resolve(#[from] NativeChildEnvironmentResolveError),
+    #[error(transparent)]
+    McpServerSpec(#[from] McpServerSpecError),
 }
 
 pub(crate) struct NativeLaunchProfiles {
     profiles: BTreeMap<NativeLaunchProfileId, NativeLaunchProfile>,
     selections: BTreeMap<AgentInstanceId, NativeLaunchProfileId>,
     instance_overlays: BTreeMap<AgentInstanceId, Arc<NativeInstanceLaunchOverlay>>,
-    harness_mcp_overlays: BTreeMap<AgentInstanceId, Arc<NativeHarnessMcpLaunchOverlay>>,
+    mcp_server_overlays: BTreeMap<AgentInstanceId, Arc<NativeMcpServerLaunchOverlay>>,
 }
 
 impl NativeLaunchProfiles {
@@ -602,7 +559,7 @@ impl NativeLaunchProfiles {
             profiles: BTreeMap::new(),
             selections: BTreeMap::new(),
             instance_overlays: BTreeMap::new(),
-            harness_mcp_overlays: BTreeMap::new(),
+            mcp_server_overlays: BTreeMap::new(),
         }
     }
 
@@ -716,25 +673,25 @@ impl NativeLaunchProfiles {
         self.instance_overlays.remove(&instance_id).is_some()
     }
 
-    pub(crate) fn install_harness_mcp_overlay(
+    pub(crate) fn install_mcp_server_overlay(
         &mut self,
         instance_id: AgentInstanceId,
-        overlay: NativeHarnessMcpLaunchOverlay,
+        overlay: NativeMcpServerLaunchOverlay,
     ) -> Result<(), NativeLaunchProfileError> {
-        if !self.harness_mcp_overlays.contains_key(&instance_id)
-            && self.harness_mcp_overlays.len() >= NATIVE_LAUNCH_PROFILE_SELECTIONS_MAX
+        if !self.mcp_server_overlays.contains_key(&instance_id)
+            && self.mcp_server_overlays.len() >= NATIVE_LAUNCH_PROFILE_SELECTIONS_MAX
         {
             return Err(NativeLaunchProfileError::EnvironmentOverlayCapacityExceeded {
                 max: NATIVE_LAUNCH_PROFILE_SELECTIONS_MAX,
             });
         }
-        self.harness_mcp_overlays
+        self.mcp_server_overlays
             .insert(instance_id, Arc::new(overlay));
         Ok(())
     }
 
-    pub(crate) fn clear_harness_mcp_overlay(&mut self, instance_id: AgentInstanceId) -> bool {
-        self.harness_mcp_overlays.remove(&instance_id).is_some()
+    pub(crate) fn clear_mcp_server_overlay(&mut self, instance_id: AgentInstanceId) -> bool {
+        self.mcp_server_overlays.remove(&instance_id).is_some()
     }
 
     fn profile_for_spawn(
@@ -745,7 +702,7 @@ impl NativeLaunchProfiles {
         pipe_binding_is_exact_one_shot: bool,
     ) -> Result<Option<NativeLaunchSpawnEnvironment>, NativeLaunchProfileError> {
         let overlay = self.instance_overlays.get(&instance_id).cloned();
-        let harness_mcp_overlay = self.harness_mcp_overlays.get(&instance_id).cloned();
+        let mcp_server_overlay = self.mcp_server_overlays.get(&instance_id).cloned();
         let profile = if let Some(profile_id) = self.selections.get(&instance_id) {
             let profile = self
                 .profiles
@@ -772,24 +729,24 @@ impl NativeLaunchProfiles {
                 return Err(NativeLaunchProfileError::EnvironmentOverlaySelectionMissing);
             }
         }
-        if let Some(harness_mcp_overlay) = &harness_mcp_overlay {
+        if let Some(mcp_server_overlay) = &mcp_server_overlay {
             if !matches!(transport, TransportKind::Pty | TransportKind::Acp)
-                || harness_mcp_overlay.agent_id != *agent_id
+                || mcp_server_overlay.agent_id != *agent_id
             {
-                return Err(NativeLaunchProfileError::HarnessMcpOverlayBindingMismatch {
+                return Err(NativeLaunchProfileError::McpServerOverlayBindingMismatch {
                     transport,
-                    overlay_provider: harness_mcp_overlay.agent_id.clone(),
+                    overlay_provider: mcp_server_overlay.agent_id.clone(),
                     spawn_provider: agent_id.clone(),
                 });
             }
         }
-        if profile.is_none() && overlay.is_none() && harness_mcp_overlay.is_none() {
+        if profile.is_none() && overlay.is_none() && mcp_server_overlay.is_none() {
             return Ok(None);
         }
         Ok(Some(NativeLaunchSpawnEnvironment {
             profile,
             overlay,
-            harness_mcp_overlay,
+            mcp_server_overlay,
         }))
     }
 }
@@ -797,13 +754,14 @@ impl NativeLaunchProfiles {
 struct NativeLaunchSpawnEnvironment {
     profile: Option<NativeLaunchProfile>,
     overlay: Option<Arc<NativeInstanceLaunchOverlay>>,
-    harness_mcp_overlay: Option<Arc<NativeHarnessMcpLaunchOverlay>>,
+    mcp_server_overlay: Option<Arc<NativeMcpServerLaunchOverlay>>,
 }
 
 pub(crate) struct ResolvedNativeLaunchOverlay {
     pub(crate) environment: Vec<EnvMutation>,
     pub(crate) extra_args: Vec<OsString>,
     pub(crate) one_shot_session_persistence: OneShotSessionPersistence,
+    pub(crate) mcp_server: Option<McpServerSpec>,
 }
 
 /// Clonable host-local control for selecting profiles without mutable runtime access.
@@ -879,18 +837,20 @@ impl NativeLaunchProfileControl {
         self.lock().clear_instance_overlay(instance_id)
     }
 
-    /// Installs the dedicated H3B environment for one exact future PTY spawn.
-    pub fn install_native_harness_mcp_launch_overlay(
+    /// Installs the dedicated MCP-server launch overlay for one exact future
+    /// PTY or ACP spawn.
+    pub fn install_native_mcp_server_launch_overlay(
         &self,
         instance_id: AgentInstanceId,
-        overlay: NativeHarnessMcpLaunchOverlay,
+        overlay: NativeMcpServerLaunchOverlay,
     ) -> Result<(), NativeLaunchProfileError> {
-        self.lock().install_harness_mcp_overlay(instance_id, overlay)
+        self.lock().install_mcp_server_overlay(instance_id, overlay)
     }
 
-    /// Clears one dedicated H3B environment before or after the child lifetime.
-    pub fn clear_native_harness_mcp_launch_overlay(&self, instance_id: AgentInstanceId) -> bool {
-        self.lock().clear_harness_mcp_overlay(instance_id)
+    /// Clears one dedicated MCP-server launch overlay before or after the
+    /// child lifetime.
+    pub fn clear_native_mcp_server_launch_overlay(&self, instance_id: AgentInstanceId) -> bool {
+        self.lock().clear_mcp_server_overlay(instance_id)
     }
 
     pub(crate) fn resolve_launch_overlay(
@@ -913,6 +873,7 @@ impl NativeLaunchProfileControl {
                 environment: Vec::new(),
                 extra_args: Vec::new(),
                 one_shot_session_persistence: OneShotSessionPersistence::Ephemeral,
+                mcp_server: None,
             });
         };
         let one_shot_session_persistence = spawn_environment
@@ -921,6 +882,10 @@ impl NativeLaunchProfileControl {
             .map_or(OneShotSessionPersistence::Ephemeral, |profile| {
                 profile.one_shot_session_persistence
             });
+        let mcp_server = spawn_environment
+            .mcp_server_overlay
+            .as_ref()
+            .map(|overlay| overlay.mcp_server().clone());
         let mut environment = if let Some(profile) = spawn_environment.profile {
             profile.resolve_environment(agent_id, transport)?
         } else {
@@ -931,7 +896,7 @@ impl NativeLaunchProfileControl {
             environment.extend(overlay.environment.iter().cloned());
             extra_args.extend(overlay.extra_args.iter().cloned());
         }
-        if let Some(overlay) = spawn_environment.harness_mcp_overlay {
+        if let Some(overlay) = spawn_environment.mcp_server_overlay {
             environment.extend(overlay.environment.iter().cloned());
         }
         validate_environment_mutations(&environment)?;
@@ -940,6 +905,7 @@ impl NativeLaunchProfileControl {
             environment,
             extra_args,
             one_shot_session_persistence,
+            mcp_server,
         })
     }
 
@@ -1169,42 +1135,6 @@ fn validate_zai_glm_claude_environment(
 mod tests {
     use super::*;
 
-    /// Serializes every test that touches [`HARNESS_MCP_TRACE_DIR_ENV`]:
-    /// `std::env` is process-global, and unit tests in this binary run on
-    /// separate threads by default.
-    static HARNESS_MCP_TRACE_DIR_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Restore-on-drop guard for [`HARNESS_MCP_TRACE_DIR_ENV`], mirroring
-    /// `EnvironmentGuard` in `tests/native_launch_profiles.rs`: capture
-    /// whatever the process had before, mutate for the test, then put it
-    /// back regardless of how the test exits.
-    struct HarnessMcpTraceDirGuard {
-        previous: Option<OsString>,
-    }
-
-    impl HarnessMcpTraceDirGuard {
-        fn set(value: &str) -> Self {
-            let previous = std::env::var_os(HARNESS_MCP_TRACE_DIR_ENV);
-            std::env::set_var(HARNESS_MCP_TRACE_DIR_ENV, value);
-            Self { previous }
-        }
-
-        fn unset() -> Self {
-            let previous = std::env::var_os(HARNESS_MCP_TRACE_DIR_ENV);
-            std::env::remove_var(HARNESS_MCP_TRACE_DIR_ENV);
-            Self { previous }
-        }
-    }
-
-    impl Drop for HarnessMcpTraceDirGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(previous) => std::env::set_var(HARNESS_MCP_TRACE_DIR_ENV, previous),
-                None => std::env::remove_var(HARNESS_MCP_TRACE_DIR_ENV),
-            }
-        }
-    }
-
     struct CodexEnvironment;
 
     impl NativeChildEnvironmentResolver for CodexEnvironment {
@@ -1283,53 +1213,76 @@ mod tests {
         );
     }
 
+    /// A caller-supplied MCP-server overlay spec, generic on `agent_id` --
+    /// mirrors what `hatchery-node` builds today (name `"hatchery"`,
+    /// `--session-proxy`, endpoint/token/trace env entries, and the two
+    /// legacy `GATE4AGENT_HARNESS_READ_*` names as removals), but under a
+    /// caller-chosen name and env keys this crate never interprets.
+    fn sample_mcp_server_overlay(agent_id: &str) -> NativeMcpServerLaunchOverlay {
+        NativeMcpServerLaunchOverlay::new(
+            AgentId::new(agent_id).unwrap(),
+            "test-mcp-server",
+            OsString::from("reviewed-program"),
+            vec![OsString::from("--session-proxy")],
+            vec![
+                (
+                    OsString::from("TEST_MCP_SESSION_ENDPOINT"),
+                    OsString::from("private-endpoint"),
+                ),
+                (
+                    OsString::from("TEST_MCP_SESSION_TOKEN"),
+                    OsString::from("private-token"),
+                ),
+            ],
+            vec![
+                OsString::from("TEST_MCP_LEGACY_ENDPOINT"),
+                OsString::from("TEST_MCP_LEGACY_CREDENTIAL"),
+            ],
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn harness_mcp_overlay_sets_only_h3b_and_scrubs_legacy_h2_environment() {
+    fn mcp_server_overlay_sets_given_environment_and_scrubs_given_removals() {
         let control = NativeLaunchProfileControl::new();
         let instance_id = AgentInstanceId(41);
-        control.install_native_harness_mcp_launch_overlay(
-            instance_id,
-            NativeHarnessMcpLaunchOverlay::new(
-                AgentId::new("codex").unwrap(),
-                OsString::from("private-endpoint"),
-                OsString::from("private-token"),
-                OsString::from("reviewed-program"),
-            ).unwrap(),
-        ).unwrap();
-        let resolved = control.resolve_launch_overlay(
-            instance_id,
-            &AgentId::new("codex").unwrap(),
-            TransportKind::Pty,
-            true,
-        ).unwrap();
-        assert_eq!(resolved.environment.len(), 5);
-        for key in [LEGACY_HARNESS_READ_ENDPOINT_ENV, LEGACY_HARNESS_READ_CREDENTIAL_ENV] {
+        control
+            .install_native_mcp_server_launch_overlay(instance_id, sample_mcp_server_overlay("codex"))
+            .unwrap();
+        let resolved = control
+            .resolve_launch_overlay(
+                instance_id,
+                &AgentId::new("codex").unwrap(),
+                TransportKind::Pty,
+                true,
+            )
+            .unwrap();
+        assert_eq!(resolved.environment.len(), 4);
+        for key in ["TEST_MCP_LEGACY_ENDPOINT", "TEST_MCP_LEGACY_CREDENTIAL"] {
             assert!(resolved.environment.iter().any(|mutation| {
                 mutation.key == OsString::from(key) && mutation.value.is_none()
             }));
         }
-        for key in [HARNESS_MCP_SESSION_ENDPOINT_ENV, HARNESS_MCP_SESSION_TOKEN_ENV, HARNESS_MCP_PROGRAM_ENV] {
+        for key in ["TEST_MCP_SESSION_ENDPOINT", "TEST_MCP_SESSION_TOKEN"] {
             assert!(resolved.environment.iter().any(|mutation| {
                 mutation.key == OsString::from(key) && mutation.value.is_some()
             }));
         }
+        let mcp_server = resolved
+            .mcp_server
+            .expect("mcp server spec resolved for this spawn");
+        assert_eq!(mcp_server.name(), "test-mcp-server");
+        assert_eq!(mcp_server.program(), OsStr::new("reviewed-program"));
+        assert_eq!(mcp_server.args(), &[OsString::from("--session-proxy")]);
+        assert_eq!(mcp_server.env().len(), 2, "exactly the two entries given, never the removals");
     }
 
     #[test]
-    fn harness_mcp_overlay_admits_acp_transport_for_the_same_provider() {
+    fn mcp_server_overlay_admits_acp_transport_for_the_same_provider() {
         let control = NativeLaunchProfileControl::new();
         let instance_id = AgentInstanceId(42);
         control
-            .install_native_harness_mcp_launch_overlay(
-                instance_id,
-                NativeHarnessMcpLaunchOverlay::new(
-                    AgentId::new("claude").unwrap(),
-                    OsString::from("private-endpoint"),
-                    OsString::from("private-token"),
-                    OsString::from("reviewed-program"),
-                )
-                .unwrap(),
-            )
+            .install_native_mcp_server_launch_overlay(instance_id, sample_mcp_server_overlay("claude"))
             .unwrap();
         let resolved = control
             .resolve_launch_overlay(
@@ -1339,24 +1292,16 @@ mod tests {
                 true,
             )
             .unwrap();
-        assert_eq!(resolved.environment.len(), 5);
+        assert_eq!(resolved.environment.len(), 4);
+        assert!(resolved.mcp_server.is_some());
     }
 
     #[test]
-    fn harness_mcp_overlay_refuses_acp_transport_for_a_different_provider() {
+    fn mcp_server_overlay_refuses_acp_transport_for_a_different_provider() {
         let control = NativeLaunchProfileControl::new();
         let instance_id = AgentInstanceId(43);
         control
-            .install_native_harness_mcp_launch_overlay(
-                instance_id,
-                NativeHarnessMcpLaunchOverlay::new(
-                    AgentId::new("codex").unwrap(),
-                    OsString::from("private-endpoint"),
-                    OsString::from("private-token"),
-                    OsString::from("reviewed-program"),
-                )
-                .unwrap(),
-            )
+            .install_native_mcp_server_launch_overlay(instance_id, sample_mcp_server_overlay("codex"))
             .unwrap();
         let result = control.resolve_launch_overlay(
             instance_id,
@@ -1365,10 +1310,10 @@ mod tests {
             true,
         );
         match result {
-            Ok(_) => panic!("expected the harness MCP overlay gate to refuse a mismatched provider"),
+            Ok(_) => panic!("expected the MCP server overlay gate to refuse a mismatched provider"),
             Err(error) => assert_eq!(
                 error,
-                NativeLaunchProfileError::HarnessMcpOverlayBindingMismatch {
+                NativeLaunchProfileError::McpServerOverlayBindingMismatch {
                     transport: TransportKind::Acp,
                     overlay_provider: AgentId::new("codex").unwrap(),
                     spawn_provider: AgentId::new("claude").unwrap(),
@@ -1378,20 +1323,11 @@ mod tests {
     }
 
     #[test]
-    fn harness_mcp_overlay_refuses_pipe_transport_by_name() {
+    fn mcp_server_overlay_refuses_pipe_transport_by_name() {
         let control = NativeLaunchProfileControl::new();
         let instance_id = AgentInstanceId(44);
         control
-            .install_native_harness_mcp_launch_overlay(
-                instance_id,
-                NativeHarnessMcpLaunchOverlay::new(
-                    AgentId::new("codex").unwrap(),
-                    OsString::from("private-endpoint"),
-                    OsString::from("private-token"),
-                    OsString::from("reviewed-program"),
-                )
-                .unwrap(),
-            )
+            .install_native_mcp_server_launch_overlay(instance_id, sample_mcp_server_overlay("codex"))
             .unwrap();
         let result = control.resolve_launch_overlay(
             instance_id,
@@ -1400,107 +1336,16 @@ mod tests {
             true,
         );
         match result {
-            Ok(_) => panic!("expected the harness MCP overlay gate to refuse Pipe transport"),
+            Ok(_) => panic!("expected the MCP server overlay gate to refuse Pipe transport"),
             Err(error) => assert_eq!(
                 error,
-                NativeLaunchProfileError::HarnessMcpOverlayBindingMismatch {
+                NativeLaunchProfileError::McpServerOverlayBindingMismatch {
                     transport: TransportKind::Pipe,
                     overlay_provider: AgentId::new("codex").unwrap(),
                     spawn_provider: AgentId::new("codex").unwrap(),
                 }
             ),
         }
-    }
-
-    #[test]
-    fn harness_mcp_overlay_adds_a_trace_mutation_when_the_node_process_opts_in() {
-        let _lock = HARNESS_MCP_TRACE_DIR_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _guard = HarnessMcpTraceDirGuard::set("C:\\g4a-trace-dir");
-
-        let control = NativeLaunchProfileControl::new();
-        let instance_id = AgentInstanceId(45);
-        control
-            .install_native_harness_mcp_launch_overlay(
-                instance_id,
-                NativeHarnessMcpLaunchOverlay::new(
-                    AgentId::new("codex").unwrap(),
-                    OsString::from("private-endpoint"),
-                    OsString::from("private-token"),
-                    OsString::from("reviewed-program"),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let resolved = control
-            .resolve_launch_overlay(
-                instance_id,
-                &AgentId::new("codex").unwrap(),
-                TransportKind::Pty,
-                true,
-            )
-            .unwrap();
-        assert_eq!(
-            resolved.environment.len(),
-            6,
-            "endpoint, token, program, the opt-in trace path, and two legacy scrubs"
-        );
-        let trace = resolved
-            .environment
-            .iter()
-            .find(|mutation| mutation.key == OsString::from(HARNESS_MCP_TRACE_ENV))
-            .expect("trace mutation present when the node process opted in");
-        let value = trace
-            .value
-            .as_deref()
-            .and_then(OsStr::to_str)
-            .expect("trace mutation carries a path value");
-        assert!(
-            value.starts_with("C:\\g4a-trace-dir\\harness-mcp-"),
-            "unexpected trace path {value}"
-        );
-        assert!(value.ends_with(".trace"), "unexpected trace path {value}");
-    }
-
-    #[test]
-    fn harness_mcp_overlay_omits_the_trace_mutation_without_the_opt_in() {
-        let _lock = HARNESS_MCP_TRACE_DIR_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _guard = HarnessMcpTraceDirGuard::unset();
-
-        let control = NativeLaunchProfileControl::new();
-        let instance_id = AgentInstanceId(46);
-        control
-            .install_native_harness_mcp_launch_overlay(
-                instance_id,
-                NativeHarnessMcpLaunchOverlay::new(
-                    AgentId::new("codex").unwrap(),
-                    OsString::from("private-endpoint"),
-                    OsString::from("private-token"),
-                    OsString::from("reviewed-program"),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let resolved = control
-            .resolve_launch_overlay(
-                instance_id,
-                &AgentId::new("codex").unwrap(),
-                TransportKind::Pty,
-                true,
-            )
-            .unwrap();
-        assert_eq!(
-            resolved.environment.len(),
-            5,
-            "unchanged from before the trace opt-in existed"
-        );
-        assert!(!resolved
-            .environment
-            .iter()
-            .any(|mutation| mutation.key == OsString::from(HARNESS_MCP_TRACE_ENV)));
     }
 }
 

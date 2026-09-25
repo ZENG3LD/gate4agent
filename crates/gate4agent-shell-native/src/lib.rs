@@ -44,7 +44,7 @@ use gate4agent_adapters::{
 };
 use gate4agent_catalog::{
     approval_level_resolution, ApprovalLevelResolution, AgentRegistry, AgentSpec, EnvMutation,
-    ModeId,
+    McpServerSpec, ModeId,
 };
 use gate4agent_shell_one_shot::NativeOneShotSession;
 use gate4agent_types::{
@@ -91,82 +91,35 @@ const RESERVED_CLAUDE_LAUNCH_FLAGS: &[&str] = &[
     "-r",
 ];
 
-/// The argv the harness MCP helper binary reads its endpoint/token pair
-/// from, once launched as `<program> --session-proxy`
-/// (`gate4agent-harness-mcp`'s `session_proxy_client_from_env`).
-const HARNESS_MCP_SESSION_PROXY_ARG: &str = "--session-proxy";
-/// The ACP-visible name the harness-MCP stdio server registers under in
-/// `session/new.mcpServers[].name` -- required by ACP v1 (an entry with no
-/// name is not a valid `McpServer` at all) and read back by
-/// [`harness_mcp_acp_server`].
-const HARNESS_MCP_SERVER_NAME: &str = "gate4agent";
-
-/// Mirror of `gate4agent_runtime_native::launch_profiles::HARNESS_MCP_PROGRAM_ENV`.
-/// This crate cannot depend on `gate4agent-runtime-native` -- the dependency
-/// points the other way, `gate4agent-runtime-native` depends on this crate --
-/// so the well-known key is duplicated here rather than imported, the same
-/// way `gate4agent-harness-mcp`'s own Windows E2E fixture already hardcodes
-/// the literal instead of importing it.
-const HARNESS_MCP_PROGRAM_ENV: &str = "GATE4AGENT_HARNESS_MCP_PROGRAM";
-/// Mirror of `HARNESS_MCP_SESSION_ENDPOINT_ENV` -- see
-/// [`HARNESS_MCP_PROGRAM_ENV`]'s doc comment for why it is duplicated here.
-const HARNESS_MCP_SESSION_ENDPOINT_ENV: &str = "GATE4AGENT_HARNESS_SESSION_ENDPOINT";
-/// Mirror of `HARNESS_MCP_SESSION_TOKEN_ENV` -- see
-/// [`HARNESS_MCP_PROGRAM_ENV`]'s doc comment for why it is duplicated here.
-const HARNESS_MCP_SESSION_TOKEN_ENV: &str = "GATE4AGENT_HARNESS_SESSION_TOKEN";
-/// Mirror of `gate4agent_runtime_native::launch_profiles::HARNESS_MCP_TRACE_ENV`
-/// (itself a mirror of `gate4agent_harness_mcp::HARNESS_MCP_TRACE_ENV`) --
-/// see [`HARNESS_MCP_PROGRAM_ENV`]'s doc comment for why it is duplicated
-/// here. Unlike the three keys above, this one is optional: the node only
-/// resolves it into `pty_env` when its own process opted in via
-/// `HARNESS_MCP_TRACE_DIR_ENV`, so [`harness_mcp_acp_server`] forwards it
-/// when present and omits it otherwise, never treating its absence as a
-/// partial overlay.
-const HARNESS_MCP_TRACE_ENV: &str = "G4A_HARNESS_MCP_TRACE";
-
-/// Reads the harness-MCP program/endpoint/token the node prepared for this
-/// exact spawn back out of the resolved environment overlay it handed down
-/// as `pty_env` -- the identical values `NativeHarnessMcpLaunchOverlay`
-/// installs into a PTY child's OS environment
-/// (`gate4agent-runtime-native::launch_profiles`), reused verbatim rather
-/// than recomputed: this crate has no way to independently verify a
-/// harness-MCP helper program, and is not meant to. `pty_env` carries the
-/// same resolved mutations regardless of transport (`profile_spawn_overlay`
-/// resolves `NativeLaunchProfileControl` once per spawn effect, harness-MCP
-/// overlay included, before dispatching to any transport's worker); the PTY
-/// and pipe branches apply it as child-process environment, this one reads
-/// it back to fill in [`AcpSessionOptions::mcp_servers`] instead, because an
-/// ACP-spawned child's environment is never consulted by the agent for its
-/// tool doors -- `session/new.mcpServers` is.
+/// Translates a resolved [`McpServerSpec`] into the one ACP `session/new`
+/// stdio entry the agent should register
+/// (`gate4agent::acp::protocol::McpServerConfig`). This is the ACP half of
+/// the same door a PTY child gets by installing the identical spec's `env`
+/// pairs into its own OS environment instead
+/// (`gate4agent-runtime-native::launch_profiles::NativeMcpServerLaunchOverlay`):
+/// the spec is resolved once, in-process, by `gate4agent-runtime-native` and
+/// handed down here as a typed value through `NativeSpawnOverlay`/
+/// `NativeEffectRequest` -- never a wire type, and never re-read out of a
+/// well-known environment key. This crate cannot depend on
+/// `gate4agent-runtime-native` (the dependency runs the other way), which is
+/// why the spec type itself lives one level below both, in
+/// `gate4agent-catalog`.
 ///
-/// Returns `None` unless all three keys are present with a value: a partial
-/// overlay (the node prepared it but a key came back empty, or no overlay
-/// was prepared for this spawn at all) is never forwarded to the agent.
-fn harness_mcp_acp_server(pty_env: &[EnvMutation]) -> Option<McpServerConfig> {
-    fn env_value<'a>(pty_env: &'a [EnvMutation], key: &str) -> Option<&'a str> {
-        pty_env
+/// Server naming, program path, args, and every environment entry are
+/// entirely the caller's concern; this function does not interpret them.
+fn mcp_server_acp_entry(spec: &McpServerSpec) -> McpServerConfig {
+    McpServerConfig::stdio(
+        spec.name().to_owned(),
+        spec.program().to_string_lossy().into_owned(),
+        spec.args()
             .iter()
-            .find(|mutation| mutation.key.to_str() == Some(key))
-            .and_then(|mutation| mutation.value.as_deref())
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-    }
-    let command = env_value(pty_env, HARNESS_MCP_PROGRAM_ENV)?.to_owned();
-    let endpoint = env_value(pty_env, HARNESS_MCP_SESSION_ENDPOINT_ENV)?.to_owned();
-    let token = env_value(pty_env, HARNESS_MCP_SESSION_TOKEN_ENV)?.to_owned();
-    let mut env = vec![
-        (HARNESS_MCP_SESSION_ENDPOINT_ENV.to_owned(), endpoint),
-        (HARNESS_MCP_SESSION_TOKEN_ENV.to_owned(), token),
-    ];
-    if let Some(trace) = env_value(pty_env, HARNESS_MCP_TRACE_ENV) {
-        env.push((HARNESS_MCP_TRACE_ENV.to_owned(), trace.to_owned()));
-    }
-    Some(McpServerConfig::stdio(
-        HARNESS_MCP_SERVER_NAME,
-        command,
-        vec![HARNESS_MCP_SESSION_PROXY_ARG.to_owned()],
-        env,
-    ))
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        spec.env()
+            .iter()
+            .map(|(key, value)| (key.to_string_lossy().into_owned(), value.to_string_lossy().into_owned()))
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -508,6 +461,7 @@ impl NativeEffectShell {
             environment,
             extra_args,
             one_shot_session_persistence,
+            None,
         )
         .await
     }
@@ -518,6 +472,7 @@ impl NativeEffectShell {
         environment: Vec<EnvMutation>,
         extra_args: Vec<OsString>,
         one_shot_session_persistence: OneShotSessionPersistence,
+        mcp_server: Option<McpServerSpec>,
     ) -> ObservationEnvelope {
         let EffectEnvelope {
             operation_id,
@@ -552,6 +507,7 @@ impl NativeEffectShell {
                             one_shot_session_persistence,
                         },
                         environment,
+                        mcp_server,
                     )
                     .await
                 }
@@ -803,6 +759,7 @@ impl NativeEffectShell {
         operation_id: OperationId,
         spawn: NativeSpawnRequest,
         pty_env: Vec<EnvMutation>,
+        mcp_server: Option<McpServerSpec>,
     ) -> ControlObservation {
         let NativeSpawnRequest {
             agent_id,
@@ -1260,15 +1217,15 @@ impl NativeEffectShell {
                     Ok(mode_id) => mode_id,
                     Err(message) => return ControlObservation::SpawnFailed { message },
                 };
-                // The harness-MCP door (gate4agent-arc-mailbox-and-task-
-                // layer Slice A(ii)): `pty_env` carries the node's resolved
-                // harness-MCP overlay whenever one was prepared for this
-                // spawn, transport-agnostic same as every other
-                // launch-profile mutation -- see `harness_mcp_acp_server`'s
-                // own doc comment. Empty when the node prepared none, which
-                // keeps `mcp_servers` empty and changes nothing else.
+                // The MCP-server door (gate4agent-arc-mailbox-and-task-layer
+                // Slice A(ii)): `mcp_server` carries the node's resolved MCP
+                // server overlay whenever one was prepared for this spawn,
+                // transport-agnostic same as every other launch-profile
+                // mutation -- see `mcp_server_acp_entry`'s own doc comment.
+                // `None` when the node prepared none, which keeps
+                // `mcp_servers` empty and changes nothing else.
                 let mcp_servers: Vec<McpServerConfig> =
-                    harness_mcp_acp_server(&pty_env).into_iter().collect();
+                    mcp_server.as_ref().map(mcp_server_acp_entry).into_iter().collect();
                 if !mcp_servers.is_empty() {
                     // State-change line: this is the point measured live to
                     // be silently empty on the wire before the ACP v1 shape
@@ -1544,6 +1501,7 @@ impl NativeEffectShell {
                 one_shot_session_persistence,
             },
             pty_env,
+            None,
         )
         .await
     }
@@ -2349,11 +2307,11 @@ fn validate_instance_launch_arguments(
 /// whose own argv convention accepts a credential positionally. The check is
 /// deliberately keyword/prefix-based rather than an entropy heuristic: a
 /// generic "long hex/base64 string" rule would also catch legitimate,
-/// diagnostically valuable arguments such as a resume session UUID.
+/// diagnostically valuable arguments such as a resume session UUID -- which
+/// is also why [`has_prefixed_hex64_credential_shape`] requires the leading
+/// `<prefix>_` before it will call a bare hex string a credential at all.
 fn argument_looks_like_credential(value: &str) -> bool {
-    const CREDENTIAL_PREFIXES: &[&str] = &[
-        "sk-", "sk_", "ghp_", "gho_", "ghs_", "xox", "g4aho_", "bearer ",
-    ];
+    const CREDENTIAL_PREFIXES: &[&str] = &["sk-", "sk_", "ghp_", "gho_", "ghs_", "xox", "bearer "];
     const CREDENTIAL_MARKERS: &[&str] = &[
         "apikey", "api_key", "api-key", "secret", "password", "passwd", "token=",
     ];
@@ -2364,6 +2322,29 @@ fn argument_looks_like_credential(value: &str) -> bool {
         || CREDENTIAL_MARKERS
             .iter()
             .any(|marker| lower.contains(marker))
+        || has_prefixed_hex64_credential_shape(&lower)
+}
+
+/// True if `value` is exactly a short lowercase-alphanumeric prefix (2-8
+/// characters), an underscore, and 64 lowercase hex characters -- the shape
+/// every gate4agent-owned or caller-owned bearer credential uses (e.g. the
+/// hatchery operator token, `g4aho_` + 64 hex, or the H3B local-capability
+/// token, `g4ah3_` + 64 hex), regardless of which prefix a particular caller
+/// picks. A bare 64-hex digest with no prefix is deliberately excluded: a
+/// commit hash, a SHA-256 checksum, or a session digest is legitimate,
+/// diagnostically valuable argument text, not a credential.
+fn has_prefixed_hex64_credential_shape(lower: &str) -> bool {
+    let Some((prefix, digest)) = lower.split_once('_') else {
+        return false;
+    };
+    (2..=8).contains(&prefix.len())
+        && prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// Renders one provider-CLI argument for a log line: verbatim unless it
@@ -4968,7 +4949,8 @@ mod tests {
         classify_pty_screen_state,
         defers_permission_requests,
         foreground_probe_rearms_immediately, foreground_probe_schedule,
-        harness_mcp_acp_server, host_policy_for_approval_level,
+        argument_looks_like_credential, host_policy_for_approval_level,
+        mcp_server_acp_entry,
         parse_operator_gate_options, prepare_fresh_pty_provider_session,
         prompt_render_probe, prompt_rendered, required_acp_mode,
         reserve_provider_gap_sequence, resolve_foreground_verdict, screen_failure,
@@ -4977,13 +4959,12 @@ mod tests {
         terminal_frame, terminal_frame_byte_len, terminal_state_capture_should_skip,
         validate_instance_launch_arguments, validate_spawn_runtime_policy,
         ForegroundProbeSchedule, ForegroundVerdict, ReadinessDiagnostics, RateLimitFeed,
-        Utf8ChunkDecoder, HARNESS_MCP_PROGRAM_ENV, HARNESS_MCP_SERVER_NAME,
-        HARNESS_MCP_SESSION_ENDPOINT_ENV, HARNESS_MCP_SESSION_TOKEN_ENV, HARNESS_MCP_TRACE_ENV,
+        Utf8ChunkDecoder,
     };
     use gate4agent::acp::protocol::{McpServerConfig, SessionMode};
     use gate4agent::HostPolicy;
     use gate4agent_adapters::builtin_adapter_registry;
-    use gate4agent_catalog::{EnvMutation, ModeId};
+    use gate4agent_catalog::{EnvMutation, McpServerSpec, ModeId};
     use gate4agent::agent::ForegroundObservation;
     use gate4agent::core::types::{
         AgentEvent, ContextWindowUsage as AgentContextWindowUsage, HostDecisionAuthority,
@@ -5570,48 +5551,42 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // harness_mcp_acp_server — the ACP half of the door
+    // mcp_server_acp_entry — the ACP half of the door
     // (gate4agent-arc-mailbox-and-task-layer Slice A(ii))
     // -----------------------------------------------------------------------
 
     #[test]
-    fn harness_mcp_acp_server_translates_a_prepared_overlay_into_one_stdio_entry() {
-        let pty_env = vec![
-            EnvMutation {
-                key: OsString::from(HARNESS_MCP_PROGRAM_ENV),
-                value: Some(OsString::from("C:\\gate4agent\\gate4agent-harness-mcp.exe")),
-            },
-            EnvMutation {
-                key: OsString::from(HARNESS_MCP_SESSION_ENDPOINT_ENV),
-                value: Some(OsString::from("\\\\.\\pipe\\gate4agent-harness-mcp-s1")),
-            },
-            EnvMutation {
-                key: OsString::from(HARNESS_MCP_SESSION_TOKEN_ENV),
-                value: Some(OsString::from("tok-abc")),
-            },
-            // A legacy H2 scrub mutation the same overlay carries alongside
-            // the three H3B keys (`NativeHarnessMcpLaunchOverlay::new`) --
-            // present in the real resolved list, and must not be mistaken
-            // for a fourth MCP server field.
-            EnvMutation {
-                key: OsString::from("GATE4AGENT_HARNESS_READ_ENDPOINT"),
-                value: None,
-            },
-        ];
+    fn mcp_server_acp_entry_translates_a_spec_into_one_stdio_entry() {
+        let spec = McpServerSpec::new(
+            "test-mcp-server",
+            OsString::from("C:\\example\\example-mcp-server.exe"),
+            vec![OsString::from("--session-proxy")],
+            vec![
+                (
+                    OsString::from("TEST_MCP_SESSION_ENDPOINT"),
+                    OsString::from("\\\\.\\pipe\\example-mcp-server-s1"),
+                ),
+                (
+                    OsString::from("TEST_MCP_SESSION_TOKEN"),
+                    OsString::from("tok-abc"),
+                ),
+            ],
+        )
+        .unwrap();
 
-        let server = harness_mcp_acp_server(&pty_env).expect("a full overlay yields one server");
+        let server = mcp_server_acp_entry(&spec);
         match server {
             McpServerConfig::Stdio { name, command, args, env } => {
-                assert_eq!(name, HARNESS_MCP_SERVER_NAME, "ACP v1 requires a name; the adapter registers by it");
-                assert_eq!(command, "C:\\gate4agent\\gate4agent-harness-mcp.exe");
+                assert_eq!(name, "test-mcp-server", "ACP v1 requires a name; the adapter registers by it");
+                assert_eq!(command, "C:\\example\\example-mcp-server.exe");
                 assert_eq!(args, vec!["--session-proxy".to_string()]);
-                assert_eq!(env.len(), 2, "exactly endpoint and token, nothing else");
+                assert_eq!(env.len(), 2, "exactly the entries the spec was given, nothing else");
                 assert_eq!(
-                    env.iter().find(|pair| pair.name == HARNESS_MCP_SESSION_ENDPOINT_ENV).map(|pair| pair.value.as_str()),
-                    Some("\\\\.\\pipe\\gate4agent-harness-mcp-s1")
+                    env.iter().find(|pair| pair.name == "TEST_MCP_SESSION_ENDPOINT").map(|pair| pair.value.as_str()),
+                    Some("\\\\.\\pipe\\example-mcp-server-s1")
                 );
                 assert_eq!(
-                    env.iter().find(|pair| pair.name == HARNESS_MCP_SESSION_TOKEN_ENV).map(|pair| pair.value.as_str()),
+                    env.iter().find(|pair| pair.name == "TEST_MCP_SESSION_TOKEN").map(|pair| pair.value.as_str()),
                     Some("tok-abc")
                 );
             }
@@ -5620,86 +5595,42 @@ mod tests {
     }
 
     #[test]
-    fn harness_mcp_acp_server_is_none_when_no_overlay_was_prepared() {
-        assert!(harness_mcp_acp_server(&[]).is_none());
-    }
+    fn mcp_server_acp_entry_carries_zero_env_pairs_when_the_spec_carries_none() {
+        let spec = McpServerSpec::new(
+            "test-mcp-server",
+            OsString::from("C:\\example\\example-mcp-server.exe"),
+            vec![OsString::from("--session-proxy")],
+            Vec::new(),
+        )
+        .unwrap();
 
-    #[test]
-    fn harness_mcp_acp_server_is_none_on_a_partial_overlay() {
-        // Only the program key present -- a real overlay is always all three
-        // or none (`NativeHarnessMcpLaunchOverlay::new`), but this function
-        // must not forward a partial door to the agent regardless.
-        let pty_env = vec![EnvMutation {
-            key: OsString::from(HARNESS_MCP_PROGRAM_ENV),
-            value: Some(OsString::from("C:\\gate4agent\\gate4agent-harness-mcp.exe")),
-        }];
-        assert!(harness_mcp_acp_server(&pty_env).is_none());
-    }
-
-    #[test]
-    fn harness_mcp_acp_server_forwards_the_trace_var_when_present() {
-        let pty_env = vec![
-            EnvMutation {
-                key: OsString::from(HARNESS_MCP_PROGRAM_ENV),
-                value: Some(OsString::from("C:\\gate4agent\\gate4agent-harness-mcp.exe")),
-            },
-            EnvMutation {
-                key: OsString::from(HARNESS_MCP_SESSION_ENDPOINT_ENV),
-                value: Some(OsString::from("\\\\.\\pipe\\gate4agent-harness-mcp-s1")),
-            },
-            EnvMutation {
-                key: OsString::from(HARNESS_MCP_SESSION_TOKEN_ENV),
-                value: Some(OsString::from("tok-abc")),
-            },
-            // The node only resolves this key into `pty_env` when its own
-            // process opted in via `HARNESS_MCP_TRACE_DIR_ENV`
-            // (`NativeHarnessMcpLaunchOverlay::new`'s `harness_mcp_trace_mutation`).
-            EnvMutation {
-                key: OsString::from(HARNESS_MCP_TRACE_ENV),
-                value: Some(OsString::from("C:\\g4a-trace-dir\\harness-mcp-7.trace")),
-            },
-        ];
-
-        let server = harness_mcp_acp_server(&pty_env).expect("a full overlay yields one server");
+        let server = mcp_server_acp_entry(&spec);
         match server {
-            McpServerConfig::Stdio { env, .. } => {
-                assert_eq!(env.len(), 3, "endpoint, token, and the opt-in trace path");
-                assert_eq!(
-                    env.iter()
-                        .find(|pair| pair.name == HARNESS_MCP_TRACE_ENV)
-                        .map(|pair| pair.value.as_str()),
-                    Some("C:\\g4a-trace-dir\\harness-mcp-7.trace")
-                );
-            }
+            McpServerConfig::Stdio { env, .. } => assert!(env.is_empty()),
             McpServerConfig::Sse { .. } => panic!("expected Stdio variant"),
         }
     }
 
     #[test]
-    fn harness_mcp_acp_server_omits_the_trace_var_when_absent() {
-        let pty_env = vec![
-            EnvMutation {
-                key: OsString::from(HARNESS_MCP_PROGRAM_ENV),
-                value: Some(OsString::from("C:\\gate4agent\\gate4agent-harness-mcp.exe")),
-            },
-            EnvMutation {
-                key: OsString::from(HARNESS_MCP_SESSION_ENDPOINT_ENV),
-                value: Some(OsString::from("\\\\.\\pipe\\gate4agent-harness-mcp-s1")),
-            },
-            EnvMutation {
-                key: OsString::from(HARNESS_MCP_SESSION_TOKEN_ENV),
-                value: Some(OsString::from("tok-abc")),
-            },
-        ];
+    fn credential_shape_rule_matches_prefixed_hex64_not_bare_digest_or_uuid() {
+        let hex64 = "a1b2c3d4e5f6".repeat(5) + "a1b2";
+        assert_eq!(hex64.len(), 64);
 
-        let server = harness_mcp_acp_server(&pty_env).expect("a full overlay yields one server");
-        match server {
-            McpServerConfig::Stdio { env, .. } => {
-                assert_eq!(env.len(), 2, "unchanged from before the trace opt-in existed");
-                assert!(!env.iter().any(|pair| pair.name == HARNESS_MCP_TRACE_ENV));
-            }
-            McpServerConfig::Sse { .. } => panic!("expected Stdio variant"),
-        }
+        let prefixed_token = format!("g4aho_{hex64}");
+        assert!(
+            argument_looks_like_credential(&prefixed_token),
+            "a short lowercase prefix plus '_' plus 64 lowercase hex chars is a credential"
+        );
+
+        assert!(
+            !argument_looks_like_credential(&hex64),
+            "a bare 64-hex digest with no prefix is a legitimate diagnostic, not a credential"
+        );
+
+        assert!(
+            !argument_looks_like_credential("550e8400-e29b-41d4-a716-446655440000"),
+            "a UUID must not be mistaken for a prefixed-hex64 credential"
+        );
     }
 
     #[test]

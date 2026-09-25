@@ -79,7 +79,7 @@ pub struct McpServerEnvVar {
 /// A single MCP server entry for `session/new`.
 ///
 /// Matches ACP v1's `McpServer` union exactly, confirmed by reading the
-/// spec after a live capture showed the harness never receiving
+/// spec after a live capture showed a downstream ACP client never receiving
 /// `tools/list`: **no `"transport"` discriminator, and stdio carries no
 /// tag at all** -- `{name, command, args, env}`. An SSE (or, if ever
 /// needed, HTTP) entry is what carries an explicit `"type"` field instead
@@ -90,10 +90,11 @@ pub struct McpServerEnvVar {
 ///
 /// `env`/`headers` are wire-mandated arrays of [`McpServerEnvVar`] pairs,
 /// not a JSON object -- a stdio entry serialized with a map there is what
-/// the harness silently dropped before this fix (nameless, wrong-shaped
-/// `env`, no `session/new` field the adapter's registration code
-/// recognized). Order is insertion order: whatever order the caller passes
-/// to [`McpServerConfig::stdio`] / [`McpServerConfig::sse`], not sorted.
+/// that downstream client silently dropped before this fix (nameless,
+/// wrong-shaped `env`, no `session/new` field the adapter's registration
+/// code recognized). Order is insertion order: whatever order the caller
+/// passes to [`McpServerConfig::stdio`] / [`McpServerConfig::sse`], not
+/// sorted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum McpServerConfig {
@@ -2287,31 +2288,30 @@ mod tests {
         assert_eq!(decoded.additional_directories, vec!["/home/user/other-repo".to_string()]);
     }
 
-    /// The harness-MCP door (gate4agent-arc-mailbox-and-task-layer Slice
-    /// A(ii)): when a caller populates `mcp_servers` with the one stdio
-    /// entry `gate4agent-shell-native` builds from a prepared harness-MCP
-    /// overlay, `session/new` carries it in ACP v1's actual wire shape --
+    /// The generic MCP-server-overlay door (gate4agent-arc-mailbox-and-task-
+    /// layer Slice A(ii)): when a caller populates `mcp_servers` with one
+    /// stdio entry, `session/new` carries it in ACP v1's actual wire shape --
     /// `name`, `command`, `args`, and `env` (an array of `{name,value}`
-    /// pairs, never a map), and no `"transport"` discriminator at all.
-    /// This is the shape a live capture showed the harness silently
-    /// dropping: a nameless entry with `env` as a JSON object never
-    /// matched the adapter's own `McpServer` union, so `tools/list` never
-    /// ran. An empty `mcp_servers` (no overlay prepared) still serializes
-    /// to `"mcpServers":[]`, exactly as `session_new_params_serialize`
-    /// above already pins.
+    /// pairs, never a map), and no `"transport"` discriminator at all. This
+    /// is the shape a live capture once showed an ACP adapter silently
+    /// dropping: a nameless entry with `env` as a JSON object never matched
+    /// the adapter's own `McpServer` union, so `tools/list` never ran. An
+    /// empty `mcp_servers` (no overlay prepared) still serializes to
+    /// `"mcpServers":[]`, exactly as `session_new_params_serialize` above
+    /// already pins.
     #[test]
     fn session_new_params_serializes_mcp_server_stdio_entry() {
-        let command = "C:\\gate4agent\\gate4agent-harness-mcp.exe";
-        let endpoint = "\\\\.\\pipe\\gate4agent-harness-mcp-s1";
+        let command = "C:\\example\\example-mcp-server.exe";
+        let endpoint = "\\\\.\\pipe\\example-mcp-server-s1";
         let p = SessionNewParams {
             cwd: "/home/user".to_string(),
             mcp_servers: vec![McpServerConfig::stdio(
-                "gate4agent",
+                "example-mcp-server",
                 command,
                 vec!["--session-proxy".to_string()],
                 vec![
-                    ("GATE4AGENT_HARNESS_SESSION_ENDPOINT".to_string(), endpoint.to_string()),
-                    ("GATE4AGENT_HARNESS_SESSION_TOKEN".to_string(), "tok-abc".to_string()),
+                    ("EXAMPLE_SESSION_ENDPOINT".to_string(), endpoint.to_string()),
+                    ("EXAMPLE_SESSION_TOKEN".to_string(), "tok-abc".to_string()),
                 ],
             )],
             additional_directories: vec![],
@@ -2319,15 +2319,15 @@ mod tests {
         let s = serde_json::to_string(&p).unwrap();
         assert!(s.contains(r#""mcpServers":[{"#), "must carry the one stdio entry");
         assert!(!s.contains("\"transport\""), "ACP v1 stdio has no discriminator field");
-        assert!(s.contains(r#""name":"gate4agent""#), "must carry the ACP-visible server name");
+        assert!(s.contains(r#""name":"example-mcp-server""#), "must carry the ACP-visible server name");
         assert!(s.contains(&format!("\"command\":{command:?}")));
         assert!(s.contains(r#""args":["--session-proxy"]"#));
         // env is an array of {name,value} pairs, never a map -- this is
-        // exactly the shape a bare `contains("GATE4AGENT_HARNESS_SESSION_
-        // ENDPOINT")` check (the old assertion) could not have caught,
-        // because it passes whether env is an object or an array.
+        // exactly the shape a bare `contains("EXAMPLE_SESSION_ENDPOINT")`
+        // check (the old assertion) could not have caught, because it
+        // passes whether env is an object or an array.
         assert!(s.contains(&format!(
-            r#""env":[{{"name":"GATE4AGENT_HARNESS_SESSION_ENDPOINT","value":{endpoint:?}}},{{"name":"GATE4AGENT_HARNESS_SESSION_TOKEN","value":"tok-abc"}}]"#
+            r#""env":[{{"name":"EXAMPLE_SESSION_ENDPOINT","value":{endpoint:?}}},{{"name":"EXAMPLE_SESSION_TOKEN","value":"tok-abc"}}]"#
         )));
 
         let empty = SessionNewParams {

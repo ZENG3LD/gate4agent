@@ -237,14 +237,14 @@ pub struct AcpSessionOptions {
 
     /// MCP servers to advertise on `session/new` via `mcpServers` -- the
     /// spec-sanctioned door a spawned agent uses to reach tools the host
-    /// exposes, most notably the harness MCP proxy
-    /// (`gate4agent-harness-mcp --session-proxy`) when the caller prepared
-    /// one for this spawn. This crate only forwards whatever the caller
-    /// already assembled; it never constructs an entry itself (that is
-    /// `gate4agent-shell-native`'s job, reusing the exact program/endpoint/
-    /// token the PTY transport's environment overlay already carries).
-    /// Default: empty, which sends `"mcpServers":[]` exactly as before this
-    /// field existed.
+    /// exposes, most notably a caller-prepared MCP-server launch overlay
+    /// (a stdio helper invoked with whatever args and environment the
+    /// caller assembled) when one was prepared for this spawn. This crate
+    /// only forwards whatever the caller already assembled; it never
+    /// constructs an entry itself (that is `gate4agent-shell-native`'s job,
+    /// reusing the exact program/args/environment the PTY transport's
+    /// environment overlay already carries). Default: empty, which sends
+    /// `"mcpServers":[]` exactly as before this field existed.
     pub mcp_servers: Vec<McpServerConfig>,
 
     /// Whether `session/request_permission` may be **deferred** to a later,

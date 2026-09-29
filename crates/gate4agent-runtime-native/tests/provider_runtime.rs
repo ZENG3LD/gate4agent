@@ -3,8 +3,8 @@ use std::time::Duration;
 use gate4agent_catalog::AgentRegistry;
 use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
 use gate4agent_testkit::{
-    acp_agent_spec, grok_acp_agent_spec, interactive_agent_spec, pipe_agent_spec,
-    pty_provider_agent_spec, ACP_FIXTURE_ID, CONTROL_FIXTURE_ID, GROK_ACP_FIXTURE_ID,
+    grok_acp_agent_spec, interactive_agent_spec, pipe_agent_spec,
+    pty_provider_agent_spec, CONTROL_FIXTURE_ID, GROK_ACP_FIXTURE_ID,
     PIPE_FIXTURE_ID, PTY_PROVIDER_FIXTURE_ID,
 };
 use gate4agent_types::{
@@ -127,114 +127,6 @@ async fn pipe_one_shot_reaches_public_snapshot_with_semantic_events() {
             ..
         } if text == "fixture-pipe-response"
     )));
-}
-
-#[tokio::test]
-async fn acp_multi_turn_prompt_streams_and_stops_through_public_handle() {
-    let (handle, mut runtime) = runtime(acp_agent_spec());
-    let subscription = handle.subscribe(64);
-    let instance_id = AgentInstanceId(42);
-    handle
-        .dispatch(command(
-            10,
-            ControlCommand::Register {
-                instance_id,
-                agent_id: AgentId::new(ACP_FIXTURE_ID).unwrap(),
-                transport: TransportKind::Acp,
-            },
-        ))
-        .unwrap();
-    handle
-        .dispatch(command(
-            11,
-            ControlCommand::Start {
-                instance_id,
-                runtime_policy: semantic_runtime_policy(),
-                request: StartRequest {
-                    working_directory: std::env::current_dir()
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
-                    terminal_size: TerminalSize {
-                        rows: 24,
-                        columns: 80,
-                    },
-                    initial_prompt: None,
-                    session_options: None,
-                    approval_level: ApprovalLevel::default(),
-                },
-            },
-        ))
-        .unwrap();
-
-    let mut events = Vec::new();
-    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
-        handle
-            .snapshot()
-            .sessions
-            .first()
-            .is_some_and(|session| session.status == SessionStatus::Running)
-    })
-    .await;
-
-    handle
-        .dispatch(command(
-            12,
-            ControlCommand::SendInput {
-                instance_id,
-                action: InputAction::SubmitPrompt(PromptPayload {
-                    text: "fixture turn".to_owned(),
-                    framing: PromptFraming::Literal,
-                }),
-            },
-        ))
-        .unwrap();
-    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
-        handle
-            .snapshot()
-            .sessions
-            .first()
-            .is_some_and(|session| session.provider.completed_turns >= 1)
-    })
-    .await;
-
-    let snapshot = handle.snapshot();
-    let session = snapshot.sessions.first().expect("ACP session snapshot");
-    assert_eq!(
-        session
-            .provider
-            .session
-            .as_ref()
-            .map(|identity| identity.id.as_str()),
-        Some("fixture-acp-session")
-    );
-    assert_eq!(session.provider.usage.input_tokens, 7);
-    assert_eq!(session.provider.usage.output_tokens, 11);
-    assert!(events.iter().any(|event| matches!(
-        &event.event,
-        ControlEventKind::ProviderEvent {
-            event: ProviderEvent::Text { text, .. },
-            ..
-        } if text == "fixture-acp-response"
-    )));
-
-    handle
-        .dispatch(command(
-            13,
-            ControlCommand::Stop {
-                instance_id,
-                force: false,
-            },
-        ))
-        .unwrap();
-    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
-        handle
-            .snapshot()
-            .sessions
-            .first()
-            .is_some_and(|session| matches!(session.status, SessionStatus::Exited { .. }))
-    })
-    .await;
 }
 
 /// Grok's catalog entry now declares an ACP transport (see

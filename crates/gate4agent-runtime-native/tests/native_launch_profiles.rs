@@ -1420,6 +1420,136 @@ async fn native_launch_environment_overlay_reaches_exact_pty_child_only() {
     .await;
 }
 
+#[test]
+fn native_launch_environment_overlay_rejects_invalid_bindings_before_resolver_or_child() {
+    let (handle, mut runtime) = NativeRuntime::new(
+        AgentRegistry::new([interactive_agent_spec()]).expect("fixture registry"),
+        NativeRuntimeConfig::default(),
+    );
+    let resolver_calls = Arc::new(AtomicUsize::new(0));
+    runtime
+        .upsert_native_launch_profile(
+            NativeLaunchProfile::new(
+                profile_id(),
+                AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                TransportKind::Pty,
+                vec![
+                    OsString::from(PROFILE_SENTINEL),
+                    OsString::from(REMOVE_SENTINEL),
+                    OsString::from(CHILD_SENTINEL),
+                ],
+                Arc::new(SentinelResolver {
+                    generation: Arc::new(AtomicUsize::new(1)),
+                    calls: Arc::clone(&resolver_calls),
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let control = runtime.native_launch_profile_control();
+    let instance_id = AgentInstanceId(8502);
+    let overlay = |agent_id: &str, key: &str| {
+        NativeLaunchEnvironmentOverlay::new(
+            AgentId::new(agent_id).unwrap(),
+            TransportKind::Pty,
+            vec![EnvMutation {
+                key: OsString::from(key),
+                value: Some(OsString::from("must-not-resolve")),
+            }],
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        control
+            .install_native_launch_environment_overlay(
+                instance_id,
+                NativeLaunchEnvironmentOverlay::new(
+                    AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                    TransportKind::Pty,
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap_err(),
+        NativeLaunchProfileError::EnvironmentOverlaySelectionMissing
+    );
+    assert_eq!(
+        control
+            .install_native_launch_environment_overlay(
+                instance_id,
+                overlay(CONTROL_FIXTURE_ID, OVERLAY_SENTINEL),
+            )
+            .unwrap_err(),
+        NativeLaunchProfileError::EnvironmentOverlaySelectionMissing
+    );
+    control
+        .select_native_launch_profile(instance_id, profile_id())
+        .unwrap();
+    assert_eq!(
+        control
+            .install_native_launch_environment_overlay(
+                instance_id,
+                overlay(HOOK_POSTING_FIXTURE_ID, OVERLAY_SENTINEL),
+            )
+            .unwrap_err(),
+        NativeLaunchProfileError::EnvironmentOverlayBindingMismatch
+    );
+    assert_eq!(
+        control
+            .install_native_launch_environment_overlay(
+                instance_id,
+                overlay(CONTROL_FIXTURE_ID, PROFILE_SENTINEL),
+            )
+            .unwrap_err(),
+        NativeLaunchProfileError::EnvironmentOverlayKeyConflict
+    );
+    control
+        .install_native_launch_environment_overlay(
+            instance_id,
+            overlay(CONTROL_FIXTURE_ID, OVERLAY_SENTINEL),
+        )
+        .unwrap();
+
+    let conflicting_profile_id = NativeLaunchProfileId::new("overlay-conflict").unwrap();
+    runtime
+        .upsert_native_launch_profile(
+            NativeLaunchProfile::new(
+                conflicting_profile_id.clone(),
+                AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                TransportKind::Pty,
+                vec![OsString::from(OVERLAY_SENTINEL)],
+                Arc::new(EmptyResolver),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        control
+            .select_native_launch_profile(instance_id, conflicting_profile_id)
+            .unwrap_err(),
+        NativeLaunchProfileError::EnvironmentOverlayKeyConflict
+    );
+    assert_eq!(
+        runtime
+            .upsert_native_launch_profile(
+                NativeLaunchProfile::new(
+                    profile_id(),
+                    AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                    TransportKind::Pty,
+                    vec![OsString::from(OVERLAY_SENTINEL)],
+                    Arc::new(EmptyResolver),
+                )
+                .unwrap(),
+            )
+            .unwrap_err(),
+        NativeLaunchProfileError::EnvironmentOverlayKeyConflict
+    );
+    assert_eq!(resolver_calls.load(Ordering::Acquire), 0);
+    assert_eq!(runtime.active_native_sessions(), 0);
+    assert!(handle.snapshot().sessions.is_empty());
+}
+
 #[tokio::test]
 async fn clearing_native_launch_profile_selection_discards_environment_overlay() {
     let mut spec = interactive_agent_spec();

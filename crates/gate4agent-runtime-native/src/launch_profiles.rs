@@ -323,12 +323,16 @@ impl NativeLaunchEnvironmentOverlay {
             return Err(NativeLaunchProfileError::UnsupportedTransport);
         }
         validate_environment_mutations(&environment)?;
-        let profile_selection_required = !environment.is_empty();
+        // Every generic environment overlay -- an empty one included -- is bound
+        // to an explicitly selected native launch profile and is refused with
+        // `EnvironmentOverlaySelectionMissing` without one. The requirement used
+        // to follow from the mutation list being non-empty, which let an empty
+        // overlay install unprofiled; only `new_context_root` is exempt.
         Ok(Self {
             agent_id,
             transport,
             environment,
-            profile_selection_required,
+            profile_selection_required: true,
         })
     }
 

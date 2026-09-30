@@ -2154,6 +2154,7 @@ fn node_event_contains_open_provider_id(event: &NodeEvent) -> bool {
         }
         NodeEvent::HarnessMcpReadCall { .. }
         | NodeEvent::Control { .. }
+        | NodeEvent::SessionRecordHistorySummarized { .. }
         | NodeEvent::TerminalFrame { .. }
         | NodeEvent::ControllerChanged { .. }
         | NodeEvent::WorkspaceRemoved { .. }
@@ -2418,6 +2419,7 @@ fn node_event_contains_opaque_unix_path(event: &NodeEvent) -> bool {
         }
         NodeEvent::HarnessMcpReadCall { .. }
         | NodeEvent::Control { .. }
+        | NodeEvent::SessionRecordHistorySummarized { .. }
         | NodeEvent::TerminalFrame { .. }
         | NodeEvent::ControllerChanged { .. }
         | NodeEvent::WorkspaceRemoved { .. }

@@ -67,7 +67,7 @@ pub use gate4agent_build_stamp::BUILD_STAMP;
 mod control_detail;
 pub use control_detail::control_telemetry_detail;
 use gate4agent_node_protocol::{
-    AgentStreamChunkV1, ManagedSessionRecord, ManagedSessionState,
+    AgentStreamChunkV1, ManagedSessionRecord, ManagedSessionState, SessionHistorySummaryV1,
     NodeSnapshot, SessionAddress, SessionMode, SessionRecordId, WorkspaceId,
 };
 use gate4agent_types::{
@@ -1038,6 +1038,10 @@ pub enum C2NodeEvent {
         address: SessionAddress,
         event: C2ControlEvent,
     },
+    SessionRecordHistorySummarized {
+        record_id: SessionRecordId,
+        summary: SessionHistorySummaryV1,
+    },
     TerminalFrame {
         address: SessionAddress,
         frame: TerminalFrame,
@@ -1084,6 +1088,12 @@ impl From<&NodeEvent> for C2NodeEvent {
                 address: address.clone(),
                 event: C2ControlEvent::from(event),
             },
+            NodeEvent::SessionRecordHistorySummarized { record_id, summary } => {
+                Self::SessionRecordHistorySummarized {
+                    record_id: record_id.clone(),
+                    summary: *summary,
+                }
+            }
             NodeEvent::TerminalFrame { address, frame } => Self::TerminalFrame {
                 address: address.clone(),
                 frame: frame.clone(),
@@ -3486,6 +3496,36 @@ mod tests {
                 event,
             },
         }
+    }
+
+    #[test]
+    fn history_summary_event_projects_exactly_and_carries_counts_only() {
+        let summary = gate4agent_node_protocol::SessionHistorySummaryV1 {
+            message_count: 12,
+            message_count_exact: true,
+            completed_turn_count: Some(5),
+            total_tokens: Some(4_000),
+            modified_at_unix_ms: Some(1_786_000_000_000),
+        };
+        let source = NodeEvent::SessionRecordHistorySummarized {
+            record_id: SessionRecordId::new("record-a").unwrap(),
+            summary,
+        };
+        let projected = C2NodeEvent::from(&source);
+        assert_eq!(
+            projected,
+            C2NodeEvent::SessionRecordHistorySummarized {
+                record_id: SessionRecordId::new("record-a").unwrap(),
+                summary,
+            },
+        );
+        assert_eq!(projected, C2NodeEvent::from_node_event_with_control_detail(&source));
+        let json = serde_json::to_string(&projected).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"session-record-history-summarized","record_id":"record-a","summary":{"message_count":12,"message_count_exact":true,"completed_turn_count":5,"total_tokens":4000,"modified_at_unix_ms":1786000000000}}"#,
+        );
+        assert_eq!(serde_json::from_str::<C2NodeEvent>(&json).unwrap(), projected);
     }
 
     fn tool_started_event() -> ControlEventKind {

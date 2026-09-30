@@ -7523,6 +7523,10 @@ pub enum NodeEvent {
         deadline_unix_ms: u64,
     },
     Control { address: SessionAddress, event: ControlEvent },
+    /// Aggregate facts about one session record's native history, published
+    /// when a client previews the record. Counts only -- never messages -- so
+    /// it is safe to fan out to every subscriber.
+    SessionRecordHistorySummarized { record_id: SessionRecordId, summary: SessionHistorySummaryV1 },
     TerminalFrame { address: SessionAddress, frame: TerminalFrame },
     AgentStream { address: SessionAddress, chunk: AgentStreamChunkV1 },
     ControllerChanged { controller: Option<ControllerState> },
@@ -7567,6 +7571,30 @@ impl NodeEvent {
     pub fn requires_history_context_pack_capability(&self) -> bool {
         matches!(self, Self::SessionRecordUpserted { record }
             if record.context_id.is_some() || record.context.is_some())
+    }
+}
+
+/// Aggregate facts about one session record's native history: how many messages
+/// and completed turns it holds and what it cost, without any of its content.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionHistorySummaryV1 {
+    pub message_count: u64,
+    pub message_count_exact: bool,
+    pub completed_turn_count: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub modified_at_unix_ms: Option<u64>,
+}
+
+impl From<&SessionRecordPreview> for SessionHistorySummaryV1 {
+    fn from(preview: &SessionRecordPreview) -> Self {
+        Self {
+            message_count: preview.message_count,
+            message_count_exact: preview.message_count_exact,
+            completed_turn_count: preview.completed_turn_count,
+            total_tokens: preview.total_tokens,
+            modified_at_unix_ms: preview.modified_at_unix_ms,
+        }
     }
 }
 

@@ -1570,6 +1570,7 @@ fn c2_node_event_is_terminal_frame(event: &C2NodeEvent) -> bool {
         C2NodeEvent::TerminalFrame { .. } => true,
         C2NodeEvent::HarnessMcpReadCall { .. }
         | C2NodeEvent::Control { .. }
+        | C2NodeEvent::SessionRecordHistorySummarized { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceAdded { .. }
         | C2NodeEvent::WorkspaceRemoved { .. }
@@ -1642,6 +1643,7 @@ fn c2_node_event_is_agent_stream(event: &C2NodeEvent) -> bool {
         C2NodeEvent::AgentStream { .. } => true,
         C2NodeEvent::HarnessMcpReadCall { .. }
         | C2NodeEvent::Control { .. }
+        | C2NodeEvent::SessionRecordHistorySummarized { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceAdded { .. }
         | C2NodeEvent::WorkspaceRemoved { .. }
@@ -1663,6 +1665,7 @@ fn c2_node_event_kind_label(event: &C2NodeEvent) -> &'static str {
     match event {
         C2NodeEvent::HarnessMcpReadCall { .. } => "harness-mcp-read-call",
         C2NodeEvent::Control { .. } => "control",
+        C2NodeEvent::SessionRecordHistorySummarized { .. } => "session-record-history-summarized",
         C2NodeEvent::TerminalFrame { .. } => "terminal-frame",
         C2NodeEvent::AgentStream { .. } => "agent-stream",
         C2NodeEvent::ControllerChanged { .. } => "controller-changed",
@@ -1996,6 +1999,7 @@ fn c2_node_event_has_unix_bytes(event: &C2NodeEvent) -> bool {
         }
         C2NodeEvent::HarnessMcpReadCall { .. }
         | C2NodeEvent::Control { .. }
+        | C2NodeEvent::SessionRecordHistorySummarized { .. }
         | C2NodeEvent::TerminalFrame { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceRemoved { .. }
@@ -2120,6 +2124,7 @@ fn c2_event_has_open_provider_id(event: &C2NodeEvent) -> bool {
         }
         C2NodeEvent::HarnessMcpReadCall { .. }
         | C2NodeEvent::Control { .. }
+        | C2NodeEvent::SessionRecordHistorySummarized { .. }
         | C2NodeEvent::TerminalFrame { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceRemoved { .. }

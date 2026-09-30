@@ -1056,6 +1056,7 @@ fn c2_event_is_terminal_frame(event: &C2NodeEvent) -> bool {
         C2NodeEvent::TerminalFrame { .. } => true,
         C2NodeEvent::HarnessMcpReadCall { .. }
         | C2NodeEvent::Control { .. }
+        | C2NodeEvent::SessionRecordHistorySummarized { .. }
         | C2NodeEvent::AgentStream { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceAdded { .. }
@@ -1150,6 +1151,7 @@ fn c2_event_is_agent_stream(event: &C2NodeEvent) -> bool {
         C2NodeEvent::AgentStream { .. } => true,
         C2NodeEvent::HarnessMcpReadCall { .. }
         | C2NodeEvent::Control { .. }
+        | C2NodeEvent::SessionRecordHistorySummarized { .. }
         | C2NodeEvent::TerminalFrame { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceAdded { .. }
@@ -2059,6 +2061,7 @@ fn c2_event_contains_opaque_unix_path(event: &C2NodeEvent) -> bool {
         C2NodeEvent::WorkspaceAdded { workspace } => workspace.canonical_root.as_unix_bytes().is_some(),
         C2NodeEvent::HarnessMcpReadCall { .. }
         | C2NodeEvent::Control { .. }
+        | C2NodeEvent::SessionRecordHistorySummarized { .. }
         | C2NodeEvent::TerminalFrame { .. }
         | C2NodeEvent::AgentStream { .. }
         | C2NodeEvent::ControllerChanged { .. }
@@ -2858,6 +2861,7 @@ fn project_legacy_event(
             retain_legacy_workspace(workspace);
             true
         }
+        C2NodeEvent::SessionRecordHistorySummarized { .. } => false,
         C2NodeEvent::SessionRecordUpserted { record } => {
             project_legacy_record_provider(record)
         }

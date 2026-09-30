@@ -105,7 +105,7 @@ use crate::protocol::{
     ManagedWorktreeSpawnRequestV2, SessionRecordId,
     NativeSessionCatalogRoute, NativeSessionSelection, SessionTaskBindingV1,
     SessionTaskTargetV1, TaskId,
-    BlockAuthorityV1, HarnessMcpLaunchV1, MAX_ACP_BLOCKED_HELP_BYTES, MAX_ACP_BLOCKED_REASON_BYTES,
+    BlockAuthorityV1, HarnessMcpLaunchV1, SessionHistorySummaryV1, MAX_ACP_BLOCKED_HELP_BYTES, MAX_ACP_BLOCKED_REASON_BYTES,
     StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind, WorktreeProfileId,
     SpawnContextId, SpawnEnvironmentProfileId, SpawnIdempotencyKey,
     SpawnProfileDefaults, SpawnRequiredCapabilities, SpawnSpec, SpawnSpecResolveError,
@@ -9978,6 +9978,7 @@ impl NodeShared {
             | NodeEvent::ManagedWorktreeRemoved { .. }
             | NodeEvent::Control { .. }
             | NodeEvent::ControllerChanged { .. }
+            | NodeEvent::SessionRecordHistorySummarized { .. }
             | NodeEvent::WorkspaceAdded { .. }
             | NodeEvent::WorkspaceRemoved { .. }
             | NodeEvent::ResyncRequired { .. }
@@ -13962,6 +13963,7 @@ fn project_event_legacy_provider_ids(
         NodeEvent::SessionRecordUpserted { record } => {
             provider_id_is_legacy(&record.provider)
         }
+        NodeEvent::SessionRecordHistorySummarized { .. } => false,
         NodeEvent::SessionRecordRemoved { .. } => shared
             .history
             .lock()
@@ -15143,6 +15145,10 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             }
             shared.revalidate_session_record_preview(&record, &identity)?;
             let preview: gate4agent_types::SessionRecordPreview = preview.into();
+            shared.publish(NodeEvent::SessionRecordHistorySummarized {
+                record_id: record_id.clone(),
+                summary: SessionHistorySummaryV1::from(&preview),
+            });
             Ok(NodeResponse::SessionRecordPreviewed {
                 record_id,
                 preview,
@@ -16603,6 +16609,310 @@ pub enum NodeServerError {
     ShutdownDispatch(NodeFailure),
     #[error("node shutdown timed out with {active_native_sessions} physical sessions retained")]
     ShutdownTimedOut { active_native_sessions: usize },
+}
+
+#[cfg(test)]
+mod agent_stream_blocked_tests {
+    use super::*;
+    use gate4agent_types::{
+        AdapterId, AdapterVerification, HostRequestOutcome as ProviderHostRequestOutcome,
+        ProviderSource,
+    };
+
+    fn provider_source(family: AdapterFamily, adapter: &str) -> ProviderSource {
+        ProviderSource {
+            family,
+            binding: AdapterBinding::new(
+                AdapterId::new(adapter).unwrap(),
+                "fixture/v1",
+                AdapterVerification::SyntheticFixture,
+            )
+            .unwrap(),
+        }
+    }
+
+    fn provider_control_event_at(
+        family: AdapterFamily,
+        adapter: &str,
+        source_sequence: u64,
+        provider_event: ProviderEvent,
+    ) -> ControlEvent {
+        ControlEvent {
+            sequence: 41,
+            command_id: None,
+            instance_id: AgentInstanceId(7),
+            generation: SessionGeneration(3),
+            event: ControlEventKind::ProviderEvent {
+                sequence: 8,
+                source: provider_source(family, adapter),
+                source_sequence,
+                event: provider_event,
+            },
+        }
+    }
+
+    fn provider_control_event(family: AdapterFamily, provider_event: ProviderEvent) -> ControlEvent {
+        provider_control_event_at(family, "fixture", 9, provider_event)
+    }
+
+    fn denied_host_request(
+        by: ProviderHostDecisionAuthority,
+        reason: Option<String>,
+    ) -> ControlEvent {
+        provider_control_event_at(
+            AdapterFamily::Acp,
+            "claude-code",
+            2,
+            ProviderEvent::HostRequestObserved {
+                method: "terminal/create".to_owned(),
+                params_json: String::new(),
+                decision: ProviderHostRequestDecision::Denied { by },
+                outcome: ProviderHostRequestOutcome::Executed,
+                reason,
+            },
+        )
+    }
+
+    fn blocked(
+        event: &ControlEvent,
+    ) -> (
+        Option<String>,
+        String,
+        BlockAuthorityV1,
+        Option<String>,
+        String,
+        Option<String>,
+    ) {
+        let chunk = agent_stream_chunk(event).expect("expected a Blocked chunk");
+        chunk.validate().expect("minted chunk must validate");
+        let AgentStreamChunkKindV1::Blocked {
+            correlation_id,
+            tool_class,
+            authority,
+            reason_kind,
+            reason,
+            help,
+        } = chunk.kind
+        else {
+            panic!("expected AgentStreamChunkKindV1::Blocked");
+        };
+        (correlation_id, tool_class, authority, reason_kind, reason, help)
+    }
+
+    /// Pins the fleet and every adapter each member declares: the fleet is
+    /// exactly what `active_registry` says, and no member declares a hook
+    /// adapter (lifecycle hooks are retired).
+    #[test]
+    fn the_enabled_provider_matrix_is_exact() {
+        let registry = active_registry().unwrap();
+        let (providers, adapters) = provider_contract_manifest(&registry).unwrap();
+        assert_eq!(
+            providers
+                .iter()
+                .map(|contract| contract.provider.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude", "codex", "grok", "kimi"],
+        );
+        assert!(adapters.iter().all(|contract| {
+            !matches!(contract.family, AdapterFamily::Hook | AdapterFamily::ManagedHook)
+        }));
+    }
+
+    /// A gate-denied host request, WITH its reason text carried all the way
+    /// from the ACP host, mints a `Blocked` chunk naming the gate.
+    #[test]
+    fn gate_denied_host_request_mints_a_blocked_chunk() {
+        let gate_text =
+            "blocked by dangerous-command gate: rule=filesystem-wipe, argument=rm -rf /";
+        let event = denied_host_request(
+            ProviderHostDecisionAuthority::Gate,
+            Some(gate_text.to_owned()),
+        );
+        let chunk = agent_stream_chunk(&event).expect("expected a Blocked chunk");
+        assert_eq!(chunk.source_sequence, 2);
+        let (correlation_id, tool_class, authority, reason_kind, reason, help) = blocked(&event);
+        assert_eq!(authority, BlockAuthorityV1::HostGate);
+        assert_eq!(reason, gate_text);
+        assert_eq!(correlation_id, None);
+        assert_eq!(reason_kind, None);
+        assert_eq!(help, None);
+        assert_eq!(tool_class, "Write");
+    }
+
+    const CLASSIFIER_SAMPLE: &str = "Permission for this action was denied by the Claude Code auto mode classifier. Reason: Blocked by classifier. If you have other tasks that don't depend on this action, continue working on those. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user what you were trying to do and why you need this permission. Let the user decide how to proceed. To allow this type of action in the future, the user can add a Bash permission rule to their settings.";
+
+    /// The owner's classifier sample, verbatim, arriving as a
+    /// `tool_call_update`-derived `ProviderEvent::ToolCompleted` with
+    /// `non_execution_kind: "permission-rule"` -- mints a `Blocked` chunk with
+    /// `authority: ProviderPermissionRule`, the `Reason:` sentence as `reason`
+    /// and the guidance tail as `help`.
+    #[test]
+    fn classifier_sample_permission_rule_mints_a_blocked_chunk() {
+        let event = provider_control_event(
+            AdapterFamily::Acp,
+            ProviderEvent::ToolCompleted {
+                id: "toolu_9".to_owned(),
+                output: CLASSIFIER_SAMPLE.to_owned(),
+                is_error: true,
+                duration_ms: None,
+                agent_id: None,
+                non_execution_kind: Some("permission-rule".to_owned()),
+            },
+        );
+        let (correlation_id, _, authority, reason_kind, reason, help) = blocked(&event);
+        assert_eq!(authority, BlockAuthorityV1::ProviderPermissionRule);
+        assert_eq!(reason, "Blocked by classifier");
+        assert_eq!(reason_kind, Some("permission-rule".to_owned()));
+        assert!(help.as_deref().is_some_and(|help| help.starts_with("If you have other tasks")));
+        assert!(correlation_id.is_some(), "a tool-correlated block must carry a correlation id");
+    }
+
+    /// A `session/prompt` RPC error with `data.codexErrorInfo:
+    /// "usageLimitExceeded"` (measured live 2026-09-05) mints a `Blocked` chunk
+    /// with `authority: ProviderQuota`, the message verbatim as `reason` and the
+    /// vendor code as `reason_kind`.
+    #[test]
+    fn codex_quota_rpc_error_mints_a_blocked_chunk() {
+        let message = "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 7th, 2026 6:19 PM.";
+        let event = provider_control_event(
+            AdapterFamily::Acp,
+            ProviderEvent::SessionEnded {
+                result: "JSON-RPC error -32603: Internal error".to_owned(),
+                cost_usd: None,
+                is_error: true,
+                stop_reason: Some(ProviderStopReason::ProviderError {
+                    code: -32603,
+                    message: message.to_owned(),
+                    vendor_code: Some("usageLimitExceeded".to_owned()),
+                }),
+            },
+        );
+        let (_, tool_class, authority, reason_kind, reason, _) = blocked(&event);
+        assert_eq!(authority, BlockAuthorityV1::ProviderQuota);
+        assert_eq!(reason, message);
+        assert_eq!(reason_kind, Some("usageLimitExceeded".to_owned()));
+        assert_eq!(tool_class, "Session");
+    }
+
+    /// ACP's `stopReason: "refusal"` mints a `Blocked` chunk with
+    /// `authority: ProviderRefusal`.
+    #[test]
+    fn session_end_stop_reason_refusal_mints_a_blocked_chunk() {
+        let event = provider_control_event(
+            AdapterFamily::Acp,
+            ProviderEvent::SessionEnded {
+                result: "refusal".to_owned(),
+                cost_usd: None,
+                is_error: true,
+                stop_reason: Some(ProviderStopReason::Refusal),
+            },
+        );
+        let (_, _, authority, _, _, _) = blocked(&event);
+        assert_eq!(authority, BlockAuthorityV1::ProviderRefusal);
+    }
+
+    /// A failed tool completion with no typed `non_execution_kind` -- or one
+    /// that only says the turn stopped -- is a plain execution failure, never a
+    /// block; nor is an agent's own narrative claiming one.
+    #[test]
+    fn failures_and_narrative_without_a_typed_block_mint_no_blocked_chunk() {
+        for non_execution_kind in [None, Some("interrupted".to_owned()), Some("cancelled".to_owned())] {
+            let event = provider_control_event(
+                AdapterFamily::Acp,
+                ProviderEvent::ToolCompleted {
+                    id: "toolu_1".to_owned(),
+                    output: "command exited with status 1".to_owned(),
+                    is_error: true,
+                    duration_ms: Some(12),
+                    agent_id: None,
+                    non_execution_kind,
+                },
+            );
+            assert!(agent_stream_chunk(&event).is_none());
+        }
+        let narrative = provider_control_event(
+            AdapterFamily::Acp,
+            ProviderEvent::ToolCompleted {
+                id: "toolu_2".to_owned(),
+                output: "the harness blocked the write, approval needed".to_owned(),
+                is_error: false,
+                duration_ms: Some(3),
+                agent_id: None,
+                non_execution_kind: None,
+            },
+        );
+        assert!(agent_stream_chunk(&narrative).is_none());
+    }
+
+    /// `Granted`/`Deferred` decisions never mint a `Blocked` chunk, whatever the
+    /// execution outcome: a granted request that failed while running was
+    /// still authorized.
+    #[test]
+    fn granted_and_deferred_host_requests_never_mint_a_blocked_chunk() {
+        for (decision, outcome) in [
+            (
+                ProviderHostRequestDecision::Granted { by: ProviderHostDecisionAuthority::Policy },
+                ProviderHostRequestOutcome::Executed,
+            ),
+            (ProviderHostRequestDecision::Deferred, ProviderHostRequestOutcome::Executed),
+            (
+                ProviderHostRequestDecision::Granted { by: ProviderHostDecisionAuthority::Policy },
+                ProviderHostRequestOutcome::Failed {
+                    error: "terminal/create spawn failed: os error 3".to_owned(),
+                },
+            ),
+        ] {
+            let event = provider_control_event_at(
+                AdapterFamily::Acp,
+                "claude-code",
+                3,
+                ProviderEvent::HostRequestObserved {
+                    method: "fs/read_text_file".to_owned(),
+                    params_json: String::new(),
+                    decision: decision.clone(),
+                    outcome,
+                    reason: None,
+                },
+            );
+            assert!(agent_stream_chunk(&event).is_none(), "{decision:?}");
+        }
+    }
+
+    /// A deferred `session/request_permission` resolved by an operator or an
+    /// expired deadline carries no reason text -- the chunk falls back to a
+    /// categorical sentence naming the authority rather than inventing detail.
+    #[test]
+    fn denied_host_request_with_no_reason_falls_back_to_a_categorical_sentence() {
+        for (by, expected_authority, expected_reason) in [
+            (
+                ProviderHostDecisionAuthority::Operator,
+                BlockAuthorityV1::Operator,
+                "declined by the operator",
+            ),
+            (
+                ProviderHostDecisionAuthority::DeadlinePolicy,
+                BlockAuthorityV1::HostDeadline,
+                "denied by host policy after the operator deadline expired",
+            ),
+        ] {
+            let (_, _, authority, _, reason, _) = blocked(&denied_host_request(by, None));
+            assert_eq!(authority, expected_authority);
+            assert_eq!(reason, expected_reason);
+        }
+    }
+
+    /// An over-long reason is cut to the wire bound BEFORE the chunk is built,
+    /// at a safe UTF-8 boundary -- `validate` rejects an over-long value
+    /// outright rather than truncating.
+    #[test]
+    fn overlong_blocked_reason_is_truncated_to_the_wire_bound() {
+        let oversized = "x".repeat(MAX_ACP_BLOCKED_REASON_BYTES + 500);
+        let (_, _, _, _, reason, _) = blocked(&denied_host_request(
+            ProviderHostDecisionAuthority::Policy,
+            Some(oversized),
+        ));
+        assert!(reason.len() <= MAX_ACP_BLOCKED_REASON_BYTES);
+    }
 }
 
 #[cfg(test)]
@@ -24384,6 +24694,31 @@ mod tests {
         let encoded = serde_json::to_string(&preview).unwrap();
         assert!(!encoded.contains("stable-session"));
         assert!(!encoded.contains(history_root.to_string_lossy().as_ref()));
+        let NodeResponse::Resync { events, .. } = shared.resync(0) else {
+            panic!("record preview history summary returned a different response");
+        };
+        let summaries = events
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                NodeEvent::SessionRecordHistorySummarized { record_id, summary }
+                    if record_id == &record.record_id =>
+                {
+                    Some(*summary)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(summaries, vec![SessionHistorySummaryV1::from(&preview)]);
+        let summary_json = serde_json::to_string(&summaries).unwrap();
+        for private in [
+            "stable-session",
+            "raw user text must not cross the catalog wire",
+            "raw answer",
+            "Workspace review",
+            "claude-sonnet",
+        ] {
+            assert!(!summary_json.contains(private), "{private}");
+        }
         let identity = record.provider_session.clone().unwrap();
         assert_eq!(
             shared.revalidate_session_record_preview(&record, &identity),

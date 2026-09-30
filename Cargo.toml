@@ -77,5 +77,12 @@ members = [
     "crates/gate4agent-runtime-native",
     "crates/gate4agent-testkit",
     "crates/gate4agent-pty",
+    "crates/gate4agent-build-stamp",
+    "crates/gate4agent-node-protocol",
+    "crates/gate4agent-node-wire",
+    "crates/gate4agent-node",
+    "crates/gate4agent-c2-protocol",
+    "crates/gate4agent-c2-client",
+    "crates/gate4agent-c2",
 ]
 resolver = "2"

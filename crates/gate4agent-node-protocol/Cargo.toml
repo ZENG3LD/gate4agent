@@ -1,0 +1,21 @@
+[package]
+name = "gate4agent-node-protocol"
+version = "0.2.37"
+edition = "2021"
+description = "Bounded wire contract for the local gate4agent node (inventory, spawn, sessions, worktrees, delivery)"
+publish = false
+
+[lib]
+name = "gate4agent_node_protocol"
+
+[dependencies]
+gate4agent-build-stamp = { path = "../gate4agent-build-stamp" }
+gate4agent-types = { path = "../gate4agent-types" }
+ring = "=0.17.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt", "time"] }

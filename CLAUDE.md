@@ -1,10 +1,14 @@
-# gate4agent — CLI-agent transport library
+# gate4agent — everything about providers: library, node, C2
 
-gate4agent is a library, not a product: it spawns, streams, resumes, and
-owns interactive CLI coding-agent subprocesses (Claude Code, Codex, Kimi,
-Grok) over PTY, pipe, ACP, and daemon transports, behind one API. The
-node/c2/harness/TUI stack that used to sit on top of it now lives in
-`hatchery`, a sibling repository that links these crates by path.
+gate4agent owns everything about CLI coding-agent providers (Claude Code,
+Codex, Kimi, Grok): the library that spawns, streams, resumes, and owns
+their subprocesses over PTY, pipe, ACP, and daemon transports behind one
+API; the node process that wraps providers for one machine and serves them
+over a wire; and the C2 that reaches the nodes on remote machines. The
+harness, TUI, observation, and task/mail stack lives in `hatchery`, a
+sibling repository that links these crates by path and talks to the node
+only through its wire (`gate4agent-node-protocol`) and the C2's
+(`gate4agent-c2-protocol`).
 Plans/handoffs/audits live in the owner's private workspace documentation
 tree, not in this repository.
 
@@ -29,23 +33,42 @@ tree, not in this repository.
   the actual subprocess. It does not replace the transport core; it wraps
   it.
 
-Hooks belong here permanently: `~/.gate4agent/agent-hooks`,
-`GATE4AGENT_HOOK_*`. They are part of the session runtime substrate a node
-embeds, not workbench/task vocabulary, and they do not move to `hatchery`.
+## Node and C2
+
+- `gate4agent-node` (binary `gate4agent-node`) — the node server: wraps
+  providers, owns PTY/inline/ACP sessions, the file browser, local git, and
+  worktrees for its machine. `gate4agent-node-protocol` is its bounded wire
+  contract, `gate4agent-node-wire` the transport/auth/client.
+- `gate4agent-c2` (binary `gate4agent-c2`) — the relay that aggregates node
+  state and routes commands down; `gate4agent-c2-protocol` and
+  `gate4agent-c2-client` (CLI `gate4agent-c2ctl`) are its contract and client.
+- `gate4agent-build-stamp` — the content hash of THIS repository's working
+  tree that every node/C2 handshake carries; peers built from different
+  trees refuse each other.
+- The node names no harness. What a session's harness-MCP door is called —
+  server name, argv, the environment variables that carry its endpoint and
+  token — arrives from the caller in `HarnessMcpLaunchV1` on the reservation.
+- The node derives no observation/telemetry vocabulary. It publishes
+  `NodeEvent::Control` and the agent stream; the C2 relays a sanitized
+  telemetry view of control events (`C2ControlEvent::detail`, capability
+  `control-detail-v1`) to a client that negotiated it, and the client builds
+  its own telemetry from that.
+
+Lifecycle hooks are retired: nothing here installs a hook into any provider's
+configuration, and no code or test may write under the real user home
+(`~/.claude`, `~/.codex`, `~/.kimi-code`, `~/.grok`, `~/.gate4agent`).
 
 ## Forbidden
 
-- No daemon binary. This repository ships no long-running service — no
-  node, no c2, no harness. `gate4agent-testkit` and its
-  `windows-headless-supervisor` binary are test infrastructure, not a
-  product daemon.
-- No wire protocol. Node/c2/harness wire types (`*-protocol` crates) live
-  in `hatchery`, not here.
+- No harness. The harness (tasks, runs, mail, observation, TUI) is
+  `hatchery`'s; the node and C2 are gate4agent's and stay harness-agnostic.
 - No task/harness/observation vocabulary. Task kanban, session extraction
-  for a client app, delivery of skills/plugins/MCP config, and read-only
-  observation projection are `hatchery` concerns — do not grow them here.
-- No dependency on any `hatchery-*` crate, in any direction. `hatchery`
-  depends on `gate4agent` by path; the reverse dependency must never exist.
+  for a client app, and the read-only observation projection are `hatchery`
+  concerns — do not grow them here.
+- No dependency on any `hatchery-*` crate, in any direction, and no source
+  path naming one. `hatchery` depends on `gate4agent` by path; the reverse
+  dependency must never exist (`tests/no_hatchery_dependency.rs` enforces it
+  over every manifest and every Rust source, node and C2 included).
 
 ## Windows PTY tests
 
@@ -84,9 +107,7 @@ local development. A public-API change here (root crate, or any
 check `hatchery`'s crates after any such change, before considering the
 change done.
 
-hatchery's own build stamp (`hatchery-build-stamp`) hashes only the
-`hatchery` repository's working tree — a wire-visible change made here in
-`gate4agent-types` (or any other crate hatchery links by path) does not
-change that stamp, even though it changes what hatchery's binaries
-actually speak on the wire. Do not treat a stable hatchery build stamp as
-evidence that nothing wire-relevant changed upstream.
+The wire stamp (`gate4agent-build-stamp`) is this repository's, and hatchery's
+binaries carry it through `gate4agent-node-protocol`: a wire-visible change
+made here changes the stamp hatchery speaks with, so a hatchery binary built
+before the change refuses a node or C2 built after it.

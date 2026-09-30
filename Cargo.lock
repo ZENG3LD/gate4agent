@@ -280,6 +280,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate4agent-build-stamp"
+version = "0.1.0"
+
+[[package]]
+name = "gate4agent-c2"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-c2-client",
+ "gate4agent-c2-protocol",
+ "gate4agent-catalog",
+ "gate4agent-node",
+ "gate4agent-node-protocol",
+ "gate4agent-node-wire",
+ "gate4agent-runtime-native",
+ "gate4agent-testkit",
+ "gate4agent-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vt100",
+]
+
+[[package]]
+name = "gate4agent-c2-client"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-c2-protocol",
+ "gate4agent-node-protocol",
+ "gate4agent-node-wire",
+ "gate4agent-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "gate4agent-c2-protocol"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-build-stamp",
+ "gate4agent-node-protocol",
+ "gate4agent-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "gate4agent-catalog"
 version = "0.4.0"
 dependencies = [
@@ -316,6 +368,55 @@ dependencies = [
  "gate4agent-tool-protocol",
  "gate4agent-types",
  "thiserror",
+]
+
+[[package]]
+name = "gate4agent-node"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-adapters",
+ "gate4agent-catalog",
+ "gate4agent-handle",
+ "gate4agent-node-protocol",
+ "gate4agent-node-wire",
+ "gate4agent-runtime-native",
+ "gate4agent-testkit",
+ "gate4agent-types",
+ "libc",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "gate4agent-node-protocol"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-build-stamp",
+ "gate4agent-types",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "gate4agent-node-wire"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-node-protocol",
+ "gate4agent-types",
+ "libc",
+ "ring",
+ "thiserror",
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

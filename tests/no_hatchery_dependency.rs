@@ -70,3 +70,91 @@ node = { package = "hatchery-node", path = "../x" }
 "#;
     assert_eq!(hatchery_dependency_lines(manifest).len(), 2);
 }
+
+/// The node and C2 belong to gate4agent, so the scan above must actually see
+/// them: a boundary test that silently skipped a crate would prove nothing.
+#[test]
+fn the_scan_covers_the_node_and_c2_crates() {
+    let scanned: Vec<String> = manifests()
+        .iter()
+        .filter_map(|path| path.parent()?.file_name()?.to_str().map(str::to_owned))
+        .collect();
+    for required in [
+        "gate4agent-node",
+        "gate4agent-node-protocol",
+        "gate4agent-node-wire",
+        "gate4agent-c2",
+        "gate4agent-c2-protocol",
+        "gate4agent-c2-client",
+        "gate4agent-build-stamp",
+    ] {
+        assert!(
+            scanned.iter().any(|name| name == required),
+            "{required} is not covered by the hatchery-dependency scan: {scanned:?}"
+        );
+    }
+}
+
+fn rust_sources(dir: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            rust_sources(&path, found);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            found.push(path);
+        }
+    }
+}
+
+fn hatchery_path_lines(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//"))
+        .filter(|line| {
+            line.contains("use hatchery_")
+                || line.contains("extern crate hatchery_")
+                || line.contains(" hatchery_") && line.contains("::")
+                || line.starts_with("hatchery_") && line.contains("::")
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn no_source_file_names_a_hatchery_crate_path() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = Vec::new();
+    for dir in ["crates", "src", "tests"] {
+        rust_sources(&root.join(dir), &mut sources);
+    }
+    let mut offenders = Vec::new();
+    for path in sources {
+        if path.file_name().is_some_and(|name| name == "no_hatchery_dependency.rs") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in hatchery_path_lines(&text) {
+            offenders.push(format!("{}: {line}", path.display()));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "gate4agent sources must never name a hatchery crate: {offenders:#?}"
+    );
+}
+
+#[test]
+fn the_source_detector_catches_use_and_path_forms_and_ignores_comments() {
+    let source = "// use hatchery_node::X;
+use hatchery_node::X;
+let y = hatchery_c2::run();
+";
+    assert_eq!(hatchery_path_lines(source).len(), 2);
+}
+

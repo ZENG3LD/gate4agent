@@ -5,10 +5,10 @@ use gate4agent_node_protocol::{
     CapabilityId, ClientFrame, ClientHello, ClientRole, HostDescriptor, LocalTransportKind,
     NegotiatedNodeCompatibility, NodeCompatibilitySupport, NodeHello, NodeId, NodeIncarnationId,
     NodeRequest, NodeResponse, NodeSnapshot, OperatingSystemId, PathEncoding, PathSemantics,
-    PathStyle, ProtocolRange, ResponseEnvelope, ServerChallenge, ServerFrame, StateSchemaSupport,
-    MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
-    NODE_AUTH_NONCE_BYTES, NODE_COMPATIBILITY_METADATA_CAPABILITY, BUILD_STAMP,
-    NODE_STATE_SCHEMA_V2,
+    PathStyle, ProtocolRange, ProviderRuntimeStatuses, ResponseEnvelope, ServerChallenge,
+    ServerFrame, StateSchemaSupport, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES,
+    MAX_NODE_HELLO_FRAME_BYTES, NODE_AUTH_NONCE_BYTES, NODE_COMPATIBILITY_METADATA_CAPABILITY,
+    BUILD_STAMP, NODE_STATE_SCHEMA_V2,
 };
 use gate4agent_node_wire::{
     negotiated_auth_proof, proofs_match, AuthDirection, LocalNodeClient, LocalServerStream,
@@ -96,8 +96,12 @@ fn snapshot() -> NodeSnapshot {
     NodeSnapshot {
         node_id: node_id(),
         enabled_providers: Vec::new(),
+        provider_runtime_statuses: ProviderRuntimeStatuses::default(),
         workspaces: Vec::new(),
         session_records: Vec::new(),
+        managed_worktrees: Vec::new(),
+        launch_inventory: None,
+        agent_progress: Vec::new(),
     }
 }
 

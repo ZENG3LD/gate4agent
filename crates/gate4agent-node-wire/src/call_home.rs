@@ -117,7 +117,7 @@ mod tests {
     /// whoever accepted it, over any stream at all.
     #[tokio::test]
     async fn a_node_names_itself_and_the_relay_reads_the_name() {
-        let node_id = NodeId::new("opbox-windows-x86-64-1d67e837f8fa").unwrap();
+        let node_id = NodeId::new("fixture-node").unwrap();
         let mut wire = Vec::new();
         write_call_home_announce(&mut wire, &node_id).await.unwrap();
         let read = read_call_home_announce(&mut wire.as_slice()).await.unwrap();
@@ -135,7 +135,7 @@ mod tests {
             &mut wire,
             &NodeCallHomeAnnounce {
                 build_stamp: foreign_stamp.clone(),
-                node_id: "opbox-windows-x86-64-1d67e837f8fa".to_owned(),
+                node_id: "fixture-node".to_owned(),
             },
             MAX_NODE_HELLO_FRAME_BYTES,
         )

@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "gate4agent": {
-      "command": "C:/Users/VA PC/CODING/ML_TRADING/nemo/gate4agent/target/release/gate4agent-harness-mcp.exe",
+      "command": "C:/Users/operator/gate4agent/target/release/gate4agent-harness-mcp.exe",
       "args": ["--session-proxy"]
     }
   }

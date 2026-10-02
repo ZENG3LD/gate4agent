@@ -2930,6 +2930,11 @@ struct NodeShared {
     /// `station-network-and-browser-profile-knobs-2026-10-02.md` §2.1 / §4.
     /// Never holds cookies / OAuth / proxy credentials.
     network_allowlist_catalog: RwLock<crate::network_allowlist_catalog::NetworkAllowlistCatalog>,
+    /// Node-local exclusive dig2browser station profile leases (feature
+    /// `dig2-station-probe`). Opaque `browser_profile_id` ↔ session holder;
+    /// cleared on session end. Never ImportSession / cookies on C2.
+    #[cfg(feature = "dig2-station-probe")]
+    browser_station_leases: crate::dig2_station_lease::BrowserStationLeaseTable,
     bundle_catalog: RwLock<BundleCatalog>,
     delivery_store: Mutex<Option<DeliveryStore>>,
     context_pack_store: Mutex<Option<ContextPackStore>>,
@@ -3343,6 +3348,8 @@ impl NodeShared {
             environment_profiles: RwLock::new(BTreeMap::new()),
             environment_materialization_profiles: RwLock::new(BTreeMap::new()),
             network_allowlist_catalog: RwLock::new(crate::network_allowlist_catalog::NetworkAllowlistCatalog::new()),
+            #[cfg(feature = "dig2-station-probe")]
+            browser_station_leases: crate::dig2_station_lease::new_lease_table(),
             bundle_catalog: RwLock::new(BundleCatalog::default()),
             delivery_store: Mutex::new(None),
             context_pack_store: Mutex::new(None),
@@ -3670,7 +3677,8 @@ impl NodeShared {
         // `\\.\pipe\{suffix}`); platform-unsupported or unreachable → clear
         // NodeFailureCode. Runs even without environment_profile_id (same
         // placement spirit as allowlist catalog). Feature off keeps stub echo.
-        // Never cookies / OAuth / proxy credentials. Bind/lease still stubbed.
+        // Never cookies / OAuth / proxy credentials. Exclusive lease is
+        // acquired later in spawn_session_with_deadline (after instance id).
         #[cfg(feature = "dig2-station-probe")]
         if resolved.browser_profile_id.is_some() {
             use crate::dig2_station_probe::{probe_station_reachable, StationProbeError};
@@ -5452,6 +5460,7 @@ impl NodeShared {
                 harness_mcp,
                 resolved.approval_level,
                 resolved.network_allowlist.clone(),
+                resolved.browser_profile_id.clone(),
             )
             .await
             .map(|(session, _runtime_policy)| {
@@ -5793,6 +5802,7 @@ impl NodeShared {
             None,
             resolved.approval_level,
             resolved.network_allowlist.clone(),
+            resolved.browser_profile_id.clone(),
         ).await;
         let (session, effective_runtime_policy) = match spawn {
             Ok(spawned) => spawned,
@@ -9276,6 +9286,15 @@ impl NodeShared {
                 && binding.generation == address.session.generation
         }) {
             let removed = bindings.remove(&address.session.instance_id);
+            // Exclusive dig2browser station profile lease is node-local; clear
+            // on every session unbind / rollback. Never ImportSession/cookies.
+            #[cfg(feature = "dig2-station-probe")]
+            {
+                crate::dig2_station_lease::release_lease_for_holder(
+                    &self.browser_station_leases,
+                    address.session.instance_id,
+                );
+            }
             self.clear_terminal_frame_watermark(address);
             if let Some(control) = self.native_launch_profile_control.as_ref() {
                 control.clear_native_mcp_server_launch_overlay(
@@ -11521,6 +11540,7 @@ impl NodeShared {
                 // than the axis default.
                 ApprovalLevel::default(),
                 None,
+                None,
             )
             .await
             .map(|(session, _runtime_policy)| session)
@@ -11544,6 +11564,12 @@ impl NodeShared {
         harness_mcp: Option<&PreparedHarnessMcpSpawn>,
         approval_level: ApprovalLevel,
         network_allowlist: Option<crate::protocol::SpawnNetworkAllowlistId>,
+        // Opaque dig2browser station profile id (ids only). Feature
+        // `dig2-station-probe`: after probe at resolve, spawn takes an
+        // exclusive node-local lease; cleared on session end. Never
+        // ImportSession / cookies on C2. Feature off: ignored (stub echo
+        // already happened on the receipt path).
+        browser_profile_id: Option<crate::protocol::SpawnBrowserProfileId>,
     ) -> Result<(SessionAddress, ProviderRuntimePolicy), NodeFailure> {
         let reserved_lease = self.managed_worktrees.lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -11657,6 +11683,44 @@ impl NodeShared {
             session = ?address.session,
             "session spawn request accepted",
         );
+        // Track A follow-on: exclusive node-local BrowserStationLease after
+        // dig2 probe (feature dig2-station-probe). Opaque profile id only —
+        // never ImportSession / cookies on C2. Linux/feature-off: probe
+        // already refused or stub; this block is cfg'd out when feature off.
+        #[cfg(feature = "dig2-station-probe")]
+        let mut browser_station_lease_guard = if let Some(profile_id) = browser_profile_id {
+            use crate::dig2_station_lease::{acquire_lease, BrowserStationLeaseError};
+            match acquire_lease(
+                &self.browser_station_leases,
+                profile_id,
+                instance_id,
+                unix_time_ms(),
+            ) {
+                Ok(guard) => Some(guard),
+                Err(BrowserStationLeaseError::ProfileBusy { .. }) => {
+                    return Err(failure(
+                        NodeFailureCode::BrowserStationProfileBusy,
+                        "dig2browser station profile is already leased by another session",
+                    ));
+                }
+                Err(BrowserStationLeaseError::CapacityExceeded) => {
+                    return Err(failure(
+                        NodeFailureCode::BrowserStationProfileBusy,
+                        "dig2browser station profile lease capacity exhausted",
+                    ));
+                }
+                Err(BrowserStationLeaseError::HolderAlreadyLeased) => {
+                    return Err(failure(
+                        NodeFailureCode::BrowserStationProfileBusy,
+                        "session already holds a dig2browser station profile lease",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "dig2-station-probe"))]
+        let _ = browser_profile_id;
         let mut harness_mcp_overlay = if let Some(prepared) = harness_mcp {
             // Slice A(ii) of gate4agent-arc-mailbox-and-task-layer: the door
             // exists for PTY (env vars) and ACP (`session/new.mcpServers`,
@@ -12015,6 +12079,10 @@ impl NodeShared {
                 if !matches!(current.status, gate4agent_types::SessionStatus::Registered) {
                     if let Some(overlay) = harness_mcp_overlay.take() {
                         overlay.retain();
+                    }
+                    #[cfg(feature = "dig2-station-probe")]
+                    if let Some(guard) = browser_station_lease_guard.take() {
+                        guard.retain();
                     }
                     return Ok((address, runtime_policy));
                 }
@@ -16656,6 +16724,7 @@ fn node_failure_category(code: NodeFailureCode) -> &'static str {
             "browser-station-probe-unavailable"
         }
         NodeFailureCode::BrowserStationUnreachable => "browser-station-unreachable",
+        NodeFailureCode::BrowserStationProfileBusy => "browser-station-profile-busy",
         NodeFailureCode::EnvironmentProfileBindingMismatch => {
             "environment-profile-binding-mismatch"
         }
@@ -17444,7 +17513,8 @@ mod station_knobs_resolve_tests {
 
     /// Feature `dig2-station-probe`: browser_profile_id set refuses when the
     /// cheap station probe cannot succeed. On non-Windows (this CI host) that
-    /// is `BrowserStationProbeUnavailable`. Never cookies on C2. Bind still stub.
+    /// is `BrowserStationProbeUnavailable`. Never cookies on C2. Lease map is
+    /// unit-tested separately (probe refuses before lease on Linux).
     #[cfg(feature = "dig2-station-probe")]
     #[test]
     fn resolve_environment_profile_refuses_browser_profile_when_station_probe_fails() {
@@ -17522,6 +17592,104 @@ mod station_knobs_resolve_tests {
             .expect("env profile present");
         assert_eq!(receipt.browser_profile_id, None);
     }
+
+    /// Feature dig2-station-probe: exclusive BrowserStationLease on NodeShared
+    /// refuses a second holder for the same opaque profile id; release on
+    /// remove_binding allows reacquire. Never ImportSession/cookies on C2.
+    #[cfg(feature = "dig2-station-probe")]
+    #[test]
+    fn browser_station_lease_exclusive_and_clears_on_remove_binding() {
+        let (shared, _defaults) = station_knobs_fixture();
+        let profile = crate::protocol::SpawnBrowserProfileId::new("station-profile-a").unwrap();
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let address_a = SessionAddress {
+            workspace_id: workspace_id.clone(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(101),
+                generation: SessionGeneration(1),
+            },
+        };
+        let address_b = SessionAddress {
+            workspace_id: workspace_id.clone(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(102),
+                generation: SessionGeneration(1),
+            },
+        };
+        let guard_a = crate::dig2_station_lease::acquire_lease(
+            &shared.browser_station_leases,
+            profile.clone(),
+            address_a.session.instance_id,
+            1,
+        )
+        .expect("first lease");
+        let busy = crate::dig2_station_lease::acquire_lease(
+            &shared.browser_station_leases,
+            profile.clone(),
+            address_b.session.instance_id,
+            2,
+        )
+        .expect_err("second holder must refuse");
+        assert!(matches!(
+            busy,
+            crate::dig2_station_lease::BrowserStationLeaseError::ProfileBusy { .. }
+        ));
+        // Simulate a bound session so remove_binding clears the lease.
+        shared.bind_session_with_policy(
+            &address_a,
+            ProviderRuntimePolicy::raw_pty(),
+            None,
+        );
+        guard_a.retain();
+        assert!(shared.remove_binding(&address_a).is_some());
+        crate::dig2_station_lease::acquire_lease(
+            &shared.browser_station_leases,
+            profile,
+            address_b.session.instance_id,
+            3,
+        )
+        .expect("reacquire after clear")
+        .retain();
+        assert!(
+            crate::dig2_station_lease::release_lease_for_holder(
+                &shared.browser_station_leases,
+                address_b.session.instance_id,
+            )
+        );
+    }
+
+    /// Feature-off: no browser_station_leases field; stub echo documented in
+    /// resolve_environment_profile_echoes_registered_station_network_and_browser_knobs.
+    #[cfg(not(feature = "dig2-station-probe"))]
+    #[test]
+    fn browser_station_lease_feature_off_keeps_stub_without_lease_table() {
+        let (shared, defaults) = station_knobs_fixture();
+        let browser = crate::protocol::SpawnBrowserProfileId::new("station-profile-a").unwrap();
+        let spec = crate::protocol::SpawnSpec {
+            target: crate::protocol::SpawnTarget {
+                node_id: shared.node_id.clone(),
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: defaults.profile_id.clone(),
+            expected_profile_revision: defaults.revision.clone(),
+            overrides: crate::protocol::SpawnOverrides {
+                browser_profile_id: Some(browser.clone()),
+                ..crate::protocol::SpawnOverrides::default()
+            },
+            deadline_ms: crate::protocol::SpawnDeadlineMs::new(30_000).unwrap(),
+            idempotency_key: crate::protocol::SpawnIdempotencyKey::new("lease-stub-off")
+                .unwrap(),
+            required_capabilities: crate::protocol::SpawnRequiredCapabilities::default(),
+        };
+        let resolved = spec.resolve(&defaults).unwrap();
+        let receipt = shared
+            .resolve_environment_profile(&resolved)
+            .expect("stub resolve")
+            .expect("env profile");
+        assert_eq!(receipt.browser_profile_id.as_ref(), Some(&browser));
+    }
+
 
     /// Startup file loader registers ids into the empty-default catalog.
     /// Feature-off dig2 probe stays stub. Never secrets on C2.
@@ -18050,6 +18218,7 @@ mod workspace_environment_collision_tests {
                 &[],
                 None,
                 ApprovalLevel::default(),
+                None,
                 None,
             )
             .await
@@ -21076,6 +21245,7 @@ mod tests {
                 &[],
                 None,
                 ApprovalLevel::default(),
+                None,
                 None,
             )
             .await

@@ -46,8 +46,9 @@ windows-sys = { version = "0.61", features = [
 [features]
 default = []
 fixture = ["dep:gate4agent-testkit", "gate4agent-node-wire/fixture"]
-# Cheap dig2browser-station named-pipe path reachability probe (no dig2browser
-# crate dep; no cookies). Feature off keeps browser_profile_id stub echo.
+# Cheap dig2browser-station named-pipe path reachability probe + node-local
+# exclusive BrowserStationLease (no dig2browser crate dep; no cookies /
+# ImportSession on C2). Feature off keeps browser_profile_id stub echo.
 dig2-station-probe = []
 
 [dev-dependencies]

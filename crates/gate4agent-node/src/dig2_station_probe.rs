@@ -2,8 +2,9 @@
 //!
 //! Behind Cargo feature `dig2-station-probe`. Path / connectability only —
 //! **never** cookie jars, session import bodies, OAuth, or proxy credentials.
-//! Dig2browser bind / lease remains a later tip; this module only answers
-//! “is the local station IPC endpoint present / connectable?”
+//! Exclusive node-local lease lives in `dig2_station_lease` (same feature).
+//! This module only answers “is the local station IPC endpoint present /
+//! connectable?”
 //!
 //! Windows-first: dig2browser station IPC today is `\\.\pipe\{suffix}` with
 //! default suffix [`DEFAULT_STATION_PIPE_SUFFIX`] (`dig2browser-station-v1`).

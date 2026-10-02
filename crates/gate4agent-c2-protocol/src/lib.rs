@@ -300,6 +300,9 @@ impl From<&NodeFailure> for C2NodeFailure {
             NodeFailureCode::BrowserStationUnreachable => {
                 "dig2browser station unreachable"
             }
+            NodeFailureCode::BrowserStationProfileBusy => {
+                "dig2browser station profile busy"
+            }
             NodeFailureCode::BundleBindingMismatch => {
                 "session bundle binding mismatch"
             }

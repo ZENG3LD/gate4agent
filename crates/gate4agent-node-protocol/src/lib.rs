@@ -506,7 +506,7 @@ pub struct SpawnEnvironmentProfileRevision(String);
 /// Node catalog enforce refuses unknown ids (`UnknownNetworkAllowlist`);
 /// optional node-local permit-set / provider-native mapping stays off the wire.
 /// Unsupported provider-native mappings refuse
-/// (`UnsupportedNetworkAllowlistMapping`). Dig2browser station bind remains
+/// (`UnsupportedNetworkAllowlistMapping`). Dig2browser station exclusive lease
 /// stubbed (probe feature-gated).
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -518,7 +518,7 @@ pub struct SpawnNetworkAllowlistId(String);
 /// Profile id string only — never cookie bytes or route credentials on C2 /
 /// IPC. See hatchery-websession-docs plan
 /// `station-network-and-browser-profile-knobs-2026-10-02.md`. Local station
-/// pipe bind / reachability refuse wait on a cheap g4a-local probe (stubbed).
+/// pipe reachability refuse + exclusive node-local lease behind feature `dig2-station-probe` (never cookies on C2).
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SpawnBrowserProfileId(String);
@@ -1334,9 +1334,10 @@ pub struct ResolvedSpawnSpec {
     pub network_allowlist: Option<SpawnNetworkAllowlistId>,
     /// Opaque dig2browser station **browserProfile** id from
     /// `SpawnOverrides::browser_profile_id` (pass-through). Empty/whitespace
-    /// ids are refused at `SpawnBrowserProfileId` construction. Local station
-    /// reachability refuse is **not** applied here until a cheap g4a-local
-    /// probe exists (see node `resolve_environment_profile` stub).
+    /// ids are refused at `SpawnBrowserProfileId` construction. When feature
+    /// `dig2-station-probe` is on, node resolve probes local station IPC and
+    /// spawn takes an exclusive node-local lease (never ImportSession/cookies
+    /// on C2). Feature off keeps stub id echo.
     pub browser_profile_id: Option<SpawnBrowserProfileId>,
 }
 
@@ -1394,8 +1395,8 @@ impl SpawnPromptMetadata {
 /// `browser_profile_id` echo **opaque station ids only** (never cookies /
 /// OAuth / proxy credentials on C2). See hatchery-websession-docs plan
 /// `station-network-and-browser-profile-knobs-2026-10-02.md` §4. Dig2browser
-/// station IPC bind / reachability refuse is not performed from this receipt
-/// until a cheap g4a-local station probe exists (node stub).
+/// station reachability refuse + exclusive lease (feature `dig2-station-probe`)
+/// run on the node — this receipt still echoes **opaque ids only**.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedEnvironmentProfileReceipt {
@@ -7275,9 +7276,13 @@ pub enum NodeFailureCode {
     BrowserStationProbeUnavailable,
     /// `browser_profile_id` set, probe feature on, and the local
     /// dig2browser-station named-pipe path is missing or not connectable.
-    /// Path reachability only — no session import / cookie frames. Bind/lease
-    /// remains a later tip.
+    /// Path reachability only — no session import / cookie frames.
     BrowserStationUnreachable,
+    /// Feature `dig2-station-probe`: another live session already holds an
+    /// exclusive node-local lease on this opaque `browser_profile_id`.
+    /// Never cookies / ImportSession on C2 — lease is node bookkeeping only.
+    /// Sketch: `dig2-station-bind-lease-sketch-2026-10-02.md`.
+    BrowserStationProfileBusy,
     BundleBindingMismatch,
     EnvironmentProfileBindingMismatch,
     BundleMaterializationFailed,

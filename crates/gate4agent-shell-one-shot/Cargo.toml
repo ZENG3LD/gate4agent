@@ -3,15 +3,15 @@ name = "gate4agent-shell-one-shot"
 version = "0.4.1"
 edition = "2021"
 description = "Bounded native process authority for provider-owned gate4agent one-shot runs"
-publish = false
+license = "MIT"
 
 [dependencies]
-gate4agent = { path = "../.." }
-gate4agent-adapters = { path = "../gate4agent-adapters" }
-gate4agent-types = { path = "../gate4agent-types" }
+gate4agent = { path = "../..", version = "0.4.1" }
+gate4agent-adapters = { path = "../gate4agent-adapters", version = "0.4.1" }
+gate4agent-types = { path = "../gate4agent-types", version = "0.4.1" }
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 
 [dev-dependencies]
-gate4agent-catalog = { path = "../gate4agent-catalog" }
+gate4agent-catalog = { path = "../gate4agent-catalog", version = "0.4.1" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

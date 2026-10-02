@@ -3,22 +3,22 @@ name = "gate4agent-runtime-native"
 version = "0.4.1"
 edition = "2021"
 description = "Tick-driven native runtime that embeds the gate4agent provider stack in an owning app core"
-publish = false
+license = "MIT"
 
 [dependencies]
-gate4agent-adapters = { path = "../gate4agent-adapters" }
-gate4agent-catalog = { path = "../gate4agent-catalog" }
-gate4agent-handle = { path = "../gate4agent-handle" }
-gate4agent-kernel = { path = "../gate4agent-kernel" }
-gate4agent-provider-ports = { path = "../gate4agent-provider-ports" }
-gate4agent-shell-history = { path = "../gate4agent-shell-history" }
-gate4agent-shell-capabilities = { path = "../gate4agent-shell-capabilities" }
-gate4agent-shell-native = { path = "../gate4agent-shell-native" }
-gate4agent-tool-engine = { path = "../gate4agent-tool-engine" }
-gate4agent-types = { path = "../gate4agent-types" }
+gate4agent-adapters = { path = "../gate4agent-adapters", version = "0.4.1" }
+gate4agent-catalog = { path = "../gate4agent-catalog", version = "0.4.1" }
+gate4agent-handle = { path = "../gate4agent-handle", version = "0.4.1" }
+gate4agent-kernel = { path = "../gate4agent-kernel", version = "0.4.1" }
+gate4agent-provider-ports = { path = "../gate4agent-provider-ports", version = "0.4.1" }
+gate4agent-shell-history = { path = "../gate4agent-shell-history", version = "0.4.1" }
+gate4agent-shell-capabilities = { path = "../gate4agent-shell-capabilities", version = "0.4.1" }
+gate4agent-shell-native = { path = "../gate4agent-shell-native", version = "0.4.1" }
+gate4agent-tool-engine = { path = "../gate4agent-tool-engine", version = "0.4.1" }
+gate4agent-types = { path = "../gate4agent-types", version = "0.4.1" }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
-gate4agent-testkit = { path = "../gate4agent-testkit" }
+gate4agent-testkit = { path = "../gate4agent-testkit", version = "0.4.1" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

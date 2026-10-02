@@ -108,6 +108,7 @@ use crate::protocol::{
     BlockAuthorityV1, HarnessMcpLaunchV1, SessionHistorySummaryV1, MAX_ACP_BLOCKED_HELP_BYTES, MAX_ACP_BLOCKED_REASON_BYTES,
     StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind, WorktreeProfileId,
     SpawnContextId, SpawnEnvironmentProfileId, SpawnIdempotencyKey,
+    SpawnNetworkAllowlistId,
     SpawnProfileDefaults, SpawnRequiredCapabilities, SpawnSpec, SpawnSpecResolveError,
     WorkspaceFileContent, WorkspaceFileRevision,
     WorkspaceFileRead, WorkspaceId, WorkspaceInspection, WorkspaceInspectionTruncationV1,
@@ -194,7 +195,7 @@ use gate4agent_types::{
     SessionStatus, TerminalFrame, TransportKind, CONTROL_SESSIONS_MAX,
     HISTORY_DISCOVERY_LIMIT_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -2886,6 +2887,12 @@ struct NodeShared {
         RwLock<BTreeMap<SpawnEnvironmentProfileId, EnvironmentProfileBinding>>,
     environment_materialization_profiles:
         RwLock<BTreeMap<SpawnEnvironmentProfileId, NodeSessionMaterializationProfile>>,
+    /// Station **network** allowlist catalog (opaque policy ids only).
+    /// Empty by default — any `network_allowlist` on spawn must be registered
+    /// here or resolve refuses with `UnknownNetworkAllowlist`. Plan
+    /// `station-network-and-browser-profile-knobs-2026-10-02.md` §2.1 / §4.
+    /// Never holds cookies / OAuth / proxy credentials.
+    network_allowlist_catalog: RwLock<BTreeSet<SpawnNetworkAllowlistId>>,
     bundle_catalog: RwLock<BundleCatalog>,
     delivery_store: Mutex<Option<DeliveryStore>>,
     context_pack_store: Mutex<Option<ContextPackStore>>,
@@ -3298,6 +3305,7 @@ impl NodeShared {
             spawn_profiles,
             environment_profiles: RwLock::new(BTreeMap::new()),
             environment_materialization_profiles: RwLock::new(BTreeMap::new()),
+            network_allowlist_catalog: RwLock::new(BTreeSet::new()),
             bundle_catalog: RwLock::new(BundleCatalog::default()),
             delivery_store: Mutex::new(None),
             context_pack_store: Mutex::new(None),
@@ -3538,6 +3546,23 @@ impl NodeShared {
         &self,
         resolved: &ResolvedSpawnSpec,
     ) -> Result<Option<ResolvedEnvironmentProfileReceipt>, NodeFailure> {
+        // Station network allowlist catalog enforce (plan
+        // station-network-and-browser-profile-knobs §2.1 / §4): empty-default
+        // catalog — unknown ids refuse rather than silent ambient. Runs even
+        // when no environment_profile_id is present so a bare allowlist still
+        // cannot bypass the catalog. Never cookies / OAuth / proxy credentials.
+        if let Some(allowlist_id) = resolved.network_allowlist.as_ref() {
+            let catalog = self
+                .network_allowlist_catalog
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !catalog.contains(allowlist_id) {
+                return Err(failure(
+                    NodeFailureCode::UnknownNetworkAllowlist,
+                    "spawn network allowlist is unavailable on this node",
+                ));
+            }
+        }
         let Some(profile_id) = resolved.environment_profile_id.as_ref() else {
             return Ok(None);
         };
@@ -3560,14 +3585,14 @@ impl NodeShared {
             ));
         }
         // Station knobs (plan station-network-and-browser-profile-knobs §4.3):
-        // echo opaque network_allowlist / browser_profile_id onto the receipt.
-        // Empty/whitespace ids already refuse at Spawn*Id construction.
-        // Dig2browser-station reachability: **no cheap local probe exists in
-        // gate4agent** (station client lives in dig2browser named-pipe IPC and
-        // is not a g4a dependency). Do **not** refuse when browser_profile_id
-        // is set but station is unreachable until such a probe lands — this
-        // slice is refuse-unknown-empty only (type-level). Never put cookies /
-        // OAuth / proxy credentials on C2.
+        // echo opaque network_allowlist / browser_profile_id onto the receipt
+        // after catalog enforce above. Empty/whitespace ids already refuse at
+        // Spawn*Id construction. Dig2browser-station reachability: **no cheap
+        // local probe exists in gate4agent** (station client lives in
+        // dig2browser named-pipe IPC and is not a g4a dependency). Do **not**
+        // refuse when browser_profile_id is set but station is unreachable
+        // until such a probe lands — browser_profile dig2 probe remains stub.
+        // Never put cookies / OAuth / proxy credentials on C2.
         Ok(Some(ResolvedEnvironmentProfileReceipt {
             profile_id: binding.id.clone(),
             profile_revision: binding.revision.clone(),
@@ -16432,6 +16457,7 @@ fn node_failure_category(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::UnsupportedTransport => "unsupported-transport",
         NodeFailureCode::TurnInFlight => "turn-in-flight",
         NodeFailureCode::UnknownEnvironmentProfile => "unknown-environment-profile",
+        NodeFailureCode::UnknownNetworkAllowlist => "unknown-network-allowlist",
         NodeFailureCode::EnvironmentProfileBindingMismatch => {
             "environment-profile-binding-mismatch"
         }
@@ -17093,14 +17119,53 @@ mod station_knobs_resolve_tests {
         (shared, spawn_defaults)
     }
 
-    /// Resolve echoes station network_allowlist + browser_profile_id onto the
-    /// env-profile receipt. Empty/whitespace refuse is type-level. Dig2browser
-    /// station reachability refuse is stubbed (no cheap g4a-local probe).
+    /// Empty-default catalog refuses unknown network_allowlist ids.
+    /// Dig2browser station reachability refuse stays stubbed.
     #[test]
-    fn resolve_environment_profile_echoes_station_network_and_browser_knobs() {
+    fn resolve_environment_profile_refuses_unknown_network_allowlist() {
+        let (shared, defaults) = station_knobs_fixture();
+        let unknown = crate::protocol::SpawnNetworkAllowlistId::new("not-registered").unwrap();
+        let browser = crate::protocol::SpawnBrowserProfileId::new("station-profile-a").unwrap();
+        let spec = crate::protocol::SpawnSpec {
+            target: crate::protocol::SpawnTarget {
+                node_id: shared.node_id.clone(),
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: defaults.profile_id.clone(),
+            expected_profile_revision: defaults.revision.clone(),
+            overrides: crate::protocol::SpawnOverrides {
+                network_allowlist: Some(unknown),
+                browser_profile_id: Some(browser),
+                ..crate::protocol::SpawnOverrides::default()
+            },
+            deadline_ms: crate::protocol::SpawnDeadlineMs::new(30_000).unwrap(),
+            idempotency_key: crate::protocol::SpawnIdempotencyKey::new(
+                "station-knobs-unknown-allowlist",
+            )
+            .unwrap(),
+            required_capabilities: crate::protocol::SpawnRequiredCapabilities::default(),
+        };
+        let resolved = spec.resolve(&defaults).unwrap();
+        let failure = shared
+            .resolve_environment_profile(&resolved)
+            .expect_err("unknown allowlist must refuse");
+        assert_eq!(failure.code, NodeFailureCode::UnknownNetworkAllowlist);
+    }
+
+    /// Registered network_allowlist + browser_profile_id echo onto the
+    /// env-profile receipt. Empty catalog still allows omit (None). Empty/
+    /// whitespace refuse is type-level. Dig2browser dig2 probe remains stub.
+    #[test]
+    fn resolve_environment_profile_echoes_registered_station_network_and_browser_knobs() {
         let (shared, defaults) = station_knobs_fixture();
         let allowlist = crate::protocol::SpawnNetworkAllowlistId::new("egress-default").unwrap();
         let browser = crate::protocol::SpawnBrowserProfileId::new("station-profile-a").unwrap();
+        shared
+            .network_allowlist_catalog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(allowlist.clone());
         let spec = crate::protocol::SpawnSpec {
             target: crate::protocol::SpawnTarget {
                 node_id: shared.node_id.clone(),

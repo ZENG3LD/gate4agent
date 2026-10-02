@@ -498,8 +498,9 @@ pub struct SpawnEnvironmentProfileRevision(String);
 ///
 /// Ids / digests only on C2 — never cookies, OAuth material, or proxy
 /// credentials. See hatchery-websession-docs plan
-/// `station-network-and-browser-profile-knobs-2026-10-02.md`. Enforcement and
-/// dig2browser station bind / catalog enforce are later; resolve echoes the id.
+/// `station-network-and-browser-profile-knobs-2026-10-02.md`. Node catalog
+/// enforce refuses unknown ids (`UnknownNetworkAllowlist`); dig2browser
+/// station bind remains stubbed until a cheap g4a-local probe exists.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SpawnNetworkAllowlistId(String);
@@ -1016,8 +1017,9 @@ impl<T> Default for SpawnOverride<T> {
 /// plan `station-network-and-browser-profile-knobs-2026-10-02.md` and research
 /// `station-profile-and-os-sandbox-matrix-2026-10-02.md`. Secrets stay on
 /// the node; C2 carries ids/receipts only (`C2 → node → drivers`). Resolve
-/// echoes ids onto env-profile receipts; dig2browser station IPC bind /
-/// reachability refuse waits on a cheap g4a-local probe (stubbed on node).
+/// echoes registered network allowlist ids onto env-profile receipts (empty-
+/// default catalog refuse); dig2browser station IPC bind / reachability
+/// refuse waits on a cheap g4a-local probe (stubbed on node).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpawnOverrides {
@@ -1042,9 +1044,10 @@ pub struct SpawnOverrides {
     /// Optional station **network** allowlist policy id (node-local catalog).
     /// Opaque id only — never credentials. Plan:
     /// `station-network-and-browser-profile-knobs-2026-10-02.md` §2.1 / §4.
-    /// Resolve echoes this onto `ResolvedEnvironmentProfileReceipt`. Empty /
-    /// whitespace ids refuse at type construction; unknown-catalog enforce
-    /// is later. Dig2browser bind is separate (`browser_profile_id`).
+    /// Resolve echoes this onto `ResolvedEnvironmentProfileReceipt` when the
+    /// id is registered in the node-local catalog (empty by default). Empty /
+    /// whitespace ids refuse at type construction; unknown ids refuse with
+    /// `UnknownNetworkAllowlist`. Dig2browser bind is separate (`browser_profile_id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_allowlist: Option<SpawnNetworkAllowlistId>,
     /// Optional dig2browser station **browserProfile** id (`profiles_root`).
@@ -1318,9 +1321,9 @@ pub struct ResolvedSpawnSpec {
     pub approval_level: ApprovalLevel,
     /// Opaque station **network** allowlist policy id from
     /// `SpawnOverrides::network_allowlist` (pass-through). Empty/whitespace
-    /// ids are refused at `SpawnNetworkAllowlistId` construction. Catalog
-    /// enforcement of unknown policy ids is a later slice — this field only
-    /// carries the id for receipt echo.
+    /// ids are refused at `SpawnNetworkAllowlistId` construction. Unknown
+    /// catalog ids refuse at node resolve (`UnknownNetworkAllowlist`); this
+    /// field carries the id for receipt echo when registered.
     pub network_allowlist: Option<SpawnNetworkAllowlistId>,
     /// Opaque dig2browser station **browserProfile** id from
     /// `SpawnOverrides::browser_profile_id` (pass-through). Empty/whitespace
@@ -7214,6 +7217,12 @@ pub enum NodeFailureCode {
     ContextPackBusy,
     ContextPackMaterializationFailed,
     UnknownEnvironmentProfile,
+    /// Station network allowlist policy id is not registered in this node's
+    /// empty-default catalog (`NodeShared::network_allowlist_catalog`).
+    /// Plan `station-network-and-browser-profile-knobs-2026-10-02.md` §2.1 /
+    /// §4 — refuse unknown ids rather than silent ambient. Opaque id only;
+    /// never credentials on C2.
+    UnknownNetworkAllowlist,
     BundleBindingMismatch,
     EnvironmentProfileBindingMismatch,
     BundleMaterializationFailed,

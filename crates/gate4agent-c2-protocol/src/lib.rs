@@ -288,6 +288,9 @@ impl From<&NodeFailure> for C2NodeFailure {
             NodeFailureCode::UnknownEnvironmentProfile => {
                 "environment profile unavailable"
             }
+            NodeFailureCode::UnknownNetworkAllowlist => {
+                "network allowlist unavailable"
+            }
             NodeFailureCode::BundleBindingMismatch => {
                 "session bundle binding mismatch"
             }

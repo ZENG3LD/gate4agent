@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-c2-protocol"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2021"
 description = "Stable, serde-only inventory and control wire contract for gate4agent C2 relays and clients"
 license = "MIT"
@@ -9,9 +9,9 @@ license = "MIT"
 name = "gate4agent_c2_protocol"
 
 [dependencies]
-gate4agent-build-stamp = { path = "../gate4agent-build-stamp", version = "0.4.7" }
-gate4agent-node-protocol = { path = "../gate4agent-node-protocol", version = "0.4.7" }
-gate4agent-types = { path = "../gate4agent-types", version = "0.4.7" }
+gate4agent-build-stamp = { path = "../gate4agent-build-stamp", version = "0.4.8" }
+gate4agent-node-protocol = { path = "../gate4agent-node-protocol", version = "0.4.8" }
+gate4agent-types = { path = "../gate4agent-types", version = "0.4.8" }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

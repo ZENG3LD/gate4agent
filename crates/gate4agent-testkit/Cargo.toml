@@ -1,10 +1,10 @@
 [package]
 name = "gate4agent-testkit"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2021"
 description = "Authentication-free provider fixtures and the Windows headless test supervisor for gate4agent"
 license = "MIT"
 
 [dependencies]
-gate4agent-adapters = { path = "../gate4agent-adapters", version = "0.4.5" }
-gate4agent-types = { path = "../gate4agent-types", version = "0.4.5" }
+gate4agent-adapters = { path = "../gate4agent-adapters", version = "0.4.6" }
+gate4agent-types = { path = "../gate4agent-types", version = "0.4.6" }

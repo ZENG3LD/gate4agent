@@ -3,6 +3,8 @@
 mod auth;
 mod call_home;
 mod client;
+#[cfg(feature = "mesh-underlay")]
+pub mod mesh_underlay;
 #[cfg(windows)]
 mod windows_secure_pipe;
 #[cfg(unix)]

@@ -27,8 +27,10 @@ ring = "=0.17.14"
 
 [dev-dependencies]
 gate4agent-types = { path = "../gate4agent-types", version = "0.4.4" }
-tokio = { version = "1", features = ["macros", "net", "rt"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread"] }
 
 [features]
-default = []
+default = ["mesh-underlay"]
+# Tip-5 Linux-first underlay slice (UDP+AEAD + token barrier). Disable to omit.
+mesh-underlay = []
 fixture = []

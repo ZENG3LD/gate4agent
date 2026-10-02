@@ -197,6 +197,7 @@ install them.
 
 ## Versioning
 
+- **0.4.1** — ordinary patch bump after websession→master merge (bridge skeleton, Claude ProviderHome `--settings` network overlay, dig2 station probe/lease). Same first crates.io wave crates; **not published to crates.io from this tip** (owner publish later).
 - **0.4.0** — breaking: non-fleet vendors cut (Gemini, OpenCode, Qwen
   parsers, pipe builders and history readers removed); the `rusqlite`
   dependency is gone, so the transport core no longer pins

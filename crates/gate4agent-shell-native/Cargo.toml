@@ -1,25 +1,25 @@
 [package]
 name = "gate4agent-shell-native"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2021"
 description = "Native effect execution (PTY, pipe, ACP) for gate4agent control-plane sessions"
 license = "MIT"
 
 [dependencies]
-gate4agent = { path = "../..", version = "0.4.6" }
-gate4agent-adapters = { path = "../gate4agent-adapters", version = "0.4.6" }
-gate4agent-catalog = { path = "../gate4agent-catalog", version = "0.4.6" }
-gate4agent-handle = { path = "../gate4agent-handle", version = "0.4.6" }
-gate4agent-shell-one-shot = { path = "../gate4agent-shell-one-shot", version = "0.4.6" }
-gate4agent-tool-protocol = { path = "../gate4agent-tool-protocol", version = "0.4.6" }
-gate4agent-types = { path = "../gate4agent-types", version = "0.4.6" }
+gate4agent = { path = "../..", version = "0.4.7" }
+gate4agent-adapters = { path = "../gate4agent-adapters", version = "0.4.7" }
+gate4agent-catalog = { path = "../gate4agent-catalog", version = "0.4.7" }
+gate4agent-handle = { path = "../gate4agent-handle", version = "0.4.7" }
+gate4agent-shell-one-shot = { path = "../gate4agent-shell-one-shot", version = "0.4.7" }
+gate4agent-tool-protocol = { path = "../gate4agent-tool-protocol", version = "0.4.7" }
+gate4agent-types = { path = "../gate4agent-types", version = "0.4.7" }
 tokio = { version = "1", features = ["time"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-gate4agent-kernel = { path = "../gate4agent-kernel", version = "0.4.6" }
-gate4agent-testkit = { path = "../gate4agent-testkit", version = "0.4.6" }
+gate4agent-kernel = { path = "../gate4agent-kernel", version = "0.4.7" }
+gate4agent-testkit = { path = "../gate4agent-testkit", version = "0.4.7" }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

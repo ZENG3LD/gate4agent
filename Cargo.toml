@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2021"
 description = "Transport library for CLI AI agents — first tier: Claude Code, Codex, Kimi, Grok. Pipe, PTY, ACP (Agent Client Protocol), and Daemon transports."
 license = "MIT"
@@ -10,12 +10,12 @@ keywords = ["claude", "agent", "cli", "pipe", "pty"]
 categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
-gate4agent-types = { path = "crates/gate4agent-types", version = "0.4.6" }
-gate4agent-catalog = { path = "crates/gate4agent-catalog", version = "0.4.6" }
+gate4agent-types = { path = "crates/gate4agent-types", version = "0.4.7" }
+gate4agent-catalog = { path = "crates/gate4agent-catalog", version = "0.4.7" }
 
 # PTY creation and cross-platform ConPTY support (in-house: ConPTY on
 # Windows, posix_openpt/fork+exec on unix; std-only, no external deps)
-gate4agent-pty = { path = "crates/gate4agent-pty", version = "0.4.6" }
+gate4agent-pty = { path = "crates/gate4agent-pty", version = "0.4.7" }
 
 # ANSI escape sequence stripping (VteParser)
 vte = "0.13"

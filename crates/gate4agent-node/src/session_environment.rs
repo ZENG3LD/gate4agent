@@ -46,7 +46,9 @@ const MATERIALIZATION_LOCK_NAME: &str = ".gate4agent-materialization-lock";
 /// **sandbox** is the separate `ApprovalLevel` / catalog argv axis;
 /// **network** and **browserProfile** are not first-class on spawn yet — see
 /// hatchery-websession-docs
-/// `research/station-profile-and-os-sandbox-matrix-2026-10-02.md`.
+/// `research/station-profile-and-os-sandbox-matrix-2026-10-02.md` and plan
+/// `station-network-and-browser-profile-knobs-2026-10-02.md` (ids on node;
+/// secrets never on C2; `C2 → node → drivers` + dig2browser station IPC).
 const CODEX_HOME_ENVIRONMENT_KEY: &str = "CODEX_HOME";
 const CONTEXT_ROOT_ENVIRONMENT_KEY: &str = "GATE4AGENT_CONTEXT_ROOT";
 pub(crate) const CONTEXT_PACK_FILE_NAME: &str = "context-pack.json";

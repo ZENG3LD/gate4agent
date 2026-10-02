@@ -975,6 +975,16 @@ impl<T> Default for SpawnOverride<T> {
     }
 }
 
+/// Spawn-time overrides for an accepted `SpawnSpec`.
+///
+/// Station-profile axes (design ledger): `environment_profile_id` covers
+/// **providerHome** bindings; workspace target covers **cwd**;
+/// `approval_level` is the partial **sandbox** axis. **network** allowlist
+/// and optional dig2browser **browserProfile** id are **not** fields here
+/// yet — see hatchery-websession-docs plan
+/// `station-network-and-browser-profile-knobs-2026-10-02.md` and research
+/// `station-profile-and-os-sandbox-matrix-2026-10-02.md`. Secrets stay on
+/// the node; C2 carries ids/receipts only (`C2 → node → drivers`).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpawnOverrides {
@@ -1306,6 +1316,14 @@ impl SpawnPromptMetadata {
     }
 }
 
+/// Resolved environment-profile identity echoed on spawn receipts.
+///
+/// Id + revision only — does **not** serialize sandbox/network/browser
+/// axes or secret material. Planned station knobs (`network` allowlist,
+/// optional dig2browser `browserProfile` id) stay node-local when added;
+/// receipts should keep echoing opaque ids only (never cookies/OAuth/
+/// proxy credentials on C2). See hatchery-websession-docs plan
+/// `station-network-and-browser-profile-knobs-2026-10-02.md`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedEnvironmentProfileReceipt {

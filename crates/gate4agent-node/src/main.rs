@@ -1,9 +1,11 @@
 use gate4agent_node::{
     default_node_endpoint, default_state_path, ManagedWorktreeProfile, NodeServer,
-    HistorySourceLayout, NativeHistoryConfig, NativeHistoryRoot, NodeServerConfig,
+    HistorySourceLayout, NativeHistoryConfig, NativeHistoryRoot, NodeSecretReference,
+    NodeSecretResolveError, NodeSecretResolver, NodeSecretValue, NodeServerConfig,
     WorkspaceConfig, WorktreeServiceMode, NETWORK_ALLOWLIST_CATALOG_ENV,
     resolve_network_allowlist_catalog,
 };
+use std::sync::Arc;
 use gate4agent_node::protocol::{
     ManagedWorktreeRetention, NodeId, SessionRecordRetentionConfig, WorktreeProfileId,
     WorktreeProfileRevision, WorkspaceId,
@@ -204,6 +206,7 @@ async fn main() {
                 println!("optional bridge token: {BRIDGE_TOKEN_ENV} (never logged; distinct from control token)");
                 println!("--bridge-underlay-listen: tip 6 mesh underlay UDP accept → TCP relay to --bridge-listen (requires {BRIDGE_TOKEN_ENV} + {MESH_UNDERLAY_KEY_ENV} + {MESH_UNDERLAY_TOKEN_ENV}; HQ dial-only; no WG daemon)");
                 println!("network allowlist catalog: --network-allowlist-catalog or {NETWORK_ALLOWLIST_CATALOG_ENV} (opaque ids, one per line; empty default)");
+                println!("session environment: materialized beside the state file (<state-file>.session-environments); secret references fail closed");
                 println!("--c2-dial: dial a relay's call-home listener instead of waiting to be dialled");
                 return;
             }
@@ -231,7 +234,7 @@ async fn main() {
     }
     let state_path = default_state_path(&node_id).unwrap_or_else(|error| fail(&error.to_string()));
     let config = NodeServerConfig::new(endpoint, token, node_id, workspaces)
-        .and_then(|config| config.with_state_path(state_path))
+        .and_then(|config| config.with_state_path(&state_path))
         .and_then(|config| config.with_api_listen(api_listen))
         .and_then(|config| match bridge_listen {
             Some(addr) => config.with_bridge_listen(addr),
@@ -296,10 +299,55 @@ async fn main() {
     let config = config
         .with_network_allowlist_catalog(allowlist_catalog)
         .unwrap_or_else(|error| fail(&error.to_string()));
+    // Same API the materialization tests use. The stock CLI has no secret
+    // store: a reference resolves Unavailable and materialize stays fail-closed.
+    // Root sits beside the durable state file so a bundle spawn can prepare
+    // a session environment before the child exists.
+    let config = with_cli_session_environment_materialization(config, &state_path)
+        .unwrap_or_else(|error| fail(&error));
     let server = NodeServer::new(config).unwrap_or_else(|error| fail(&error.to_string()));
     if let Err(error) = server.run_until_ctrl_signal().await {
         fail(&error.to_string());
     }
+}
+
+/// Stock CLI secret resolver. There is no secret product here: any
+/// reference is unavailable, so a profile that needs a secret fails closed
+/// inside materialize instead of inventing a value.
+struct CliUnavailableSecretResolver;
+
+impl NodeSecretResolver for CliUnavailableSecretResolver {
+    fn resolve(
+        &self,
+        _reference: &NodeSecretReference,
+    ) -> Result<NodeSecretValue, NodeSecretResolveError> {
+        Err(NodeSecretResolveError::Unavailable)
+    }
+}
+
+/// Sibling of the state file, same shape as the delivery store root
+/// (`<file>.delivery-store` → `<file>.session-environments`).
+fn session_environment_root_for_state_path(state_path: &std::path::Path) -> Result<PathBuf, String> {
+    let parent = state_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "state path has no parent for the session-environment root".to_owned())?;
+    let file_name = state_path.file_name().ok_or_else(|| {
+        "state path has no file name for the session-environment root".to_owned()
+    })?;
+    let mut name = file_name.to_os_string();
+    name.push(".session-environments");
+    Ok(parent.join(name))
+}
+
+fn with_cli_session_environment_materialization(
+    config: NodeServerConfig,
+    state_path: &std::path::Path,
+) -> Result<NodeServerConfig, String> {
+    let root = session_environment_root_for_state_path(state_path)?;
+    config
+        .with_session_environment_materialization(root, Arc::new(CliUnavailableSecretResolver))
+        .map_err(|error| error.to_string())
 }
 
 fn explicit_history_config(
@@ -400,6 +448,7 @@ fn fail(message: &str) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gate4agent_node::NodeServerError;
 
     #[test]
     fn node_history_is_disabled_without_explicit_history_root() {
@@ -438,5 +487,72 @@ mod tests {
     fn session_record_retention_keep_refuses_a_non_numeric_value_by_name() {
         let error = parse_session_record_retention_keep("not-a-number").unwrap_err();
         assert!(error.starts_with("--session-record-retention-keep is invalid: "));
+    }
+
+    #[test]
+    fn cli_session_environment_root_sits_beside_the_state_file() {
+        let root = session_environment_root_for_state_path(std::path::Path::new(
+            "/var/lib/gate4agent/nodes/n1/state-v1.json",
+        ))
+        .unwrap();
+        assert_eq!(
+            root,
+            PathBuf::from("/var/lib/gate4agent/nodes/n1/state-v1.json.session-environments"),
+        );
+    }
+
+    #[test]
+    fn cli_secret_resolver_fails_closed() {
+        let reference = NodeSecretReference::new("fixture-secret").unwrap();
+        match CliUnavailableSecretResolver.resolve(&reference) {
+            Err(NodeSecretResolveError::Unavailable) => {}
+            Ok(_) => panic!("cli secret resolver must not return a value"),
+            Err(other) => panic!("expected unavailable, got {other}"),
+        }
+    }
+
+    #[test]
+    fn cli_materializer_initializes_from_the_state_path() {
+        let scratch = std::env::temp_dir().join(format!(
+            "g4a-cli-mat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let workspace = scratch.join("workspace");
+        let state_parent = scratch.join("node");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&state_parent).unwrap();
+        let state_path = state_parent.join("state-v1.json");
+        let endpoint = scratch.join("node.sock");
+        let config = NodeServerConfig::new(
+            endpoint.to_string_lossy().as_ref(),
+            "fixture-token",
+            NodeId::new("cli-mat").unwrap(),
+            [WorkspaceConfig::new(WorkspaceId::new("primary").unwrap(), &workspace).unwrap()],
+        )
+        .unwrap()
+        .with_state_path(&state_path)
+        .unwrap();
+        let bare = config.clone();
+        let config = with_cli_session_environment_materialization(config, &state_path).unwrap();
+        let server = NodeServer::new(config).unwrap();
+        drop(server);
+        let marker = session_environment_root_for_state_path(&state_path)
+            .unwrap()
+            .join(".gate4agent-materialization-root");
+        assert!(marker.is_file(), "materializer did not initialize beside the state file");
+        match bare.with_session_environment_materialization(
+            PathBuf::from("relative-root"),
+            Arc::new(CliUnavailableSecretResolver),
+        ) {
+            Err(NodeServerError::InvalidSessionEnvironmentRoot) => {}
+            Ok(_) => panic!("relative session-environment root must be refused"),
+            Err(other) => panic!("expected invalid root, got {other}"),
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

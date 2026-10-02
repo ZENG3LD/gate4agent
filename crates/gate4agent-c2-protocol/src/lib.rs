@@ -5102,6 +5102,7 @@ mod tests {
                 revision: SpawnBundleRevision::new("v1").unwrap(),
                 digest: SpawnBundleDigest::new(format!("sha256:{}", "0".repeat(64))).unwrap(),
             }]),
+            network_allowlists: None,
         };
         let snapshot = NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),

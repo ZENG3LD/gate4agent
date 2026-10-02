@@ -10042,6 +10042,19 @@ impl NodeShared {
                         .map(NodeBundle::receipt)
                         .collect(),
                 ),
+                // Opaque station allowlist ids from empty-default catalog /
+                // optional startup loader. Never secrets. Dig2 probe stays stub.
+                network_allowlists: {
+                    let catalog = self
+                        .network_allowlist_catalog
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if catalog.is_empty() {
+                        None
+                    } else {
+                        Some(catalog.iter().cloned().collect())
+                    }
+                },
             }),
             agent_progress,
         }
@@ -13070,7 +13083,10 @@ fn snapshot_for_wire(
         if !include_session_bundles {
             inventory.bundles = None;
         }
-        if inventory.spawn_profiles.is_none() && inventory.bundles.is_none() {
+        if inventory.spawn_profiles.is_none()
+            && inventory.bundles.is_none()
+            && inventory.network_allowlists.is_none()
+        {
             snapshot.launch_inventory = None;
         }
     }
@@ -17332,7 +17348,30 @@ mod station_knobs_resolve_tests {
             .expect("env profile present");
         assert_eq!(receipt.network_allowlist.as_ref(), Some(&allowlist));
     }
+
+    /// Snapshot launch inventory echoes registered catalog ids (opaque).
+    /// Dig2browser dig2 probe remains stub. Never secrets on C2.
+    #[test]
+    fn snapshot_launch_inventory_lists_network_allowlist_catalog_ids() {
+        let (shared, _defaults) = station_knobs_fixture();
+        let allowlist = crate::protocol::SpawnNetworkAllowlistId::new("egress-default").unwrap();
+        shared
+            .network_allowlist_catalog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(allowlist.clone());
+        let snapshot = shared.snapshot();
+        let inventory = snapshot
+            .launch_inventory
+            .expect("launch inventory present");
+        let ids = inventory
+            .network_allowlists
+            .expect("non-empty catalog surfaces ids");
+        assert_eq!(ids, vec![allowlist]);
+    }
+
 }
+
 
 #[cfg(test)]
 mod workspace_environment_collision_tests {

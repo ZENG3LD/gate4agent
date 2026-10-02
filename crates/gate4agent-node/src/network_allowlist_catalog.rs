@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Soft bound on station network allowlist catalog membership (ids only).
-pub const MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES: usize = 128;
+pub use crate::protocol::MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES;
 
 /// Env path to an optional allowlist-id catalog file (absolute regular file).
 /// Unset → empty catalog (deny unknown at resolve). Never a secret store.

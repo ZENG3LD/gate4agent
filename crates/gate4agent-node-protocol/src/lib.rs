@@ -123,6 +123,9 @@ pub const MAX_SESSION_DISPLAY_NAME_BYTES: usize = 256;
 pub const MAX_SPAWN_PROFILE_ID_BYTES: usize = 64;
 pub const MAX_SPAWN_PROFILE_REVISION_BYTES: usize = 128;
 pub const MAX_SPAWN_PROFILES: usize = 64;
+
+/// Soft bound on station network allowlist catalog ids exposed on launch inventory.
+pub const MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES: usize = 128;
 pub const MAX_SPAWN_ENVIRONMENT_PROFILE_REVISION_BYTES: usize = 128;
 pub const MAX_SPAWN_BUNDLE_REVISION_BYTES: usize = 128;
 pub const MAX_SPAWN_RESOURCE_ID_BYTES: usize = 128;
@@ -1451,6 +1454,11 @@ pub struct LaunchInventory {
     pub spawn_profiles: Option<Vec<SpawnProfileSummary>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundles: Option<Vec<ResolvedBundleReceipt>>,
+    /// Station network allowlist catalog ids registered on this node (opaque).
+    /// Empty/None when unset. Never cookies / OAuth / proxy credentials.
+    /// Dig2browser dig2 probe stays stubbed elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_allowlists: Option<Vec<SpawnNetworkAllowlistId>>,
 }
 
 impl<'de> Deserialize<'de> for LaunchInventory {
@@ -1465,17 +1473,42 @@ impl<'de> Deserialize<'de> for LaunchInventory {
             spawn_profiles: Option<BoundedSpawnProfiles>,
             #[serde(default)]
             bundles: Option<BoundedLaunchBundles>,
+            #[serde(default)]
+            network_allowlists: Option<Vec<SpawnNetworkAllowlistId>>,
         }
 
         let wire = WireInventory::deserialize(deserializer)?;
-        if wire.spawn_profiles.is_none() && wire.bundles.is_none() {
+        if wire.spawn_profiles.is_none()
+            && wire.bundles.is_none()
+            && wire.network_allowlists.is_none()
+        {
             return Err(serde::de::Error::custom(
                 "launch inventory must expose at least one negotiated component",
             ));
         }
+        let network_allowlists = match wire.network_allowlists {
+            None => None,
+            Some(ids) => {
+                if ids.len() > MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES {
+                    return Err(serde::de::Error::custom(
+                        "launch inventory network allowlist catalog exceeds bound",
+                    ));
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                for id in &ids {
+                    if !seen.insert(id.clone()) {
+                        return Err(serde::de::Error::custom(
+                            "launch inventory contains duplicate network allowlist id",
+                        ));
+                    }
+                }
+                Some(ids)
+            }
+        };
         Ok(Self {
             spawn_profiles: wire.spawn_profiles.map(|profiles| profiles.0),
             bundles: wire.bundles.map(|bundles| bundles.0),
+            network_allowlists,
         })
     }
 }
@@ -10009,6 +10042,7 @@ mod tests {
         let current = LaunchInventory {
             spawn_profiles: Some(Vec::new()),
             bundles: Some(Vec::new()),
+            network_allowlists: None,
         };
         assert_eq!(
             serde_json::to_string(&current).unwrap(),

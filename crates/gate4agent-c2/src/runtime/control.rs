@@ -4680,6 +4680,7 @@ mod tests {
                 ))
                 .unwrap(),
             }]),
+            network_allowlists: None,
         };
         let snapshot = crate::protocol::C2NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),

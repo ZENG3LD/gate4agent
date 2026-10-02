@@ -29,6 +29,12 @@ const MATERIALIZATION_ROOT_MARKER: &[u8] = b"gate4agent-node-session-environment
 const MATERIALIZATION_OWNER_MARKER: &str = ".gate4agent-materialization-owner";
 const MATERIALIZATION_ROOT_MARKER_NAME: &str = ".gate4agent-materialization-root";
 const MATERIALIZATION_LOCK_NAME: &str = ".gate4agent-materialization-lock";
+/// Exclusive ProviderHome env key for Codex bundle layout (`supports_bundle_layout`).
+/// Other provider relocation vars (`CLAUDE_CONFIG_DIR`, `KIMI_CODE_HOME`, `GROK_HOME`)
+/// are already expressible as generic `NodeSessionPathBinding` → `ProviderHome`
+/// profile data (no hard-coded gate here). Node-level multi-config = one owner
+/// contour; multi-private-Max fleet orchestration is hatchery-across-nodes.
+/// See hatchery-websession-docs research `multi-account-node-vs-hatchery-2026-10-02`.
 const CODEX_HOME_ENVIRONMENT_KEY: &str = "CODEX_HOME";
 const CONTEXT_ROOT_ENVIRONMENT_KEY: &str = "GATE4AGENT_CONTEXT_ROOT";
 pub(crate) const CONTEXT_PACK_FILE_NAME: &str = "context-pack.json";

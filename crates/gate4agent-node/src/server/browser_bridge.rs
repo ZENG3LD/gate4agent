@@ -1674,6 +1674,14 @@ mod tests {
             Err(crate::NodeServerError::BridgeUnderlayRequiresBridgeToken)
         ));
         let config = config.with_bridge_token("bridge-secret").unwrap();
+        assert!(matches!(
+            config.clone().with_bridge_underlay(
+                "127.0.0.1:0".parse().unwrap(),
+                [9u8; 32],
+                "",
+            ),
+            Err(crate::NodeServerError::InvalidBridgeUnderlayToken)
+        ));
         assert!(config
             .with_bridge_underlay("0.0.0.0:0".parse().unwrap(), [9u8; 32], "underlay-token")
             .is_ok());
@@ -1724,6 +1732,46 @@ mod tests {
         assert!(health.contains("\"hq_mesh_role\":\"dial-only\""));
         assert!(!health.contains("test-token"));
         assert!(!health.contains("GATE4AGENT"));
+
+        server.shutdown_handle().request_shutdown().await.unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bridge_health_reports_tip6_when_underlay_reach_flag_set() {
+        let server = node_server();
+        let shared = Arc::clone(&server.shared);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = BridgeAuth::from_optional(None).unwrap();
+        // underlay_reach=true flips health transport_udp_underlay without
+        // starting a real UDP accept (config barriers covered separately).
+        let task = tokio::spawn(serve_listener_with_observe_options(
+            listener,
+            auth,
+            Arc::clone(&shared),
+            Duration::from_secs(30),
+            ObserveMode::SnapshotOnly,
+            true,
+        ));
+
+        let health = http_text(
+            address,
+            "GET /bridge/health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(
+            health.starts_with("HTTP/1.1 200 OK\r\n"),
+            "unexpected health: {health}"
+        );
+        assert!(health.contains("\"transport_udp_underlay\":\"tip-6-bridge-reach\""));
+        assert!(health.contains("\"hq_mesh_role\":\"dial-only\""));
+        assert!(!health.contains("opt-in-via-bridge-underlay-listen"));
+        assert!(!health.contains("test-token"));
 
         server.shutdown_handle().request_shutdown().await.unwrap();
         timeout(Duration::from_secs(1), task)

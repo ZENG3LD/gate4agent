@@ -509,6 +509,66 @@ mod tests {
         app_task.await.unwrap();
     }
 
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tip6_bridge_multi_chunk_relay_over_underlay() {
+        use crate::mesh_underlay::{serve_bridge_tcp_relay, BridgeUnderlayClient};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let transport = UnderlayTransportKey::from_bytes([13u8; 32]);
+        let underlay_auth = UnderlayAuthToken::new("underlay-tip6-chunk").unwrap();
+
+        // Local app door echoes a large body so client must reassemble chunks.
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge_addr = tcp.local_addr().unwrap();
+        let payload = vec![0x5Au8; 9_000]; // > CHUNK_MAX (4090) — forces multi-frame
+        let app_task = {
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                let (mut stream, _) = tcp.accept().await.unwrap();
+                let mut buf = vec![0u8; 64];
+                let _ = stream.read(&mut buf).await;
+                stream.write_all(&payload).await.unwrap();
+                let _ = stream.shutdown().await;
+            })
+        };
+
+        let listener = accept_peer(MeshUnderlayRole::NodePeer, &transport, &underlay_auth)
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_task = {
+            let transport = transport.clone();
+            let underlay_auth = underlay_auth.clone();
+            let expect = payload.clone();
+            tokio::spawn(async move {
+                let session = dial_peer(
+                    MeshUnderlayRole::C2Peer,
+                    &transport,
+                    &underlay_auth,
+                    &addr.to_string(),
+                )
+                .await
+                .unwrap();
+                let mut client = BridgeUnderlayClient::open(session, "underlay-tip6-chunk")
+                    .await
+                    .unwrap();
+                client.write_all(b"GET /echo HTTP/1.1\r\n\r\n").await.unwrap();
+                let got = client.read_at_least(expect.len()).await.unwrap();
+                assert_eq!(got, expect, "multi-chunk reassembly mismatch");
+                client.close().await.unwrap();
+            })
+        };
+        let session = listener.accept().await.unwrap();
+        serve_bridge_tcp_relay(session, &underlay_auth, bridge_addr)
+            .await
+            .expect("authorized multi-chunk relay");
+        client_task.await.unwrap();
+        app_task.await.unwrap();
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn non_linux_accept_refuses_with_clear_platform_error() {

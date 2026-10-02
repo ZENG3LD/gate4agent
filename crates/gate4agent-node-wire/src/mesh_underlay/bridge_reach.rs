@@ -255,3 +255,42 @@ pub struct BridgeUnderlayClient;
 pub fn underlay_to_io(err: MeshUnderlayError) -> io::Error {
     io::Error::new(io::ErrorKind::Other, err.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_encode_decode_round_trip() {
+        let packet = encode_open_with_token("underlay-tip6-token").unwrap();
+        assert!(packet.starts_with(OPEN_REQ));
+        assert_eq!(decode_open_with_token(&packet).unwrap(), "underlay-tip6-token");
+    }
+
+    #[test]
+    fn open_decode_rejects_truncated_and_bad_length() {
+        assert!(decode_open_with_token(b"nope").is_err());
+        assert!(decode_open_with_token(OPEN_REQ).is_err());
+        let mut packet = OPEN_REQ.to_vec();
+        packet.extend_from_slice(&5u16.to_be_bytes());
+        packet.extend_from_slice(b"abcd"); // claims 5, has 4
+        assert!(decode_open_with_token(&packet).is_err());
+    }
+
+    #[test]
+    fn open_encode_rejects_oversized_token() {
+        let huge = "x".repeat(5_000);
+        assert_eq!(
+            encode_open_with_token(&huge),
+            Err(MeshUnderlayError::InvalidAuthToken)
+        );
+    }
+
+    #[test]
+    fn underlay_to_io_preserves_message_without_secrets() {
+        let err = underlay_to_io(MeshUnderlayError::Unauthorized);
+        let msg = err.to_string();
+        assert!(msg.contains("unauthorized") || msg.contains("Unauthorized") || msg.contains("token"));
+        assert!(!msg.contains("super-secret"));
+    }
+}

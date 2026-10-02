@@ -72,7 +72,7 @@ pub enum ApprovalLevel {
     /// No restriction: the provider CLI is launched with whatever flag
     /// grants it full autonomy (Claude `--permission-mode bypassPermissions`,
     /// Codex `--dangerously-bypass-approvals-and-sandbox`, Grok
-    /// `--permission-mode bypassPermissions`, Kimi `--yolo`). Default --
+    /// `--always-approve` / `--yolo`, Kimi `--auto`). Default --
     /// restricting is opt-in, not asking a human is the norm.
     #[default]
     FullAuto,

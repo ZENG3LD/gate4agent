@@ -40,6 +40,13 @@ const MATERIALIZATION_LOCK_NAME: &str = ".gate4agent-materialization-lock";
 /// worktree), not a second exclusivity key. See hatchery-websession-docs
 /// research `multi-account-node-vs-hatchery-2026-10-02` and plan
 /// `n-accounts-one-workspace-collision-2026-10-02`.
+///
+/// Station-profile axes (design ledger, not a type here): this materializer
+/// owns **providerHome** (+ path classes) and pairs with workspace **cwd**.
+/// **sandbox** is the separate `ApprovalLevel` / catalog argv axis;
+/// **network** and **browserProfile** are not first-class on spawn yet — see
+/// hatchery-websession-docs
+/// `research/station-profile-and-os-sandbox-matrix-2026-10-02.md`.
 const CODEX_HOME_ENVIRONMENT_KEY: &str = "CODEX_HOME";
 const CONTEXT_ROOT_ENVIRONMENT_KEY: &str = "GATE4AGENT_CONTEXT_ROOT";
 pub(crate) const CONTEXT_PACK_FILE_NAME: &str = "context-pack.json";

@@ -294,6 +294,15 @@ pub enum ApprovalLevelResolution {
 ///   every other level: this function never guesses at an unknown
 ///   provider's flag surface, and refusing is honest where the old
 ///   behaviour (silently launching with no flag at all) was not.
+///
+/// Station-profile note (docs only): this table is the **sandbox /
+/// approval** axis of `{providerHome, cwd, sandbox, network,
+/// browserProfile?}`. It does **not** encode OS Landlock/Seatbelt/Windows
+/// token choice, Codex `networkAccess`, Grok `--sandbox` profiles, or a
+/// dig2browser profile id — those remain gaps; see hatchery-websession-docs
+/// `research/station-profile-and-os-sandbox-matrix-2026-10-02.md` (Claude
+/// native Windows = no vendor sandbox; Grok Windows sandbox undocumented;
+/// Kimi has no first-party OS-sandbox matrix).
 pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> ApprovalLevelResolution {
     use ApprovalLevelResolution::{Supported, Unsupported};
     match (agent_id.as_str(), level) {

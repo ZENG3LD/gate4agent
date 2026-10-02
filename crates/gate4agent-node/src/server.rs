@@ -3562,6 +3562,8 @@ impl NodeShared {
         Ok(Some(ResolvedEnvironmentProfileReceipt {
             profile_id: binding.id.clone(),
             profile_revision: binding.revision.clone(),
+            network_allowlist: None,
+            browser_profile_id: None,
         }))
     }
 
@@ -15717,6 +15719,8 @@ fn resolved_spawn_profile_summary(
             Some(ResolvedEnvironmentProfileReceipt {
                 profile_id: binding.id.clone(),
                 profile_revision: binding.revision.clone(),
+                network_allowlist: None,
+                browser_profile_id: None,
             })
         }
     };
@@ -17095,6 +17099,8 @@ mod workspace_environment_collision_tests {
             receipts.push(ResolvedEnvironmentProfileReceipt {
                 profile_id,
                 profile_revision,
+                network_allowlist: None,
+                browser_profile_id: None,
             });
         }
         let profile_b = receipts.pop().unwrap();
@@ -17624,6 +17630,8 @@ mod tests {
             ResolvedEnvironmentProfileReceipt {
                 profile_id,
                 profile_revision,
+                network_allowlist: None,
+                browser_profile_id: None,
             },
         )
     }
@@ -17755,6 +17763,8 @@ mod tests {
             ResolvedEnvironmentProfileReceipt {
                 profile_id,
                 profile_revision,
+                network_allowlist: None,
+                browser_profile_id: None,
             },
             root,
             deny,
@@ -17878,6 +17888,8 @@ mod tests {
             ResolvedEnvironmentProfileReceipt {
                 profile_id,
                 profile_revision,
+                network_allowlist: None,
+                browser_profile_id: None,
             },
             bundle,
             root,
@@ -18571,6 +18583,8 @@ mod tests {
                 "local-claude-r2",
             )
             .unwrap(),
+            network_allowlist: None,
+            browser_profile_id: None,
         };
         let error = match shared.select_environment_profile(
                 AgentInstanceId(42),

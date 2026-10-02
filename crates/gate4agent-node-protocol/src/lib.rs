@@ -494,6 +494,27 @@ pub struct SpawnEnvironmentProfileId(String);
 #[serde(transparent)]
 pub struct SpawnEnvironmentProfileRevision(String);
 
+/// Opaque node-local **network allowlist** policy id (station axis).
+///
+/// Ids / digests only on C2 — never cookies, OAuth material, or proxy
+/// credentials. See hatchery-websession-docs plan
+/// `station-network-and-browser-profile-knobs-2026-10-02.md`. Enforcement and
+/// dig2browser station bind are later slices; this type is schema only.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SpawnNetworkAllowlistId(String);
+
+/// Opaque dig2browser station **browserProfile** id under node-local
+/// `profiles_root`.
+///
+/// Profile id string only — never cookie bytes or route credentials on C2 /
+/// IPC. See hatchery-websession-docs plan
+/// `station-network-and-browser-profile-knobs-2026-10-02.md`. Local station
+/// pipe bind is a later slice; this type is schema only.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SpawnBrowserProfileId(String);
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SpawnIdempotencyKey(String);
@@ -554,6 +575,16 @@ spawn_identifier_impl!(SpawnContextId, "spawn context", MAX_SPAWN_RESOURCE_ID_BY
 spawn_identifier_impl!(
     SpawnEnvironmentProfileId,
     "spawn environment profile",
+    MAX_SPAWN_RESOURCE_ID_BYTES
+);
+spawn_identifier_impl!(
+    SpawnNetworkAllowlistId,
+    "spawn network allowlist",
+    MAX_SPAWN_RESOURCE_ID_BYTES
+);
+spawn_identifier_impl!(
+    SpawnBrowserProfileId,
+    "spawn browser profile",
     MAX_SPAWN_RESOURCE_ID_BYTES
 );
 
@@ -979,12 +1010,13 @@ impl<T> Default for SpawnOverride<T> {
 ///
 /// Station-profile axes (design ledger): `environment_profile_id` covers
 /// **providerHome** bindings; workspace target covers **cwd**;
-/// `approval_level` is the partial **sandbox** axis. **network** allowlist
-/// and optional dig2browser **browserProfile** id are **not** fields here
-/// yet — see hatchery-websession-docs plan
-/// `station-network-and-browser-profile-knobs-2026-10-02.md` and research
+/// `approval_level` is the partial **sandbox** axis; optional
+/// `network_allowlist` + `browser_profile_id` are the **network** /
+/// dig2browser **browserProfile** axes (ids only). See hatchery-websession-docs
+/// plan `station-network-and-browser-profile-knobs-2026-10-02.md` and research
 /// `station-profile-and-os-sandbox-matrix-2026-10-02.md`. Secrets stay on
-/// the node; C2 carries ids/receipts only (`C2 → node → drivers`).
+/// the node; C2 carries ids/receipts only (`C2 → node → drivers`). Dig2browser
+/// station IPC bind is **not** wired from these fields yet.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpawnOverrides {
@@ -1006,6 +1038,18 @@ pub struct SpawnOverrides {
     /// can never resolve against a profile field that does not exist.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_level: Option<ApprovalLevel>,
+    /// Optional station **network** allowlist policy id (node-local catalog).
+    /// Opaque id only — never credentials. Plan:
+    /// `station-network-and-browser-profile-knobs-2026-10-02.md` §2.1 / §4.
+    /// Not enforced in this slice; unknown ids must refuse when resolve lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_allowlist: Option<SpawnNetworkAllowlistId>,
+    /// Optional dig2browser station **browserProfile** id (`profiles_root`).
+    /// Id only — never cookie/OAuth/proxy material on C2. Plan:
+    /// `station-network-and-browser-profile-knobs-2026-10-02.md` §2.2 / §4.
+    /// Not bound to dig2browser-station IPC in this slice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_profile_id: Option<SpawnBrowserProfileId>,
 }
 
 impl Default for SpawnOverrides {
@@ -1019,6 +1063,8 @@ impl Default for SpawnOverrides {
             context_id: SpawnOverride::Inherit,
             environment_profile_id: SpawnOverride::Inherit,
             approval_level: None,
+            network_allowlist: None,
+            browser_profile_id: None,
         }
     }
 }
@@ -1318,17 +1364,24 @@ impl SpawnPromptMetadata {
 
 /// Resolved environment-profile identity echoed on spawn receipts.
 ///
-/// Id + revision only — does **not** serialize sandbox/network/browser
-/// axes or secret material. Planned station knobs (`network` allowlist,
-/// optional dig2browser `browserProfile` id) stay node-local when added;
-/// receipts should keep echoing opaque ids only (never cookies/OAuth/
-/// proxy credentials on C2). See hatchery-websession-docs plan
-/// `station-network-and-browser-profile-knobs-2026-10-02.md`.
+/// Always carries profile id + revision. Optional `network_allowlist` and
+/// `browser_profile_id` echo **opaque station ids only** (never cookies /
+/// OAuth / proxy credentials on C2). See hatchery-websession-docs plan
+/// `station-network-and-browser-profile-knobs-2026-10-02.md` §4. Dig2browser
+/// station IPC bind is not performed from this receipt.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedEnvironmentProfileReceipt {
     pub profile_id: SpawnEnvironmentProfileId,
     pub profile_revision: SpawnEnvironmentProfileRevision,
+    /// Echo of spawn/station **network** allowlist policy id when set.
+    /// Plan: `station-network-and-browser-profile-knobs-2026-10-02.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_allowlist: Option<SpawnNetworkAllowlistId>,
+    /// Echo of optional dig2browser station **browserProfile** id when set.
+    /// Plan: `station-network-and-browser-profile-knobs-2026-10-02.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_profile_id: Option<SpawnBrowserProfileId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -8110,6 +8163,8 @@ mod tests {
                 context_id: SpawnOverride::Inherit,
                 environment_profile_id: SpawnOverride::Clear,
                 approval_level: None,
+                network_allowlist: None,
+                browser_profile_id: None,
             },
             deadline_ms: SpawnDeadlineMs::new(30_000).unwrap(),
             idempotency_key: SpawnIdempotencyKey::new("request-0001").unwrap(),
@@ -8176,6 +8231,8 @@ mod tests {
                 "local-default.2026-08",
             )
             .unwrap(),
+            network_allowlist: None,
+            browser_profile_id: None,
         };
         let environment_receipt = first.receipt_with_materialization(
             NodeIncarnationId::from_bytes([9; NODE_INCARNATION_ID_BYTES]),
@@ -8256,6 +8313,101 @@ mod tests {
         assert!(SpawnProfileId::new("unsafe/profile").is_err());
         assert!(serde_json::from_str::<SpawnOverride<AgentId>>(
             r#"{"kind":"set","value":"claude","typo":true}"#,
+        )
+        .is_err());
+    }
+
+    /// Station knobs slice (plan
+    /// `station-network-and-browser-profile-knobs-2026-10-02.md` §4): optional
+    /// `network_allowlist` + `browser_profile_id` on `SpawnOverrides` and
+    /// `ResolvedEnvironmentProfileReceipt` round-trip as opaque ids only.
+    /// Omitted when None; secret-looking unknown fields are refused. No
+    /// dig2browser-station bind in this slice.
+    #[test]
+    fn station_network_and_browser_profile_knobs_serde_ids_only() {
+        let allowlist = SpawnNetworkAllowlistId::new("egress-default").unwrap();
+        let browser = SpawnBrowserProfileId::new("station-profile-a").unwrap();
+        assert_eq!(allowlist.as_str(), "egress-default");
+        assert_eq!(browser.as_str(), "station-profile-a");
+        assert!(SpawnNetworkAllowlistId::new("").is_err());
+        assert!(SpawnBrowserProfileId::new("bad/id").is_err());
+        assert!(SpawnNetworkAllowlistId::new(
+            "x".repeat(MAX_SPAWN_RESOURCE_ID_BYTES + 1),
+        )
+        .is_err());
+
+        let overrides = SpawnOverrides {
+            network_allowlist: Some(allowlist.clone()),
+            browser_profile_id: Some(browser.clone()),
+            ..SpawnOverrides::default()
+        };
+        let overrides_json = serde_json::to_string(&overrides).unwrap();
+        assert_eq!(
+            overrides_json,
+            r#"{"provider":{"kind":"inherit"},"mode":{"kind":"inherit"},"terminal_size":{"kind":"inherit"},"prompt":{"kind":"inherit"},"bundle_id":{"kind":"inherit"},"context_id":{"kind":"inherit"},"environment_profile_id":{"kind":"inherit"},"network_allowlist":"egress-default","browser_profile_id":"station-profile-a"}"#,
+        );
+        assert!(!overrides_json.contains("cookie"));
+        assert!(!overrides_json.contains("oauth"));
+        assert!(!overrides_json.contains("password"));
+        assert_eq!(
+            serde_json::from_str::<SpawnOverrides>(&overrides_json).unwrap(),
+            overrides,
+        );
+
+        let omitted = serde_json::to_string(&SpawnOverrides::default()).unwrap();
+        assert!(!omitted.contains("network_allowlist"));
+        assert!(!omitted.contains("browser_profile_id"));
+        assert_eq!(
+            serde_json::from_str::<SpawnOverrides>(r#"{}"#).unwrap(),
+            SpawnOverrides::default(),
+        );
+
+        let mut unknown = serde_json::to_value(&overrides).unwrap();
+        unknown["proxy_password"] = serde_json::json!("nope");
+        assert!(serde_json::from_value::<SpawnOverrides>(unknown).is_err());
+        let mut cookie_field = serde_json::to_value(&overrides).unwrap();
+        cookie_field["cookie_bytes"] = serde_json::json!("deadbeef");
+        assert!(serde_json::from_value::<SpawnOverrides>(cookie_field).is_err());
+
+        let receipt = ResolvedEnvironmentProfileReceipt {
+            profile_id: SpawnEnvironmentProfileId::new("local-default").unwrap(),
+            profile_revision: SpawnEnvironmentProfileRevision::new("r1").unwrap(),
+            network_allowlist: Some(allowlist),
+            browser_profile_id: Some(browser),
+        };
+        let receipt_json = serde_json::to_string(&receipt).unwrap();
+        assert_eq!(
+            receipt_json,
+            r#"{"profile_id":"local-default","profile_revision":"r1","network_allowlist":"egress-default","browser_profile_id":"station-profile-a"}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<ResolvedEnvironmentProfileReceipt>(&receipt_json).unwrap(),
+            receipt,
+        );
+
+        let bare = ResolvedEnvironmentProfileReceipt {
+            profile_id: SpawnEnvironmentProfileId::new("local-default").unwrap(),
+            profile_revision: SpawnEnvironmentProfileRevision::new("r1").unwrap(),
+            network_allowlist: None,
+            browser_profile_id: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            r#"{"profile_id":"local-default","profile_revision":"r1"}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<ResolvedEnvironmentProfileReceipt>(
+                r#"{"profile_id":"local-default","profile_revision":"r1"}"#,
+            )
+            .unwrap(),
+            bare,
+        );
+        assert!(serde_json::from_str::<ResolvedEnvironmentProfileReceipt>(
+            r#"{"profile_id":"local-default","profile_revision":"r1","cookie":"x"}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ResolvedEnvironmentProfileReceipt>(
+            r#"{"profile_id":"local-default","profile_revision":"r1","oauth_token":"x"}"#,
         )
         .is_err());
     }
@@ -9784,6 +9936,8 @@ mod tests {
         let environment_profile = ResolvedEnvironmentProfileReceipt {
             profile_id: SpawnEnvironmentProfileId::new("local-claude").unwrap(),
             profile_revision: SpawnEnvironmentProfileRevision::new("local-claude-r1").unwrap(),
+            network_allowlist: None,
+            browser_profile_id: None,
         };
         let summary = SpawnProfileSummary {
             id: SpawnProfileId::new("default").unwrap(),

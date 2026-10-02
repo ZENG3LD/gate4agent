@@ -4482,6 +4482,8 @@ mod tests {
             profile_id: SpawnEnvironmentProfileId::new("local-default").unwrap(),
             profile_revision: SpawnEnvironmentProfileRevision::new("local-default.r1")
                 .unwrap(),
+                network_allowlist: None,
+                browser_profile_id: None,
         });
         let frame = response_frame(NodeResponse::SpawnSpecAccepted { receipt });
         assert!(matches!(

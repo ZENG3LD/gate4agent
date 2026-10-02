@@ -19,7 +19,8 @@ pub use gate4agent_node_protocol::{
     ContextPackBytesRead, ContextPackLineageReceipt, ResolvedContextPackReceipt, SpawnContextDigest,
     ResolvedSpawnSpec, SpawnBundleDigest, SpawnBundleId, SpawnBundleRevision,
     SpawnContextId, SpawnDeadlineMs, SpawnEnvironmentProfileId,
-    SpawnEnvironmentProfileRevision, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverride,
+    SpawnEnvironmentProfileRevision, SpawnNetworkAllowlistId, SpawnBrowserProfileId,
+    SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverride,
     SpawnOverrides, SpawnProfileDefaults, SpawnProfileId, SpawnProfileRevision, SpawnPrompt,
     SpawnPromptMetadata, SpawnRequiredCapabilities, SpawnResolutionProvenance, SpawnSpec,
     SpawnTarget,
@@ -3405,6 +3406,8 @@ mod tests {
                     "local-default.2026-08",
                 )
                 .unwrap(),
+                network_allowlist: None,
+                browser_profile_id: None,
             }),
             bundle: None,
             context_id: None,

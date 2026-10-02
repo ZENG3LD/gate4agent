@@ -388,6 +388,8 @@ async fn spawn_spec_defaults_overrides_are_deterministic() {
             context_id: SpawnOverride::Clear,
             environment_profile_id: SpawnOverride::Clear,
             approval_level: None,
+            network_allowlist: None,
+            browser_profile_id: None,
         },
         deadline_ms: SpawnDeadlineMs::new(20_000).unwrap(),
         idempotency_key: idempotency_key("accepted-once"),

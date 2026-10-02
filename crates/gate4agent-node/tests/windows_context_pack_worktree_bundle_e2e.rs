@@ -897,6 +897,8 @@ fn managed_spawn_request(
                 context_id: SpawnOverride::Set { value: context_id },
                 environment_profile_id: SpawnOverride::Inherit,
                 approval_level: None,
+                network_allowlist: None,
+                browser_profile_id: None,
             },
             deadline_ms: SpawnDeadlineMs::new(20_000).unwrap(),
             idempotency_key: SpawnIdempotencyKey::new("context-target-once").unwrap(),

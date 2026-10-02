@@ -41,14 +41,15 @@ const MATERIALIZATION_LOCK_NAME: &str = ".gate4agent-materialization-lock";
 /// research `multi-account-node-vs-hatchery-2026-10-02` and plan
 /// `n-accounts-one-workspace-collision-2026-10-02`.
 ///
-/// Station-profile axes (design ledger, not a type here): this materializer
-/// owns **providerHome** (+ path classes) and pairs with workspace **cwd**.
+/// Station-profile axes (design ledger): this materializer owns
+/// **providerHome** (+ path classes) and pairs with workspace **cwd**.
 /// **sandbox** is the separate `ApprovalLevel` / catalog argv axis;
-/// **network** and **browserProfile** are not first-class on spawn yet — see
-/// hatchery-websession-docs
+/// optional **network** allowlist + dig2browser **browserProfile** ids are
+/// typed on `SpawnOverrides` / env-profile receipts (serde only in this
+/// slice — no dig2browser-station bind yet). See hatchery-websession-docs
 /// `research/station-profile-and-os-sandbox-matrix-2026-10-02.md` and plan
 /// `station-network-and-browser-profile-knobs-2026-10-02.md` (ids on node;
-/// secrets never on C2; `C2 → node → drivers` + dig2browser station IPC).
+/// secrets never on C2; `C2 → node → drivers` + local station IPC later).
 const CODEX_HOME_ENVIRONMENT_KEY: &str = "CODEX_HOME";
 const CONTEXT_ROOT_ENVIRONMENT_KEY: &str = "GATE4AGENT_CONTEXT_ROOT";
 pub(crate) const CONTEXT_PACK_FILE_NAME: &str = "context-pack.json";
@@ -1659,6 +1660,8 @@ mod tests {
         ResolvedEnvironmentProfileReceipt {
             profile_id: crate::protocol::SpawnEnvironmentProfileId::new("fixture").unwrap(),
             profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1").unwrap(),
+            network_allowlist: None,
+            browser_profile_id: None,
         }
     }
 

@@ -312,6 +312,8 @@ fn spawn_request(
                 context_id: SpawnOverride::Inherit,
                 environment_profile_id: SpawnOverride::Inherit,
                 approval_level: None,
+                network_allowlist: None,
+                browser_profile_id: None,
             },
             deadline_ms: SpawnDeadlineMs::new(20_000).unwrap(),
             idempotency_key: SpawnIdempotencyKey::new(idempotency_key).unwrap(),
@@ -948,6 +950,8 @@ async fn spawn_managed_codex_bundle_isolated_home_is_private_and_cleaned_end_to_
         &gate4agent_node::protocol::ResolvedEnvironmentProfileReceipt {
             profile_id: environment_profile_id.clone(),
             profile_revision: environment_profile_revision.clone(),
+            network_allowlist: None,
+            browser_profile_id: None,
         },
     );
     assert_eq!(

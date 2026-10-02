@@ -2470,6 +2470,8 @@ mod tests {
                     .unwrap(),
                 profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1")
                     .unwrap(),
+                    network_allowlist: None,
+                    browser_profile_id: None,
             }),
             None,
             None,
@@ -2600,6 +2602,8 @@ mod tests {
                 "local-claude-r1",
             )
             .unwrap(),
+            network_allowlist: None,
+            browser_profile_id: None,
         };
         record.environment_profile = Some(environment_profile.clone());
 
@@ -2689,6 +2693,8 @@ mod tests {
             Some(ResolvedEnvironmentProfileReceipt {
                 profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude").unwrap(),
                 profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1").unwrap(),
+                network_allowlist: None,
+                browser_profile_id: None,
             }),
             None,
             None,
@@ -2892,6 +2898,8 @@ mod tests {
                 environment_profile: ResolvedEnvironmentProfileReceipt {
                     profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude").unwrap(),
                     profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1").unwrap(),
+                    network_allowlist: None,
+                    browser_profile_id: None,
                 },
                 owner: MaterializationOwner::Session {
                     incarnation_id: crate::protocol::NodeIncarnationId::from_bytes([3; crate::protocol::NODE_INCARNATION_ID_BYTES]),
@@ -2935,6 +2943,8 @@ mod tests {
             environment_profile: ResolvedEnvironmentProfileReceipt {
                 profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude").unwrap(),
                 profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1").unwrap(),
+                network_allowlist: None,
+                browser_profile_id: None,
             },
             owner: MaterializationOwner::Session {
                 incarnation_id: crate::protocol::NodeIncarnationId::from_bytes([3; crate::protocol::NODE_INCARNATION_ID_BYTES]),
@@ -3708,6 +3718,8 @@ mod tests {
         let environment_profile = ResolvedEnvironmentProfileReceipt {
             profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude").unwrap(),
             profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1").unwrap(),
+            network_allowlist: None,
+            browser_profile_id: None,
         };
         record.environment_profile = Some(environment_profile.clone());
         let ownership = materialization_ownership(
@@ -3759,6 +3771,8 @@ mod tests {
         let environment_profile = ResolvedEnvironmentProfileReceipt {
             profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude").unwrap(),
             profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1").unwrap(),
+            network_allowlist: None,
+            browser_profile_id: None,
         };
         let bundle = ResolvedBundleReceipt {
             id: crate::protocol::SpawnBundleId::new("review-bundle").unwrap(),

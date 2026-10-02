@@ -4416,6 +4416,8 @@ mod tests {
                         "local-default.r1",
                     )
                     .unwrap(),
+                    network_allowlist: None,
+                    browser_profile_id: None,
             },
         );
         let frame = C2ServerFrame::Reply(C2ReplyEnvelope {

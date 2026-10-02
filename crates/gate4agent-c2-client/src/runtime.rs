@@ -5067,6 +5067,8 @@ mod tests {
                         "local-default.r1",
                     )
                     .unwrap(),
+                    network_allowlist: None,
+                    browser_profile_id: None,
             },
         );
         incoming_tx.send(OwnerInput::Frame(C2ServerFrame::Reply(

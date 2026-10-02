@@ -1,14 +1,24 @@
-//! Station **network allowlist** catalog load (opaque policy ids only).
+//! Station **network allowlist** catalog (opaque policy ids + optional
+//! node-local permit-set / provider-native mapping).
 //!
 //! Operator startup path for `NodeShared::network_allowlist_catalog`. Empty
-//! when unset. File lists one id per line; `#` comments and blank lines are
-//! skipped. Never cookies / OAuth / proxy credentials — ids only. Plan
-//! `station-network-and-browser-profile-knobs-2026-10-02.md` §2.1 / handoff
-//! catalog-enforce gap "Catalog persistence / operator load path".
-//! Dig2browser dig2 probe remains stubbed elsewhere.
+//! when unset. **C2 / spawn wire stays id-only**; inventory lists ids.
+//! Never cookies / OAuth / proxy credentials.
+//!
+//! Dual file formats (Track B §3.2.1):
+//! - **v1 id-list** (backward compatible): one id per line; `#` comments /
+//!   blanks skipped. Entries are membership-only (empty permits).
+//! - **v2 JSON**: `{ "schema_version": 2, "entries": [ { "id", "permits?",
+//!   "provider_native?" } ] }`. Detected when the first non-comment /
+//!   non-blank content starts with `{`.
+//!
+//! Plan: `dig2browser-station-probe-and-network-permit-set-2026-10-02.md` §3.2.1.
+//! Dig2browser bind remains stubbed elsewhere; provider-native argv apply is
+//! a later tip (Codex `networkAccess` research first).
 
 use crate::protocol::SpawnNetworkAllowlistId;
-use std::collections::BTreeSet;
+use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -17,7 +27,16 @@ use thiserror::Error;
 /// Soft bound on station network allowlist catalog membership (ids only).
 pub use crate::protocol::MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES;
 
-/// Env path to an optional allowlist-id catalog file (absolute regular file).
+/// Soft bound on permit rows per catalog entry (dig2 `MAX_NETWORK_PERMITS` spirit).
+pub const MAX_NETWORK_PERMITS_PER_ENTRY: usize = 64;
+
+/// Soft bound on peer string bytes (non-secret host:port / CIDR sketch).
+pub const MAX_NETWORK_PERMIT_PEER_BYTES: usize = 256;
+
+/// Structured catalog schema version (JSON v2).
+pub const NETWORK_ALLOWLIST_CATALOG_SCHEMA_VERSION: u32 = 2;
+
+/// Env path to an optional allowlist catalog file (absolute regular file).
 /// Unset → empty catalog (deny unknown at resolve). Never a secret store.
 pub const NETWORK_ALLOWLIST_CATALOG_ENV: &str = "GATE4AGENT_NODE_NETWORK_ALLOWLIST_CATALOG";
 
@@ -29,18 +48,171 @@ pub enum NetworkAllowlistCatalogError {
     Io(#[source] io::Error),
     #[error("network allowlist catalog line {line}: {message}")]
     InvalidEntry { line: usize, message: String },
+    #[error("network allowlist catalog: {0}")]
+    InvalidCatalog(String),
     #[error("network allowlist catalog exceeds the {max}-entry limit")]
     Capacity { max: usize },
 }
 
-/// Load opaque allowlist ids from `path`.
+/// dig2browser-spirit peer+protocol permit (node-local; non-secret).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkPermitSketch {
+    pub protocol: NetworkPermitProtocol,
+    pub peer: String,
+}
+
+/// Allowed permit protocols (string form in JSON: `tcp` / `udp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkPermitProtocol {
+    Tcp,
+    Udp,
+}
+
+impl NetworkPermitProtocol {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "tcp" => Ok(Self::Tcp),
+            "udp" => Ok(Self::Udp),
+            other => Err(format!(
+                "unsupported network permit protocol {other:?} (expected tcp or udp)"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+/// Honest, partial provider-native network mapping (node-local).
 ///
-/// Format: one id per line; trim ASCII whitespace; skip empty lines and lines
-/// whose first non-whitespace character is `#`. Duplicates collapse via set.
-/// Refuse relative paths, missing files, non-files, invalid ids, and overflow.
+/// Only measured / documented knobs appear here. Unknown JSON keys refuse at
+/// load (`deny_unknown_fields`). Claude / Kimi have no first-class network
+/// axis — omit rather than fake flags; resolve refuses when a required
+/// Codex-only mapping is asked of a non-Codex provider.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderNativeNetworkSketch {
+    /// Codex `networkAccess`-shaped knob when measured. `None` = unmapped.
+    #[serde(default)]
+    pub codex_network_access: Option<bool>,
+}
+
+impl ProviderNativeNetworkSketch {
+    pub fn is_empty(&self) -> bool {
+        self.codex_network_access.is_none()
+    }
+}
+
+/// One node-local catalog entry. Wire / inventory still use [`SpawnNetworkAllowlistId`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkAllowlistEntry {
+    pub id: SpawnNetworkAllowlistId,
+    /// Empty = id membership only (v1 id-list behavior).
+    pub permits: Vec<NetworkPermitSketch>,
+    pub provider_native: Option<ProviderNativeNetworkSketch>,
+}
+
+impl NetworkAllowlistEntry {
+    pub fn membership_only(id: SpawnNetworkAllowlistId) -> Self {
+        Self {
+            id,
+            permits: Vec::new(),
+            provider_native: None,
+        }
+    }
+}
+
+/// Empty-default station network allowlist catalog.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkAllowlistCatalog {
+    entries: BTreeMap<SpawnNetworkAllowlistId, NetworkAllowlistEntry>,
+}
+
+impl NetworkAllowlistCatalog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn contains(&self, id: &SpawnNetworkAllowlistId) -> bool {
+        self.entries.contains_key(id)
+    }
+
+    pub fn get(&self, id: &SpawnNetworkAllowlistId) -> Option<&NetworkAllowlistEntry> {
+        self.entries.get(id)
+    }
+
+    /// Opaque ids in sorted order (LaunchInventory surface).
+    pub fn ids(&self) -> impl Iterator<Item = &SpawnNetworkAllowlistId> {
+        self.entries.keys()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &NetworkAllowlistEntry> {
+        self.entries.values()
+    }
+
+    /// Insert or replace. Refuses when at capacity and `id` is new.
+    pub fn insert(
+        &mut self,
+        entry: NetworkAllowlistEntry,
+    ) -> Result<(), NetworkAllowlistCatalogError> {
+        if self.entries.len() == MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES
+            && !self.entries.contains_key(&entry.id)
+        {
+            return Err(NetworkAllowlistCatalogError::Capacity {
+                max: MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES,
+            });
+        }
+        self.entries.insert(entry.id.clone(), entry);
+        Ok(())
+    }
+
+    /// Convenience: register membership-only id (tests / in-memory config).
+    pub fn insert_id(
+        &mut self,
+        id: SpawnNetworkAllowlistId,
+    ) -> Result<(), NetworkAllowlistCatalogError> {
+        self.insert(NetworkAllowlistEntry::membership_only(id))
+    }
+}
+
+impl FromIterator<SpawnNetworkAllowlistId> for NetworkAllowlistCatalog {
+    fn from_iter<T: IntoIterator<Item = SpawnNetworkAllowlistId>>(iter: T) -> Self {
+        let mut catalog = Self::new();
+        for id in iter {
+            // Capacity: drop extras silently only in FromIterator would hide
+            // overflow — callers that need refuse use `insert` / loader.
+            let _ = catalog.insert_id(id);
+        }
+        catalog
+    }
+}
+
+impl FromIterator<NetworkAllowlistEntry> for NetworkAllowlistCatalog {
+    fn from_iter<T: IntoIterator<Item = NetworkAllowlistEntry>>(iter: T) -> Self {
+        let mut catalog = Self::new();
+        for entry in iter {
+            let _ = catalog.insert(entry);
+        }
+        catalog
+    }
+}
+
+/// Load catalog from `path` (absolute regular file). Dual format.
 pub fn load_network_allowlist_catalog_file(
     path: impl AsRef<Path>,
-) -> Result<BTreeSet<SpawnNetworkAllowlistId>, NetworkAllowlistCatalogError> {
+) -> Result<NetworkAllowlistCatalog, NetworkAllowlistCatalogError> {
     let path = path.as_ref();
     let display = path.to_string_lossy().into_owned();
     if !path.is_absolute() {
@@ -60,11 +232,48 @@ pub fn load_network_allowlist_catalog_file(
     parse_network_allowlist_catalog_text(&text)
 }
 
-/// Parse catalog text (same line rules as [`load_network_allowlist_catalog_file`]).
+/// Parse catalog text: JSON v2 when first non-comment content is `{`, else
+/// v1 id-list (one id per line).
 pub fn parse_network_allowlist_catalog_text(
     text: &str,
-) -> Result<BTreeSet<SpawnNetworkAllowlistId>, NetworkAllowlistCatalogError> {
-    let mut catalog = BTreeSet::new();
+) -> Result<NetworkAllowlistCatalog, NetworkAllowlistCatalogError> {
+    if looks_like_json_catalog(text) {
+        parse_network_allowlist_catalog_json(text)
+    } else {
+        parse_network_allowlist_catalog_id_list(text)
+    }
+}
+
+/// Resolve optional catalog from an explicit path, else from
+/// [`NETWORK_ALLOWLIST_CATALOG_ENV`], else empty.
+pub fn resolve_network_allowlist_catalog(
+    explicit_path: Option<PathBuf>,
+) -> Result<NetworkAllowlistCatalog, NetworkAllowlistCatalogError> {
+    let path = match explicit_path {
+        Some(path) => Some(path),
+        None => std::env::var_os(NETWORK_ALLOWLIST_CATALOG_ENV).map(PathBuf::from),
+    };
+    match path {
+        Some(path) => load_network_allowlist_catalog_file(path),
+        None => Ok(NetworkAllowlistCatalog::new()),
+    }
+}
+
+fn looks_like_json_catalog(text: &str) -> bool {
+    for raw_line in text.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        return trimmed.starts_with('{');
+    }
+    false
+}
+
+fn parse_network_allowlist_catalog_id_list(
+    text: &str,
+) -> Result<NetworkAllowlistCatalog, NetworkAllowlistCatalogError> {
+    let mut catalog = NetworkAllowlistCatalog::new();
     for (index, raw_line) in text.lines().enumerate() {
         let line = index + 1;
         let trimmed = raw_line.trim();
@@ -77,29 +286,155 @@ pub fn parse_network_allowlist_catalog_text(
                 message: error.to_string(),
             }
         })?;
-        if catalog.len() == MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES && !catalog.contains(&id) {
-            return Err(NetworkAllowlistCatalogError::Capacity {
-                max: MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES,
-            });
-        }
-        catalog.insert(id);
+        catalog.insert(NetworkAllowlistEntry::membership_only(id))?;
     }
     Ok(catalog)
 }
 
-/// Resolve optional catalog from an explicit path, else from
-/// [`NETWORK_ALLOWLIST_CATALOG_ENV`], else empty.
-pub fn resolve_network_allowlist_catalog(
-    explicit_path: Option<PathBuf>,
-) -> Result<BTreeSet<SpawnNetworkAllowlistId>, NetworkAllowlistCatalogError> {
-    let path = match explicit_path {
-        Some(path) => Some(path),
-        None => std::env::var_os(NETWORK_ALLOWLIST_CATALOG_ENV).map(PathBuf::from),
-    };
-    match path {
-        Some(path) => load_network_allowlist_catalog_file(path),
-        None => Ok(BTreeSet::new()),
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogFileV2 {
+    schema_version: u32,
+    #[serde(default)]
+    entries: Vec<CatalogEntryV2>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogEntryV2 {
+    id: String,
+    #[serde(default)]
+    permits: Vec<CatalogPermitV2>,
+    #[serde(default)]
+    provider_native: Option<ProviderNativeNetworkSketch>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogPermitV2 {
+    protocol: String,
+    peer: String,
+}
+
+fn strip_leading_comments_and_blanks(text: &str) -> &str {
+    let mut rest = text;
+    loop {
+        let trimmed_start = rest.trim_start();
+        if trimmed_start.is_empty() {
+            return trimmed_start;
+        }
+        // Advance past leading blank lines already handled by trim_start.
+        rest = trimmed_start;
+        if rest.starts_with('#') {
+            rest = match rest.split_once('\n') {
+                Some((_, after)) => after,
+                None => return "",
+            };
+            continue;
+        }
+        return rest;
     }
+}
+
+fn parse_network_allowlist_catalog_json(
+    text: &str,
+) -> Result<NetworkAllowlistCatalog, NetworkAllowlistCatalogError> {
+    let json_text = strip_leading_comments_and_blanks(text);
+    let file: CatalogFileV2 = serde_json::from_str(json_text).map_err(|error| {
+        NetworkAllowlistCatalogError::InvalidCatalog(format!("invalid JSON catalog: {error}"))
+    })?;
+    if file.schema_version != NETWORK_ALLOWLIST_CATALOG_SCHEMA_VERSION {
+        return Err(NetworkAllowlistCatalogError::InvalidCatalog(format!(
+            "unsupported schema_version {} (expected {})",
+            file.schema_version, NETWORK_ALLOWLIST_CATALOG_SCHEMA_VERSION
+        )));
+    }
+    let mut catalog = NetworkAllowlistCatalog::new();
+    for (index, raw) in file.entries.into_iter().enumerate() {
+        let entry_label = index + 1;
+        let id = SpawnNetworkAllowlistId::new(&raw.id).map_err(|error| {
+            NetworkAllowlistCatalogError::InvalidCatalog(format!(
+                "entries[{entry_label}].id: {error}"
+            ))
+        })?;
+        if catalog.contains(&id) {
+            return Err(NetworkAllowlistCatalogError::InvalidCatalog(format!(
+                "duplicate catalog id {}",
+                id.as_str()
+            )));
+        }
+        if raw.permits.len() > MAX_NETWORK_PERMITS_PER_ENTRY {
+            return Err(NetworkAllowlistCatalogError::InvalidCatalog(format!(
+                "entries[{entry_label}]: exceeds {MAX_NETWORK_PERMITS_PER_ENTRY} permits"
+            )));
+        }
+        let mut permits = Vec::with_capacity(raw.permits.len());
+        for (permit_index, permit) in raw.permits.into_iter().enumerate() {
+            let protocol = NetworkPermitProtocol::parse(&permit.protocol).map_err(|message| {
+                NetworkAllowlistCatalogError::InvalidCatalog(format!(
+                    "entries[{entry_label}].permits[{}]: {message}",
+                    permit_index + 1
+                ))
+            })?;
+            let peer = permit.peer.trim();
+            if peer.is_empty() {
+                return Err(NetworkAllowlistCatalogError::InvalidCatalog(format!(
+                    "entries[{entry_label}].permits[{}]: peer must be non-empty",
+                    permit_index + 1
+                )));
+            }
+            if peer.len() > MAX_NETWORK_PERMIT_PEER_BYTES {
+                return Err(NetworkAllowlistCatalogError::InvalidCatalog(format!(
+                    "entries[{entry_label}].permits[{}]: peer exceeds {MAX_NETWORK_PERMIT_PEER_BYTES} bytes",
+                    permit_index + 1
+                )));
+            }
+            // Non-secret sketch only — refuse obvious credential-shaped keys in peer.
+            if peer.contains('@') && peer.contains(':') && peer.split('@').next().is_some_and(|u| u.contains(':')) {
+                // user:pass@host — refuse; credentials never belong in catalog.
+                return Err(NetworkAllowlistCatalogError::InvalidCatalog(format!(
+                    "entries[{entry_label}].permits[{}]: peer must not carry credentials",
+                    permit_index + 1
+                )));
+            }
+            permits.push(NetworkPermitSketch {
+                protocol,
+                peer: peer.to_owned(),
+            });
+        }
+        let provider_native = match raw.provider_native {
+            Some(native) if native.is_empty() => None,
+            other => other,
+        };
+        catalog.insert(NetworkAllowlistEntry {
+            id,
+            permits,
+            provider_native,
+        })?;
+    }
+    Ok(catalog)
+}
+
+/// Whether `provider_native` on a catalog entry can be honored for `provider`.
+///
+/// Codex-only knobs refuse clearly for other providers (Claude / Kimi / …).
+/// Actual Codex argv apply remains a later tip — membership + honesty first.
+pub fn provider_native_mapping_supported(
+    provider: &str,
+    native: &ProviderNativeNetworkSketch,
+) -> Result<(), String> {
+    if native.is_empty() {
+        return Ok(());
+    }
+    if native.codex_network_access.is_some() {
+        if provider != "codex" {
+            return Err(format!(
+                "provider-native codex_network_access is unsupported for provider {provider:?}"
+            ));
+        }
+        return Ok(());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -120,8 +455,6 @@ mod tests {
 
     #[test]
     fn unset_path_yields_empty_catalog_when_env_absent() {
-        // Isolate from ambient operator env so the empty-default contract stays
-        // deterministic in shared CI / agent boxes.
         let previous = std::env::var_os(NETWORK_ALLOWLIST_CATALOG_ENV);
         std::env::remove_var(NETWORK_ALLOWLIST_CATALOG_ENV);
         let catalog = resolve_network_allowlist_catalog(None).unwrap();
@@ -164,6 +497,11 @@ mod tests {
         assert_eq!(catalog.len(), 2);
         assert!(catalog.contains(&SpawnNetworkAllowlistId::new("egress-default").unwrap()));
         assert!(catalog.contains(&SpawnNetworkAllowlistId::new("lab-egress").unwrap()));
+        let entry = catalog
+            .get(&SpawnNetworkAllowlistId::new("egress-default").unwrap())
+            .unwrap();
+        assert!(entry.permits.is_empty());
+        assert!(entry.provider_native.is_none());
         let _ = fs::remove_file(&path);
     }
 
@@ -220,7 +558,116 @@ mod tests {
         let error = parse_network_allowlist_catalog_text(&body).unwrap_err();
         assert!(matches!(
             error,
-            NetworkAllowlistCatalogError::Capacity { max: MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES }
+            NetworkAllowlistCatalogError::Capacity {
+                max: MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES
+            }
         ));
+    }
+
+    #[test]
+    fn json_v2_loads_permits_and_provider_native() {
+        let text = r#"
+        {
+          "schema_version": 2,
+          "entries": [
+            {
+              "id": "egress-default",
+              "permits": [
+                { "protocol": "tcp", "peer": "127.0.0.1:443" },
+                { "protocol": "UDP", "peer": "10.0.0.1:53" }
+              ],
+              "provider_native": { "codex_network_access": true }
+            },
+            { "id": "lab-egress" }
+          ]
+        }
+        "#;
+        let catalog = parse_network_allowlist_catalog_text(text).unwrap();
+        assert_eq!(catalog.len(), 2);
+        let entry = catalog
+            .get(&SpawnNetworkAllowlistId::new("egress-default").unwrap())
+            .unwrap();
+        assert_eq!(entry.permits.len(), 2);
+        assert_eq!(entry.permits[0].protocol, NetworkPermitProtocol::Tcp);
+        assert_eq!(entry.permits[0].peer, "127.0.0.1:443");
+        assert_eq!(entry.permits[1].protocol, NetworkPermitProtocol::Udp);
+        let native = entry.provider_native.as_ref().unwrap();
+        assert_eq!(native.codex_network_access, Some(true));
+        let bare = catalog
+            .get(&SpawnNetworkAllowlistId::new("lab-egress").unwrap())
+            .unwrap();
+        assert!(bare.permits.is_empty());
+        assert!(bare.provider_native.is_none());
+    }
+
+    #[test]
+    fn json_v2_refuses_unsupported_schema_version() {
+        let text = r#"{ "schema_version": 99, "entries": [] }"#;
+        let error = parse_network_allowlist_catalog_text(text).unwrap_err();
+        assert!(matches!(
+            error,
+            NetworkAllowlistCatalogError::InvalidCatalog(_)
+        ));
+        assert!(error.to_string().contains("schema_version"));
+    }
+
+    #[test]
+    fn json_v2_refuses_unknown_provider_native_keys() {
+        let text = r#"
+        {
+          "schema_version": 2,
+          "entries": [{
+            "id": "egress-default",
+            "provider_native": { "claude_network": true }
+          }]
+        }
+        "#;
+        let error = parse_network_allowlist_catalog_text(text).unwrap_err();
+        assert!(matches!(
+            error,
+            NetworkAllowlistCatalogError::InvalidCatalog(_)
+        ));
+        let message = error.to_string();
+        assert!(
+            message.contains("claude_network") || message.contains("unknown field"),
+            "message={message}"
+        );
+    }
+
+    #[test]
+    fn json_v2_refuses_unsupported_permit_protocol() {
+        let text = r#"
+        {
+          "schema_version": 2,
+          "entries": [{
+            "id": "egress-default",
+            "permits": [{ "protocol": "quic", "peer": "127.0.0.1:443" }]
+          }]
+        }
+        "#;
+        let error = parse_network_allowlist_catalog_text(text).unwrap_err();
+        assert!(error.to_string().contains("quic"));
+    }
+
+    #[test]
+    fn json_v2_comment_preamble_still_detects_json() {
+        let text = "# operator catalog\n{ \"schema_version\": 2, \"entries\": [{\"id\":\"a\"}] }\n";
+        let catalog = parse_network_allowlist_catalog_text(text).unwrap();
+        assert!(catalog.contains(&SpawnNetworkAllowlistId::new("a").unwrap()));
+    }
+
+    #[test]
+    fn provider_native_mapping_refuses_non_codex() {
+        let native = ProviderNativeNetworkSketch {
+            codex_network_access: Some(true),
+        };
+        let err = provider_native_mapping_supported("claude", &native).unwrap_err();
+        assert!(err.contains("claude"));
+        assert!(provider_native_mapping_supported("codex", &native).is_ok());
+        assert!(provider_native_mapping_supported(
+            "claude",
+            &ProviderNativeNetworkSketch::default()
+        )
+        .is_ok());
     }
 }

@@ -500,10 +500,14 @@ pub struct SpawnEnvironmentProfileRevision(String);
 /// Opaque node-local **network allowlist** policy id (station axis).
 ///
 /// Ids / digests only on C2 — never cookies, OAuth material, or proxy
-/// credentials. See hatchery-websession-docs plan
-/// `station-network-and-browser-profile-knobs-2026-10-02.md`. Node catalog
-/// enforce refuses unknown ids (`UnknownNetworkAllowlist`); dig2browser
-/// station bind remains stubbed until a cheap g4a-local probe exists.
+/// credentials. See hatchery-websession-docs plans
+/// `station-network-and-browser-profile-knobs-2026-10-02.md` and
+/// `dig2browser-station-probe-and-network-permit-set-2026-10-02.md` Track B.
+/// Node catalog enforce refuses unknown ids (`UnknownNetworkAllowlist`);
+/// optional node-local permit-set / provider-native mapping stays off the wire.
+/// Unsupported provider-native mappings refuse
+/// (`UnsupportedNetworkAllowlistMapping`). Dig2browser station bind remains
+/// stubbed (probe feature-gated).
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SpawnNetworkAllowlistId(String);
@@ -7257,6 +7261,11 @@ pub enum NodeFailureCode {
     /// §4 — refuse unknown ids rather than silent ambient. Opaque id only;
     /// never credentials on C2.
     UnknownNetworkAllowlist,
+    /// Catalog entry carries a provider-native network mapping this spawn's
+    /// provider cannot honor (e.g. `codex_network_access` for Claude / Kimi).
+    /// Plan `dig2browser-station-probe-and-network-permit-set-2026-10-02.md`
+    /// Track B — refuse rather than silent ambient. Never secrets on C2.
+    UnsupportedNetworkAllowlistMapping,
     /// `browser_profile_id` set while feature `dig2-station-probe` is on, but
     /// the cheap station probe cannot run on this platform (dig2browser
     /// named-pipe IPC is Windows-first; no unix socket path yet) or the

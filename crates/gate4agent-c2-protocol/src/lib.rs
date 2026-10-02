@@ -291,6 +291,9 @@ impl From<&NodeFailure> for C2NodeFailure {
             NodeFailureCode::UnknownNetworkAllowlist => {
                 "network allowlist unavailable"
             }
+            NodeFailureCode::UnsupportedNetworkAllowlistMapping => {
+                "network allowlist mapping unsupported for this provider"
+            }
             NodeFailureCode::BrowserStationProbeUnavailable => {
                 "dig2browser station probe unavailable on this platform"
             }

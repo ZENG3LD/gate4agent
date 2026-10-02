@@ -38,8 +38,11 @@ mod server;
 
 pub use network_allowlist_catalog::{
     load_network_allowlist_catalog_file, parse_network_allowlist_catalog_text,
-    resolve_network_allowlist_catalog, NetworkAllowlistCatalogError,
-    MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES, NETWORK_ALLOWLIST_CATALOG_ENV,
+    provider_native_mapping_supported, resolve_network_allowlist_catalog,
+    NetworkAllowlistCatalog, NetworkAllowlistCatalogError, NetworkAllowlistEntry,
+    NetworkPermitProtocol, NetworkPermitSketch, ProviderNativeNetworkSketch,
+    MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES, MAX_NETWORK_PERMITS_PER_ENTRY,
+    NETWORK_ALLOWLIST_CATALOG_ENV, NETWORK_ALLOWLIST_CATALOG_SCHEMA_VERSION,
 };
 pub use server::{
     default_node_endpoint, default_state_path, NodeServer, NodeServerConfig, NodeServerError,

@@ -108,7 +108,6 @@ use crate::protocol::{
     BlockAuthorityV1, HarnessMcpLaunchV1, SessionHistorySummaryV1, MAX_ACP_BLOCKED_HELP_BYTES, MAX_ACP_BLOCKED_REASON_BYTES,
     StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind, WorktreeProfileId,
     SpawnContextId, SpawnEnvironmentProfileId, SpawnIdempotencyKey,
-    SpawnNetworkAllowlistId,
     SpawnProfileDefaults, SpawnRequiredCapabilities, SpawnSpec, SpawnSpecResolveError,
     WorkspaceFileContent, WorkspaceFileRevision,
     WorkspaceFileRead, WorkspaceId, WorkspaceInspection, WorkspaceInspectionTruncationV1,
@@ -195,7 +194,7 @@ use gate4agent_types::{
     SessionStatus, TerminalFrame, TransportKind, CONTROL_SESSIONS_MAX,
     HISTORY_DISCOVERY_LIMIT_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1055,7 +1054,7 @@ pub struct NodeServerConfig {
     /// Station network allowlist catalog (opaque ids). Empty default.
     /// Loaded at startup from `--network-allowlist-catalog` / env
     /// `GATE4AGENT_NODE_NETWORK_ALLOWLIST_CATALOG` file. Never secrets.
-    network_allowlist_catalog: BTreeSet<SpawnNetworkAllowlistId>,
+    network_allowlist_catalog: crate::network_allowlist_catalog::NetworkAllowlistCatalog,
     #[cfg(feature = "fixture")]
     fixture_raw_pty_runtime: bool,
 }
@@ -1136,7 +1135,7 @@ impl NodeServerConfig {
             session_environment: None,
             history: None,
             harness_mcp_helper: None,
-            network_allowlist_catalog: BTreeSet::new(),
+            network_allowlist_catalog: crate::network_allowlist_catalog::NetworkAllowlistCatalog::new(),
             #[cfg(feature = "fixture")]
             fixture_raw_pty_runtime: false,
         })
@@ -1256,32 +1255,26 @@ impl NodeServerConfig {
         }
     }
 
-    /// Install an in-memory station network allowlist catalog (opaque ids).
-    /// Empty remains the default — unknown spawn ids refuse at resolve.
-    /// Never cookies / OAuth / proxy credentials.
+    /// Install an in-memory station network allowlist catalog (opaque ids +
+    /// optional node-local permits / provider-native mapping). Empty remains
+    /// the default — unknown spawn ids refuse at resolve. Never cookies /
+    /// OAuth / proxy credentials. C2 / inventory still list ids only.
     pub fn with_network_allowlist_catalog(
         mut self,
-        catalog: impl IntoIterator<Item = SpawnNetworkAllowlistId>,
+        catalog: crate::network_allowlist_catalog::NetworkAllowlistCatalog,
     ) -> Result<Self, NodeServerError> {
-        let mut set = BTreeSet::new();
-        for id in catalog {
-            if set.len() == crate::network_allowlist_catalog::MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES
-                && !set.contains(&id)
-            {
-                return Err(NodeServerError::NetworkAllowlistCatalogCapacity {
-                    max: crate::network_allowlist_catalog::MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES,
-                });
-            }
-            set.insert(id);
+        if catalog.len() > crate::network_allowlist_catalog::MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES {
+            return Err(NodeServerError::NetworkAllowlistCatalogCapacity {
+                max: crate::network_allowlist_catalog::MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES,
+            });
         }
-        self.network_allowlist_catalog = set;
+        self.network_allowlist_catalog = catalog;
         Ok(self)
     }
 
     /// Load station network allowlist catalog from an absolute regular file
-    /// (one opaque id per line; `#` comments / blanks skipped). Unset path
-    /// is not used here — callers that want env fallback use
-    /// `resolve_network_allowlist_catalog`.
+    /// (v1 id-list or v2 JSON schema). Unset path is not used here — callers
+    /// that want env fallback use `resolve_network_allowlist_catalog`.
     pub fn with_network_allowlist_catalog_file(
         self,
         path: impl AsRef<std::path::Path>,
@@ -2936,7 +2929,7 @@ struct NodeShared {
     /// / env `GATE4AGENT_NODE_NETWORK_ALLOWLIST_CATALOG`. Plan
     /// `station-network-and-browser-profile-knobs-2026-10-02.md` §2.1 / §4.
     /// Never holds cookies / OAuth / proxy credentials.
-    network_allowlist_catalog: RwLock<BTreeSet<SpawnNetworkAllowlistId>>,
+    network_allowlist_catalog: RwLock<crate::network_allowlist_catalog::NetworkAllowlistCatalog>,
     bundle_catalog: RwLock<BundleCatalog>,
     delivery_store: Mutex<Option<DeliveryStore>>,
     context_pack_store: Mutex<Option<ContextPackStore>>,
@@ -3349,7 +3342,7 @@ impl NodeShared {
             spawn_profiles,
             environment_profiles: RwLock::new(BTreeMap::new()),
             environment_materialization_profiles: RwLock::new(BTreeMap::new()),
-            network_allowlist_catalog: RwLock::new(BTreeSet::new()),
+            network_allowlist_catalog: RwLock::new(crate::network_allowlist_catalog::NetworkAllowlistCatalog::new()),
             bundle_catalog: RwLock::new(BundleCatalog::default()),
             delivery_store: Mutex::new(None),
             context_pack_store: Mutex::new(None),
@@ -3600,11 +3593,24 @@ impl NodeShared {
                 .network_allowlist_catalog
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !catalog.contains(allowlist_id) {
+            let Some(entry) = catalog.get(allowlist_id) else {
                 return Err(failure(
                     NodeFailureCode::UnknownNetworkAllowlist,
                     "spawn network allowlist is unavailable on this node",
                 ));
+            };
+            // Track B: refuse provider-native mappings this provider cannot
+            // honor (e.g. codex_network_access on Claude). Never silent ambient.
+            if let Some(native) = entry.provider_native.as_ref() {
+                if let Err(message) = crate::network_allowlist_catalog::provider_native_mapping_supported(
+                    resolved.provider.as_str(),
+                    native,
+                ) {
+                    return Err(failure(
+                        NodeFailureCode::UnsupportedNetworkAllowlistMapping,
+                        &message,
+                    ));
+                }
             }
         }
         // Station knobs Track A (dig2browser-station-probe-and-network-permit-set):
@@ -10073,7 +10079,7 @@ impl NodeShared {
                     if catalog.is_empty() {
                         None
                     } else {
-                        Some(catalog.iter().cloned().collect())
+                        Some(catalog.ids().cloned().collect())
                     }
                 },
             }),
@@ -16539,6 +16545,9 @@ fn node_failure_category(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::TurnInFlight => "turn-in-flight",
         NodeFailureCode::UnknownEnvironmentProfile => "unknown-environment-profile",
         NodeFailureCode::UnknownNetworkAllowlist => "unknown-network-allowlist",
+        NodeFailureCode::UnsupportedNetworkAllowlistMapping => {
+            "unsupported-network-allowlist-mapping"
+        }
         NodeFailureCode::BrowserStationProbeUnavailable => {
             "browser-station-probe-unavailable"
         }
@@ -16683,6 +16692,8 @@ pub enum NodeServerError {
     NetworkAllowlistCatalogIo(#[source] std::io::Error),
     #[error("network allowlist catalog line {line}: {message}")]
     InvalidNetworkAllowlistCatalogEntry { line: usize, message: String },
+    #[error("network allowlist catalog: {0}")]
+    InvalidNetworkAllowlistCatalog(String),
     #[error("network allowlist catalog exceeds the {max}-entry limit")]
     NetworkAllowlistCatalogCapacity { max: usize },
     #[error("the local state directory is unavailable; supply an explicit state path")]
@@ -16788,6 +16799,7 @@ impl From<crate::network_allowlist_catalog::NetworkAllowlistCatalogError> for No
             E::InvalidEntry { line, message } => {
                 Self::InvalidNetworkAllowlistCatalogEntry { line, message }
             }
+            E::InvalidCatalog(message) => Self::InvalidNetworkAllowlistCatalog(message),
             E::Capacity { max } => Self::NetworkAllowlistCatalogCapacity { max },
         }
     }
@@ -17275,7 +17287,8 @@ mod station_knobs_resolve_tests {
             .network_allowlist_catalog
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(allowlist.clone());
+            .insert_id(allowlist.clone())
+            .unwrap();
         let spec = crate::protocol::SpawnSpec {
             target: crate::protocol::SpawnTarget {
                 node_id: shared.node_id.clone(),
@@ -17473,7 +17486,8 @@ mod station_knobs_resolve_tests {
             .network_allowlist_catalog
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(allowlist.clone());
+            .insert_id(allowlist.clone())
+            .unwrap();
         let snapshot = shared.snapshot();
         let inventory = snapshot
             .launch_inventory
@@ -17483,6 +17497,143 @@ mod station_knobs_resolve_tests {
             .expect("non-empty catalog surfaces ids");
         assert_eq!(ids, vec![allowlist]);
     }
+
+    /// Track B: registered id with provider_native codex_network_access refuses
+    /// clearly for Claude (fixture provider). Unknown id still UnknownNetworkAllowlist.
+    /// Never secrets on C2. Codex argv apply is a later tip.
+    #[test]
+    fn resolve_environment_profile_refuses_unsupported_provider_native_mapping() {
+        let (shared, defaults) = station_knobs_fixture();
+        let allowlist = crate::protocol::SpawnNetworkAllowlistId::new("egress-codex-only").unwrap();
+        let entry = crate::network_allowlist_catalog::NetworkAllowlistEntry {
+            id: allowlist.clone(),
+            permits: vec![crate::network_allowlist_catalog::NetworkPermitSketch {
+                protocol: crate::network_allowlist_catalog::NetworkPermitProtocol::Tcp,
+                peer: "127.0.0.1:443".to_owned(),
+            }],
+            provider_native: Some(
+                crate::network_allowlist_catalog::ProviderNativeNetworkSketch {
+                    codex_network_access: Some(true),
+                },
+            ),
+        };
+        shared
+            .network_allowlist_catalog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(entry)
+            .unwrap();
+        let spec = crate::protocol::SpawnSpec {
+            target: crate::protocol::SpawnTarget {
+                node_id: shared.node_id.clone(),
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: defaults.profile_id.clone(),
+            expected_profile_revision: defaults.revision.clone(),
+            overrides: crate::protocol::SpawnOverrides {
+                network_allowlist: Some(allowlist),
+                ..crate::protocol::SpawnOverrides::default()
+            },
+            deadline_ms: crate::protocol::SpawnDeadlineMs::new(30_000).unwrap(),
+            idempotency_key: crate::protocol::SpawnIdempotencyKey::new(
+                "station-knobs-unsupported-mapping",
+            )
+            .unwrap(),
+            required_capabilities: crate::protocol::SpawnRequiredCapabilities::default(),
+        };
+        let resolved = spec.resolve(&defaults).unwrap();
+        assert_eq!(resolved.provider.as_str(), "claude");
+        let failure = shared
+            .resolve_environment_profile(&resolved)
+            .expect_err("claude + codex_network_access must refuse");
+        assert_eq!(
+            failure.code,
+            NodeFailureCode::UnsupportedNetworkAllowlistMapping
+        );
+    }
+
+    /// Track B: JSON v2 catalog file loads permits; inventory still ids only.
+    #[test]
+    fn network_allowlist_catalog_loads_json_v2_and_lists_ids_only() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "gate4agent-node-allowlist-json-{}-{unique}.json",
+            std::process::id(),
+        ));
+        std::fs::write(
+            &path,
+            r#"{
+              "schema_version": 2,
+              "entries": [
+                {
+                  "id": "egress-default",
+                  "permits": [{ "protocol": "tcp", "peer": "127.0.0.1:443" }]
+                },
+                { "id": "lab-egress" }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let loaded = crate::network_allowlist_catalog::load_network_allowlist_catalog_file(&path)
+            .expect("json v2 catalog must load");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.len(), 2);
+        let entry = loaded
+            .get(&crate::protocol::SpawnNetworkAllowlistId::new("egress-default").unwrap())
+            .unwrap();
+        assert_eq!(entry.permits.len(), 1);
+        let (shared, defaults) = station_knobs_fixture();
+        {
+            let mut catalog = shared
+                .network_allowlist_catalog
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *catalog = loaded;
+        }
+        let allowlist = crate::protocol::SpawnNetworkAllowlistId::new("egress-default").unwrap();
+        let spec = crate::protocol::SpawnSpec {
+            target: crate::protocol::SpawnTarget {
+                node_id: shared.node_id.clone(),
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: defaults.profile_id.clone(),
+            expected_profile_revision: defaults.revision.clone(),
+            overrides: crate::protocol::SpawnOverrides {
+                network_allowlist: Some(allowlist.clone()),
+                ..crate::protocol::SpawnOverrides::default()
+            },
+            deadline_ms: crate::protocol::SpawnDeadlineMs::new(30_000).unwrap(),
+            idempotency_key: crate::protocol::SpawnIdempotencyKey::new(
+                "station-knobs-catalog-json",
+            )
+            .unwrap(),
+            required_capabilities: crate::protocol::SpawnRequiredCapabilities::default(),
+        };
+        let resolved = spec.resolve(&defaults).unwrap();
+        let receipt = shared
+            .resolve_environment_profile(&resolved)
+            .expect("permits-only entry ok for claude")
+            .expect("env profile present");
+        assert_eq!(receipt.network_allowlist.as_ref(), Some(&allowlist));
+        let inventory = shared
+            .snapshot()
+            .launch_inventory
+            .expect("launch inventory present");
+        let ids = inventory.network_allowlists.expect("ids surface");
+        assert_eq!(
+            ids,
+            vec![
+                crate::protocol::SpawnNetworkAllowlistId::new("egress-default").unwrap(),
+                crate::protocol::SpawnNetworkAllowlistId::new("lab-egress").unwrap(),
+            ]
+        );
+    }
+
 
 }
 

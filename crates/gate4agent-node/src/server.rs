@@ -1307,23 +1307,19 @@ impl NodeServerConfig {
     }
 
     /// Enables the H3B read proxy with one exact operator-reviewed helper file.
+    /// Linux/macOS use owner-only UDS; Windows uses owner-only named pipes.
+    /// Both platforms review the helper the same way (absolute regular file +
+    /// identity hash) — the old `cfg(not(windows))` hard-refuse was a leftover
+    /// gate after Unix listener/peer-cred support landed.
     pub fn with_harness_mcp_helper(
         mut self,
         helper_program: impl Into<PathBuf>,
     ) -> Result<Self, NodeServerError> {
-        #[cfg(not(windows))]
-        {
-            let _ = helper_program;
-            return Err(NodeServerError::InvalidHarnessMcpHelper);
-        }
-        #[cfg(windows)]
-        {
         self.harness_mcp_helper = Some(
             ReviewedHarnessMcpProgram::review(helper_program.into())
                 .map_err(|_| NodeServerError::InvalidHarnessMcpHelper)?,
         );
         Ok(self)
-        }
     }
 
     /// Install an in-memory station network allowlist catalog (opaque ids +

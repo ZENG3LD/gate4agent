@@ -996,8 +996,29 @@ fn client_is_provider_descendant(stream: &LocalServerStream, provider_root_pid: 
 
 #[cfg(unix)]
 fn client_is_provider_descendant(stream: &LocalServerStream, provider_root_pid: u32) -> bool {
-    stream.peer_cred().ok().and_then(|credential| credential.pid())
-        .is_some_and(|pid| pid as u32 == provider_root_pid)
+    // Match Windows: the MCP helper is a child of the provider, not the
+    // provider itself. Walk `/proc/<pid>/stat` ppid up to 64 steps.
+    let Some(client_pid) = stream.peer_cred().ok().and_then(|credential| credential.pid())
+        .map(|pid| pid as u32) else { return false; };
+    if client_pid == provider_root_pid { return true; }
+    let mut current = client_pid;
+    for _ in 0..64 {
+        let Some(parent) = unix_parent_pid(current) else { return false; };
+        if parent == provider_root_pid { return true; }
+        if parent == 0 || parent == current { return false; }
+        current = parent;
+    }
+    false
+}
+
+#[cfg(unix)]
+fn unix_parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `/proc/<pid>/stat`: `pid (comm) state ppid ...` — comm may contain
+    // spaces/parens, so split on the final `) ` then take field index 2
+    // of the remainder (ppid is the 4th overall field).
+    let rest = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start())?;
+    rest.split_whitespace().nth(1)?.parse().ok()
 }
 
 #[cfg(test)]

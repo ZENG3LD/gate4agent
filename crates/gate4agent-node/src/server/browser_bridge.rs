@@ -1,13 +1,20 @@
-//! Node-envelope HTTP + WebSocket browser bridge (first slice).
+//! Node-envelope HTTP + WebSocket browser bridge.
 //!
 //! Separate from framed node-wire C2 and from the ops `--api-listen` HTTP
 //! observer (`http_api`). Loopback-only bind; optional `GATE4AGENT_BRIDGE_TOKEN`
 //! (never logged). Product bytes are HTTP+WS over TCP. UDP is not an
 //! application protocol here — it remains the mesh/WG-class underlay each
 //! peer will own a slice of later (see design plan connectivity doctrine).
+//!
+//! Observe projection (tip 3): slim per-session inventory over WS / HTTP
+//! snapshot — address, status, screen kind, opaque browser_profile_id when
+//! bound. No terminal_frame contents, history messages, cookies, or tokens.
 
 use super::NodeShared;
 use crate::protocol::BUILD_STAMP;
+use gate4agent_types::{
+    PreparedInputKind, PtyScreenState, SessionSnapshot, SessionStatus, TerminalSize,
+};
 use serde_json::{json, Value};
 use std::io;
 use std::net::SocketAddr;
@@ -229,8 +236,8 @@ Sec-WebSocket-Accept: {accept}\r\n\
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bridge ws upgrade write timed out"))??;
 
-    // First observe frame: typed hello + minimal snapshot.
-    // Full session projection is a later tip — keep fields honest/empty-capable.
+    // Observe frame: typed hello + slim per-session projections (tip 3).
+    // Streaming push / drive API remain later tips.
     let payload = serde_json::to_vec(&observe_frame(shared)).map_err(|error| {
         io::Error::new(io::ErrorKind::InvalidData, error)
     })?;
@@ -239,7 +246,7 @@ Sec-WebSocket-Accept: {accept}\r\n\
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bridge ws frame write timed out"))??;
 
-    // Slice 1: one observe text frame then close. Streaming push is next tip.
+    // One observe text frame then close. Streaming push is a later tip.
     let close = [0x88u8, 0x00]; // FIN + opcode close, empty payload
     let _ = timeout(WRITE_TIMEOUT, stream.write_all(&close)).await;
     Ok(())
@@ -286,11 +293,15 @@ fn observe_snapshot_body(shared: &NodeShared) -> Value {
     observe_frame(shared)
 }
 
-/// Typed observe payload. Full projection is next; this tip sends honest
-/// session counts the node already tracks (no screen/cookies/provider RPC).
+/// Typed observe payload with slim per-session projections.
+/// Privacy: no terminal_frame contents/formatted, no history messages, no
+/// cookies/OAuth, no bridge/node tokens. Screen is kind (+ short classifiers)
+/// only — OperatorGate options (on-screen choice labels) are stripped.
 fn observe_frame(shared: &NodeShared) -> Value {
-    let control_plane_sessions = shared.handle.snapshot().sessions.len();
+    let control = shared.handle.snapshot();
+    let control_plane_sessions = control.sessions.len();
     let native_pty_sessions = shared.native_session_gauge.load(Ordering::Relaxed);
+    let session_projections = slim_session_projections(shared, &control.sessions);
     json!({
         "type": "bridge.hello",
         "observe": {
@@ -299,14 +310,134 @@ fn observe_frame(shared: &NodeShared) -> Value {
                 "control_plane": control_plane_sessions,
                 "native_pty": native_pty_sessions,
             },
-            // Honest empty list: per-session projection lands in a later tip.
-            "session_projections": [],
-            "note": "minimal snapshot; full projection/drive is next tip",
+            "session_projections": session_projections,
+            "note": "slim session projection; drive/streaming/mesh underlay later",
         },
         "node_id": shared.node_id,
         "incarnation_id": shared.incarnation_id,
         "door": "node-envelope-bridge",
     })
+}
+
+const SLIM_FAILED_MESSAGE_MAX: usize = 160;
+const SLIM_PROCESS_NAME_MAX: usize = 64;
+const SLIM_FAILING_REASON_MAX: usize = 96;
+
+fn slim_session_projections(
+    shared: &NodeShared,
+    sessions: &[SessionSnapshot],
+) -> Vec<Value> {
+    let bindings = shared
+        .session_bindings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut out = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let Some(binding) = bindings.get(&session.instance_id) else {
+            continue;
+        };
+        if binding.generation != session.generation {
+            continue;
+        }
+        let browser_profile_id = binding
+            .environment_profile
+            .as_ref()
+            .and_then(|receipt| receipt.browser_profile_id.as_ref())
+            .map(|id| id.as_str().to_owned());
+        let network_allowlist = binding
+            .environment_profile
+            .as_ref()
+            .and_then(|receipt| receipt.network_allowlist.as_ref())
+            .map(|id| id.as_str().to_owned());
+        out.push(json!({
+            "workspace_id": binding.workspace_id.as_str(),
+            "instance_id": session.instance_id.0,
+            "generation": session.generation.0,
+            "agent_id": session.agent_id.as_str(),
+            "transport": session.transport,
+            "status": slim_session_status(&session.status),
+            "screen": slim_screen_state(&session.screen_state),
+            "pending_input": session.pending_input.map(slim_pending_input),
+            "terminal_size": session.terminal_size.map(slim_terminal_size),
+            "browser_profile_id": browser_profile_id,
+            "network_allowlist": network_allowlist,
+            // Explicitly absent: terminal_frame, history, provider internals,
+            // cwd/paths, cookies, tokens.
+        }));
+    }
+    out
+}
+
+fn slim_session_status(status: &SessionStatus) -> Value {
+    match status {
+        SessionStatus::Registered => json!({ "kind": "registered" }),
+        SessionStatus::Starting => json!({ "kind": "starting" }),
+        SessionStatus::Running => json!({ "kind": "running" }),
+        SessionStatus::Stopping => json!({ "kind": "stopping" }),
+        SessionStatus::Exited { exit_code } => json!({
+            "kind": "exited",
+            "exit_code": exit_code,
+        }),
+        SessionStatus::Failed { message } => json!({
+            "kind": "failed",
+            "message": truncate_chars(message, SLIM_FAILED_MESSAGE_MAX),
+        }),
+    }
+}
+
+fn slim_screen_state(screen: &PtyScreenState) -> Value {
+    match screen {
+        PtyScreenState::Unknown => json!({ "kind": "unknown" }),
+        PtyScreenState::NotAgent { observed_process } => json!({
+            "kind": "not-agent",
+            "observed_process": truncate_chars(
+                &basename_process(observed_process),
+                SLIM_PROCESS_NAME_MAX,
+            ),
+        }),
+        PtyScreenState::OperatorGate { gate } => json!({
+            "kind": "operator-gate",
+            // Kind only — strip options (on-screen labels) and subject detail.
+            "gate_kind": gate.kind,
+        }),
+        PtyScreenState::Failing { reason } => json!({
+            "kind": "failing",
+            "reason": truncate_chars(reason, SLIM_FAILING_REASON_MAX),
+        }),
+        PtyScreenState::Ready => json!({ "kind": "ready" }),
+    }
+}
+
+fn slim_pending_input(kind: PreparedInputKind) -> Value {
+    // Serialize the enum via serde so rename_all kebab-case stays honest.
+    serde_json::to_value(kind).unwrap_or_else(|_| json!("unknown"))
+}
+
+fn slim_terminal_size(size: TerminalSize) -> Value {
+    json!({ "rows": size.rows, "columns": size.columns })
+}
+
+fn basename_process(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let name = trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    if name.is_empty() {
+        "unknown".to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_owned();
+    }
+    let mut out: String = value.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn extract_bridge_token(request: &Request) -> Option<String> {
@@ -766,7 +897,10 @@ Sec-WebSocket-Version: 13\r\n\
         assert!(body.contains("\"type\":\"bridge.hello\""));
         assert!(body.contains("\"type\":\"observe.snapshot\""));
         assert!(body.contains("\"session_projections\":[]"));
+        assert!(body.contains("slim session projection"));
         assert!(!body.contains("test-token"));
+        assert!(!body.contains("terminal_frame"));
+        assert!(!body.contains("GATE4AGENT"));
 
         server.shutdown_handle().request_shutdown().await.unwrap();
         timeout(Duration::from_secs(1), task)
@@ -800,6 +934,85 @@ Sec-WebSocket-Version: 13\r\n\
         .await;
         assert!(ok.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(!ok.contains("bridge-secret"));
+
+        server.shutdown_handle().request_shutdown().await.unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn slim_screen_strips_operator_gate_options_and_basenames_process() {
+        use gate4agent_types::{
+            OperatorGateInput, OperatorGateKind, OperatorGateOption,
+            OperatorGateOptionSemantics, OperatorGateState,
+        };
+
+        let mut gate = OperatorGateState::new(OperatorGateKind::Authentication);
+        // Force an on-screen option label into the gate so we can assert the
+        // slim projector strips it (options stay station/operator-local).
+        gate.input = OperatorGateInput::NumberedList;
+        gate.options = vec![OperatorGateOption {
+            text: "sign in with cookie-jar secret".into(),
+            semantics: OperatorGateOptionSemantics::Accept,
+            selected: false,
+        }];
+        let projected = slim_screen_state(&PtyScreenState::OperatorGate { gate });
+        let text = projected.to_string();
+        assert!(text.contains("\"kind\":\"operator-gate\""));
+        assert!(text.contains("authentication"));
+        assert!(!text.contains("cookie-jar"));
+        assert!(!text.contains("sign in"));
+
+        let not_agent = slim_screen_state(&PtyScreenState::NotAgent {
+            observed_process: "/home/fixture/bin/apt-get".into(),
+        });
+        assert_eq!(
+            not_agent,
+            json!({
+                "kind": "not-agent",
+                "observed_process": "apt-get",
+            })
+        );
+    }
+
+    #[test]
+    fn slim_status_truncates_failed_message() {
+        let long = "x".repeat(SLIM_FAILED_MESSAGE_MAX + 40);
+        let projected = slim_session_status(&SessionStatus::Failed {
+            message: long.clone(),
+        });
+        let message = projected["message"].as_str().unwrap();
+        assert!(message.chars().count() <= SLIM_FAILED_MESSAGE_MAX);
+        assert!(message.ends_with('…'));
+        assert!(!projected.to_string().contains(&long));
+    }
+
+    #[tokio::test]
+    async fn bridge_http_snapshot_exposes_slim_projection_shape() {
+        let server = node_server();
+        let shared = Arc::clone(&server.shared);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = BridgeAuth::from_optional(None).unwrap();
+        let task = tokio::spawn(serve_listener(listener, auth, Arc::clone(&shared)));
+
+        let body = http_text(
+            address,
+            "GET /bridge/snapshot HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(
+            body.starts_with("HTTP/1.1 200 OK\r\n"),
+            "unexpected snapshot response: {body}"
+        );
+        assert!(body.contains("\"type\":\"bridge.hello\""));
+        assert!(body.contains("\"session_projections\":[]"));
+        assert!(body.contains("slim session projection"));
+        assert!(!body.contains("test-token"));
+        assert!(!body.contains("terminal_frame"));
 
         server.shutdown_handle().request_shutdown().await.unwrap();
         timeout(Duration::from_secs(1), task)

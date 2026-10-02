@@ -1827,6 +1827,56 @@ mod tests {
     }
 
     #[test]
+    fn provider_home_path_bindings_pass_claude_kimi_grok_relocation_env_keys() {
+        // NODE-level multi-config: same generic ProviderHome binding used for
+        // CODEX_HOME also relocates Claude/Kimi/Grok homes via profile data.
+        // Temp materialization root only — never touches real ~/.claude etc.
+        let root = temp_root();
+        let materializer =
+            SessionEnvironmentMaterializer::new(root.clone(), Arc::new(FakeResolver)).unwrap();
+        for key in ["CLAUDE_CONFIG_DIR", "KIMI_CODE_HOME", "GROK_HOME"] {
+            let profile = NodeSessionMaterializationProfile::new(
+                Vec::new(),
+                vec![NodeSessionPathBinding::new(key, NodeSessionPathClass::ProviderHome).unwrap()],
+                Vec::new(),
+            )
+            .unwrap();
+            // Claude/Kimi layouts do not require an exclusive home key; Codex does.
+            assert!(profile.supports_bundle_layout(BundleProviderLayout::Claude));
+            assert!(profile.supports_bundle_layout(BundleProviderLayout::Kimi));
+            assert!(!profile.supports_bundle_layout(BundleProviderLayout::Codex));
+
+            let id = MaterializationId::new(format!(
+                "reloc-{}",
+                key.to_ascii_lowercase().replace('_', "-")
+            ))
+            .unwrap();
+            let prepared = materializer
+                .prepare(id, receipt(), owner(), None, &profile, 40)
+                .unwrap();
+            let env = prepared.environment();
+            assert_eq!(env.len(), 1, "key={key}");
+            assert_eq!(env[0].key, OsString::from(key));
+            let value = env[0].value.as_ref().expect("path binding must set a value");
+            let provider_home = PathBuf::from(value);
+            assert!(provider_home.is_absolute());
+            assert_eq!(
+                provider_home.file_name().and_then(|n| n.to_str()),
+                Some(NodeSessionPathClass::ProviderHome.directory_name()),
+            );
+            assert!(
+                provider_home.starts_with(&root),
+                "materialized home must stay under temp root, not the real user profile"
+            );
+            let (_, ownership) = prepared.into_parts();
+            materializer.cleanup(&ownership).unwrap();
+            assert!(!ownership.root().exists());
+        }
+        drop(materializer);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn failed_materialization_retains_cleanup_state_until_absence_is_reconciled() {
         let root = temp_root();
         let materializer = SessionEnvironmentMaterializer::new(root.clone(), Arc::new(UnavailableResolver)).unwrap();

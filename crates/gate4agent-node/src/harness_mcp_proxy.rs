@@ -2,7 +2,7 @@
 //!
 //! The node owns this envelope (`HarnessMcpProxyRegistry`): reservations,
 //! owner-only local endpoint, token barrier, and opaque call relay. The
-//! reviewed helper (`gate4agent-harness-mcp` bin / `hatchery-harness-mcp`
+//! reviewed helper (`hatchery-harness-mcp` bin / `hatchery-harness-mcp`
 //! crate) may speak MCP/JSON-RPC on the **session's** stdio. Provider
 //! dialects (ACP JSON-RPC, pipe NDJSON, PTY) stay node-local adapters.
 //! C2 carries only our node envelopes — never provider RPC. Remote control

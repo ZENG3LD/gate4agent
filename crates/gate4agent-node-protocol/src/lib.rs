@@ -2029,7 +2029,7 @@ pub enum HarnessMcpContentTypeV1 {
 /// (`HarnessMcpLocalRequestV1::request`, `HarnessMcpLocalReplyV1::Ok::
 /// response`, `NodeEvent::HarnessMcpReadCall::request`): `body` is whatever
 /// bytes the originating endpoint encoded, and this crate never decodes it.
-/// Only the reviewed local helper (`gate4agent-harness-mcp` bin from
+/// Only the reviewed local helper (`hatchery-harness-mcp` bin from
 /// `hatchery-harness-mcp`, which holds `hatchery-harness-api` types via
 /// `hatchery-harness-client`) and `hatchery-harness-service` (the harness
 /// itself) know what `body` actually contains.

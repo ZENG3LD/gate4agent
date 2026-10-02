@@ -16,10 +16,12 @@
 //! the auth barrier (not C2 controller lease). No raw PTY bytes / TerminalBytes
 //! / cookies / OAuth as product API.
 //!
-//! Streaming observe (tip after drive): `/bridge/ws` keeps the connection,
-//! sends an initial `bridge.hello` slim snapshot, then periodic
-//! `observe.snapshot` frames. Client ping→pong; close or node shutdown ends
-//! the loop. Not a C2 controller; no cookies/OAuth/secrets on the wire.
+//! Streaming observe: `/bridge/ws` keeps the connection, sends an initial
+//! `bridge.hello` slim snapshot (`seq: 0`), then change-driven `observe.delta`
+//! (or forced/full `observe.snapshot`) frames. Unchanged ticks are suppressed.
+//! `GATE4AGENT_BRIDGE_OBSERVE_MODE=snapshot-only` restores every-tick full
+//! snapshots (streaming tip behavior). Client ping→pong; close or node
+//! shutdown ends the loop. Not a C2 controller; no cookies/OAuth/secrets.
 
 use super::NodeShared;
 use crate::protocol::{
@@ -33,6 +35,7 @@ use gate4agent_types::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -52,10 +55,16 @@ const MAX_BRIDGE_CONNECTIONS: usize = 8;
 /// JSON envelope overhead budget on top of `MAX_NODE_TEXT_BYTES` for drive POST.
 const BRIDGE_DRIVE_BODY_OVERHEAD: usize = 1_024;
 const MAX_BRIDGE_DRIVE_BODY_BYTES: usize = MAX_NODE_TEXT_BYTES + BRIDGE_DRIVE_BODY_OVERHEAD;
-/// Default period between slim observe snapshots on an open `/bridge/ws`.
+/// Default period between observe ticks on an open `/bridge/ws`.
 /// Slim projections only — keep short enough for MLC attach, long enough to
 /// avoid busy-looping the node snapshot lock.
 const DEFAULT_OBSERVE_PERIOD: Duration = Duration::from_secs(1);
+/// Forced full `observe.snapshot` every N emitted delta ticks (~1 min @ 1s).
+const SNAPSHOT_FLOOR_TICKS: u32 = 60;
+/// If upserts+removes exceed this, emit full snapshot instead of delta.
+const DELTA_ROW_CAP: usize = 32;
+/// Escape hatch: `snapshot-only` ≡ always-full ticks (streaming tip).
+const BRIDGE_OBSERVE_MODE_ENV: &str = "GATE4AGENT_BRIDGE_OBSERVE_MODE";
 /// Cap client control-frame payload (RFC6455 ping/pong/close body).
 const WS_CONTROL_PAYLOAD_MAX: usize = 125;
 /// Cap inbound client data frame for this tip (observe-only; drive is HTTP).
@@ -95,6 +104,131 @@ pub(super) enum BridgeAuthError {
     Invalid,
 }
 
+/// Observe emit mode on `/bridge/ws` (design §5.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObserveMode {
+    /// Change-driven: suppress unchanged ticks; emit `observe.delta` or forced full.
+    Delta,
+    /// Always full `observe.snapshot` each tick (≡ streaming tip `3f5aedc`).
+    SnapshotOnly,
+}
+
+impl ObserveMode {
+    fn from_env() -> Self {
+        match std::env::var(BRIDGE_OBSERVE_MODE_ENV).ok().as_deref() {
+            Some(value) if value.eq_ignore_ascii_case("snapshot-only") => Self::SnapshotOnly,
+            _ => Self::Delta,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionGauges {
+    control_plane: usize,
+    native_pty: usize,
+}
+
+/// Keyed tip-3 slim rows for deterministic diff `(instance_id, generation)`.
+type ProjectionMap = BTreeMap<(u64, u64), Value>;
+
+fn projection_row_key(row: &Value) -> Option<(u64, u64)> {
+    let instance_id = row.get("instance_id")?.as_u64()?;
+    let generation = row.get("generation")?.as_u64()?;
+    Some((instance_id, generation))
+}
+
+fn projections_to_map(projections: &[Value]) -> ProjectionMap {
+    let mut map = BTreeMap::new();
+    for row in projections {
+        if let Some(key) = projection_row_key(row) {
+            map.insert(key, row.clone());
+        }
+    }
+    map
+}
+
+fn map_to_projections(map: &ProjectionMap) -> Vec<Value> {
+    map.values().cloned().collect()
+}
+
+/// Diff last vs now: whole-row upserts + `{instance_id, generation}` removes.
+fn diff_projections(last: &ProjectionMap, now: &ProjectionMap) -> (Vec<Value>, Vec<Value>) {
+    let mut upserts = Vec::new();
+    for (key, row) in now {
+        match last.get(key) {
+            Some(prev) if prev == row => {}
+            _ => upserts.push(row.clone()),
+        }
+    }
+    let mut removes = Vec::new();
+    for (instance_id, generation) in last.keys() {
+        if !now.contains_key(&(*instance_id, *generation)) {
+            removes.push(json!({
+                "instance_id": instance_id,
+                "generation": generation,
+            }));
+        }
+    }
+    (upserts, removes)
+}
+
+#[derive(Debug, PartialEq)]
+enum TickDecision {
+    Suppress,
+    Snapshot,
+    Delta { upserts: Vec<Value>, removes: Vec<Value> },
+}
+
+fn decide_observe_tick(
+    mode: ObserveMode,
+    last: &ProjectionMap,
+    last_gauges: SessionGauges,
+    now: &ProjectionMap,
+    now_gauges: SessionGauges,
+    ticks_since_snapshot: u32,
+) -> TickDecision {
+    if mode == ObserveMode::SnapshotOnly {
+        return TickDecision::Snapshot;
+    }
+    if last == now && last_gauges == now_gauges {
+        return TickDecision::Suppress;
+    }
+    let (upserts, removes) = diff_projections(last, now);
+    let row_churn = upserts.len().saturating_add(removes.len());
+    if ticks_since_snapshot.saturating_add(1) >= SNAPSHOT_FLOOR_TICKS {
+        return TickDecision::Snapshot;
+    }
+    if row_churn > DELTA_ROW_CAP {
+        return TickDecision::Snapshot;
+    }
+    // Gauge-only change (no row churn): always delta — design §4.2.
+    if row_churn == 0 {
+        return TickDecision::Delta { upserts, removes };
+    }
+    // Size heuristic: if projected delta JSON ≥ ~80% of full snapshot, send full.
+    let delta_probe = json!({
+        "upserts": &upserts,
+        "removes": &removes,
+        "sessions": {
+            "control_plane": now_gauges.control_plane,
+            "native_pty": now_gauges.native_pty,
+        },
+    });
+    let full_probe = json!({
+        "session_projections": map_to_projections(now),
+        "sessions": {
+            "control_plane": now_gauges.control_plane,
+            "native_pty": now_gauges.native_pty,
+        },
+    });
+    let delta_len = serde_json::to_vec(&delta_probe).map(|v| v.len()).unwrap_or(0);
+    let full_len = serde_json::to_vec(&full_probe).map(|v| v.len()).unwrap_or(1);
+    if full_len > 0 && delta_len.saturating_mul(10) >= full_len.saturating_mul(8) {
+        return TickDecision::Snapshot;
+    }
+    TickDecision::Delta { upserts, removes }
+}
+
 pub(super) async fn run(
     listen: Option<SocketAddr>,
     auth: BridgeAuth,
@@ -124,7 +258,14 @@ async fn serve_listener(
     auth: BridgeAuth,
     shared: Arc<NodeShared>,
 ) -> io::Result<()> {
-    serve_listener_with_observe_period(listener, auth, shared, DEFAULT_OBSERVE_PERIOD).await
+    serve_listener_with_observe_options(
+        listener,
+        auth,
+        shared,
+        DEFAULT_OBSERVE_PERIOD,
+        ObserveMode::from_env(),
+    )
+    .await
 }
 
 async fn serve_listener_with_observe_period(
@@ -132,6 +273,23 @@ async fn serve_listener_with_observe_period(
     auth: BridgeAuth,
     shared: Arc<NodeShared>,
     observe_period: Duration,
+) -> io::Result<()> {
+    serve_listener_with_observe_options(
+        listener,
+        auth,
+        shared,
+        observe_period,
+        ObserveMode::from_env(),
+    )
+    .await
+}
+
+async fn serve_listener_with_observe_options(
+    listener: TcpListener,
+    auth: BridgeAuth,
+    shared: Arc<NodeShared>,
+    observe_period: Duration,
+    observe_mode: ObserveMode,
 ) -> io::Result<()> {
     let permits = Arc::new(Semaphore::new(MAX_BRIDGE_CONNECTIONS));
     let mut connections = JoinSet::new();
@@ -168,6 +326,7 @@ async fn serve_listener_with_observe_period(
                         connection_auth,
                         connection_shared,
                         observe_period,
+                        observe_mode,
                     )
                     .await;
                 });
@@ -186,6 +345,7 @@ async fn serve_connection(
     auth: BridgeAuth,
     shared: Arc<NodeShared>,
     observe_period: Duration,
+    observe_mode: ObserveMode,
 ) -> io::Result<()> {
     let request = match timeout(HEADER_READ_TIMEOUT, read_request(&mut stream)).await {
         Ok(Ok(request)) => request,
@@ -202,7 +362,7 @@ async fn serve_connection(
         .map_or(request.target.as_str(), |(path, _)| path);
 
     if path_only == "/bridge/ws" {
-        return handle_websocket_upgrade(stream, request, &auth, &shared, observe_period).await;
+        return handle_websocket_upgrade(stream, request, &auth, &shared, observe_period, observe_mode).await;
     }
 
     if path_only == "/bridge/drive" {
@@ -240,6 +400,7 @@ async fn handle_websocket_upgrade(
     auth: &BridgeAuth,
     shared: &NodeShared,
     observe_period: Duration,
+    observe_mode: ObserveMode,
 ) -> io::Result<()> {
     if request.method != "GET" {
         return write_http(
@@ -285,20 +446,34 @@ Sec-WebSocket-Accept: {accept}\r\n\
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bridge ws upgrade write timed out"))??;
 
-    // Initial hello + keep connection for periodic slim snapshots.
+    // Initial hello + keep connection for change-driven observe.
     // Drive remains HTTP POST /bridge/drive (tip 4). Mesh underlay later.
-    run_ws_observe_loop(&mut stream, shared, observe_period).await
+    run_ws_observe_loop(&mut stream, shared, observe_period, observe_mode).await
 }
 
-/// Keep `/bridge/ws` open: hello once, then periodic `observe.snapshot`.
+/// Keep `/bridge/ws` open: hello once (`seq: 0`), then change-driven ticks.
+/// Default mode suppresses unchanged ticks and emits `observe.delta` with
+/// `basis_seq`; forced full `observe.snapshot` per floor/cap/size rules.
+/// `ObserveMode::SnapshotOnly` restores every-tick full snapshots.
 /// Responds to client ping with pong; ends on client close, read error, or
 /// node shutdown. Ignores inbound text/binary (drive is HTTP, not WS C2).
 async fn run_ws_observe_loop(
     stream: &mut TcpStream,
     shared: &NodeShared,
     observe_period: Duration,
+    observe_mode: ObserveMode,
 ) -> io::Result<()> {
-    write_ws_text(stream, &observe_hello_frame(shared)).await?;
+    let (control_plane, native_pty, projections) = observe_core(shared);
+    let mut last_map = projections_to_map(&projections);
+    let mut last_gauges = SessionGauges {
+        control_plane,
+        native_pty,
+    };
+    write_ws_text(
+        stream,
+        &observe_hello_frame_from(shared, control_plane, native_pty, &projections),
+    )
+    .await?;
 
     let period = if observe_period.is_zero() {
         DEFAULT_OBSERVE_PERIOD
@@ -311,6 +486,7 @@ async fn run_ws_observe_loop(
     ticker.tick().await;
 
     let mut seq: u64 = 0;
+    let mut ticks_since_snapshot: u32 = 0;
     loop {
         let shutdown = shared.shutdown_notify.notified();
         tokio::pin!(shutdown);
@@ -325,9 +501,57 @@ async fn run_ws_observe_loop(
                 }
             }
             _ = ticker.tick() => {
-                seq = seq.saturating_add(1);
-                if write_ws_text(stream, &observe_tick_frame(shared, seq)).await.is_err() {
-                    break;
+                let (control_plane, native_pty, projections) = observe_core(shared);
+                let now_map = projections_to_map(&projections);
+                let now_gauges = SessionGauges {
+                    control_plane,
+                    native_pty,
+                };
+                let decision = decide_observe_tick(
+                    observe_mode,
+                    &last_map,
+                    last_gauges,
+                    &now_map,
+                    now_gauges,
+                    ticks_since_snapshot,
+                );
+                match decision {
+                    TickDecision::Suppress => {}
+                    TickDecision::Snapshot => {
+                        seq = seq.saturating_add(1);
+                        let frame = observe_snapshot_frame(
+                            shared,
+                            seq,
+                            control_plane,
+                            native_pty,
+                            &projections,
+                        );
+                        if write_ws_text(stream, &frame).await.is_err() {
+                            break;
+                        }
+                        last_map = now_map;
+                        last_gauges = now_gauges;
+                        ticks_since_snapshot = 0;
+                    }
+                    TickDecision::Delta { upserts, removes } => {
+                        let basis_seq = seq;
+                        seq = seq.saturating_add(1);
+                        let frame = observe_delta_frame(
+                            shared,
+                            seq,
+                            basis_seq,
+                            control_plane,
+                            native_pty,
+                            &upserts,
+                            &removes,
+                        );
+                        if write_ws_text(stream, &frame).await.is_err() {
+                            break;
+                        }
+                        last_map = now_map;
+                        last_gauges = now_gauges;
+                        ticks_since_snapshot = ticks_since_snapshot.saturating_add(1);
+                    }
                 }
             }
             frame = read_client_ws_frame(stream) => {
@@ -338,16 +562,13 @@ async fn run_ws_observe_loop(
                             break;
                         }
                     }
-                    Ok(ClientWsFrame::Pong | ClientWsFrame::Data) => {
-                        // Observe-only stream; ignore application data + unsolicited pong.
-                    }
+                    Ok(ClientWsFrame::Pong | ClientWsFrame::Data) => {}
                     Err(_) => break,
                 }
             }
         }
     }
 
-    // Best-effort close; ignore write failures (peer may already be gone).
     let _ = write_ws_control(stream, 0x08, &[]).await;
     Ok(())
 }
@@ -490,6 +711,20 @@ fn observe_core(shared: &NodeShared) -> (usize, usize, Vec<Value>) {
 
 fn observe_hello_frame(shared: &NodeShared) -> Value {
     let (control_plane_sessions, native_pty_sessions, session_projections) = observe_core(shared);
+    observe_hello_frame_from(
+        shared,
+        control_plane_sessions,
+        native_pty_sessions,
+        &session_projections,
+    )
+}
+
+fn observe_hello_frame_from(
+    shared: &NodeShared,
+    control_plane_sessions: usize,
+    native_pty_sessions: usize,
+    session_projections: &[Value],
+) -> Value {
     json!({
         "type": "bridge.hello",
         "observe": {
@@ -500,7 +735,7 @@ fn observe_hello_frame(shared: &NodeShared) -> Value {
                 "native_pty": native_pty_sessions,
             },
             "session_projections": session_projections,
-            "note": "slim session projection; drive via POST /bridge/drive (prompt|paste); WS streams periodic observe.snapshot; mesh underlay later",
+            "note": "slim session projection; drive via POST /bridge/drive (prompt|paste); WS change-driven observe.delta (snapshot-only escape hatch); mesh underlay later",
         },
         "node_id": shared.node_id,
         "incarnation_id": shared.incarnation_id,
@@ -508,8 +743,13 @@ fn observe_hello_frame(shared: &NodeShared) -> Value {
     })
 }
 
-fn observe_tick_frame(shared: &NodeShared, seq: u64) -> Value {
-    let (control_plane_sessions, native_pty_sessions, session_projections) = observe_core(shared);
+fn observe_snapshot_frame(
+    shared: &NodeShared,
+    seq: u64,
+    control_plane_sessions: usize,
+    native_pty_sessions: usize,
+    session_projections: &[Value],
+) -> Value {
     json!({
         "type": "observe.snapshot",
         "seq": seq,
@@ -518,6 +758,31 @@ fn observe_tick_frame(shared: &NodeShared, seq: u64) -> Value {
             "native_pty": native_pty_sessions,
         },
         "session_projections": session_projections,
+        "node_id": shared.node_id,
+        "incarnation_id": shared.incarnation_id,
+        "door": "node-envelope-bridge",
+    })
+}
+
+fn observe_delta_frame(
+    shared: &NodeShared,
+    seq: u64,
+    basis_seq: u64,
+    control_plane_sessions: usize,
+    native_pty_sessions: usize,
+    upserts: &[Value],
+    removes: &[Value],
+) -> Value {
+    json!({
+        "type": "observe.delta",
+        "seq": seq,
+        "basis_seq": basis_seq,
+        "sessions": {
+            "control_plane": control_plane_sessions,
+            "native_pty": native_pty_sessions,
+        },
+        "upserts": upserts,
+        "removes": removes,
         "node_id": shared.node_id,
         "incarnation_id": shared.incarnation_id,
         "door": "node-envelope-bridge",
@@ -1368,7 +1633,7 @@ Sec-WebSocket-Version: 13\r\n\
         assert!(body.contains("\"type\":\"observe.snapshot\""));
         assert!(body.contains("\"session_projections\":[]"));
         assert!(body.contains("slim session projection"));
-        assert!(body.contains("periodic observe.snapshot"));
+        assert!(body.contains("observe.delta") || body.contains("change-driven"));
         assert!(!body.contains("test-token"));
         assert!(!body.contains("terminal_frame"));
         assert!(!body.contains("GATE4AGENT"));
@@ -1483,7 +1748,7 @@ Sec-WebSocket-Version: 13\r\n\
         assert!(body.contains("\"session_projections\":[]"));
         assert!(body.contains("slim session projection"));
         assert!(body.contains("POST /bridge/drive"));
-        assert!(body.contains("periodic observe.snapshot"));
+        assert!(body.contains("observe.delta") || body.contains("change-driven"));
         assert!(!body.contains("test-token"));
         assert!(!body.contains("terminal_frame"));
 
@@ -1746,16 +2011,18 @@ Sec-WebSocket-Version: 13\r\n\
 
     #[tokio::test]
     async fn bridge_ws_streams_periodic_observe_snapshots() {
+        // snapshot-only escape hatch ≡ streaming tip: every tick full snapshot.
         let server = node_server();
         let shared = Arc::clone(&server.shared);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let auth = BridgeAuth::from_optional(None).unwrap();
-        let task = tokio::spawn(serve_listener_with_observe_period(
+        let task = tokio::spawn(serve_listener_with_observe_options(
             listener,
             auth,
             Arc::clone(&shared),
             Duration::from_millis(80),
+            ObserveMode::SnapshotOnly,
         ));
 
         let mut stream = TcpStream::connect(address).await.unwrap();
@@ -1780,7 +2047,7 @@ Sec-WebSocket-Version: 13\r\n\
         let hello = std::str::from_utf8(&texts[0]).unwrap();
         assert!(hello.contains("\"type\":\"bridge.hello\""));
         assert!(hello.contains("\"seq\":0"));
-        assert!(hello.contains("periodic observe.snapshot"));
+        assert!(hello.contains("observe.delta") || hello.contains("change-driven"));
         assert!(!hello.contains("test-token"));
         assert!(!hello.contains("GATE4AGENT"));
 
@@ -1878,5 +2145,224 @@ Sec-WebSocket-Version: 13\r\n\
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    fn sample_row(instance_id: u64, generation: u64, status_kind: &str) -> Value {
+        json!({
+            "workspace_id": "ws",
+            "instance_id": instance_id,
+            "generation": generation,
+            "agent_id": "agent",
+            "transport": "native-pty",
+            "status": { "kind": status_kind },
+            "screen": { "kind": "ready" },
+            "pending_input": null,
+            "terminal_size": { "rows": 24, "columns": 80 },
+            "browser_profile_id": null,
+            "network_allowlist": null,
+        })
+    }
+
+    #[test]
+    fn diff_projections_upserts_removes_and_ignores_unchanged() {
+        let last = projections_to_map(&[
+            sample_row(1, 1, "running"),
+            sample_row(2, 1, "running"),
+        ]);
+        let now = projections_to_map(&[
+            sample_row(1, 1, "running"),
+            sample_row(2, 1, "exited"),
+            sample_row(3, 1, "starting"),
+        ]);
+        let (upserts, removes) = diff_projections(&last, &now);
+        assert_eq!(upserts.len(), 2);
+        let ids: Vec<u64> = upserts
+            .iter()
+            .map(|row| row["instance_id"].as_u64().unwrap())
+            .collect();
+        assert!(ids.contains(&2) && ids.contains(&3));
+        assert_eq!(removes.len(), 0);
+
+        let now_removed = projections_to_map(&[sample_row(2, 1, "exited")]);
+        let (_u2, removes2) = diff_projections(&last, &now_removed);
+        assert_eq!(removes2.len(), 1);
+        assert_eq!(removes2[0]["instance_id"], 1);
+        assert_eq!(removes2[0]["generation"], 1);
+
+        let bumped = projections_to_map(&[sample_row(1, 2, "running")]);
+        let only1 = projections_to_map(&[sample_row(1, 1, "running")]);
+        let (up_b, rm_b) = diff_projections(&only1, &bumped);
+        assert_eq!(rm_b.len(), 1);
+        assert_eq!(rm_b[0]["generation"], 1);
+        assert_eq!(up_b.len(), 1);
+        assert_eq!(up_b[0]["generation"], 2);
+    }
+
+    #[test]
+    fn decide_observe_tick_suppresses_unchanged_and_forces_floor() {
+        let map = projections_to_map(&[sample_row(1, 1, "running")]);
+        let gauges = SessionGauges { control_plane: 1, native_pty: 0 };
+        assert_eq!(
+            decide_observe_tick(ObserveMode::Delta, &map, gauges, &map, gauges, 0),
+            TickDecision::Suppress
+        );
+        let gauges2 = SessionGauges { control_plane: 1, native_pty: 1 };
+        match decide_observe_tick(ObserveMode::Delta, &map, gauges, &map, gauges2, 0) {
+            TickDecision::Delta { upserts, removes } => {
+                assert!(upserts.is_empty() && removes.is_empty());
+            }
+            other => panic!("expected gauge-only delta, got {other:?}"),
+        }
+        assert_eq!(
+            decide_observe_tick(
+                ObserveMode::Delta, &map, gauges, &map, gauges2,
+                SNAPSHOT_FLOOR_TICKS.saturating_sub(1),
+            ),
+            TickDecision::Snapshot
+        );
+        assert_eq!(
+            decide_observe_tick(ObserveMode::SnapshotOnly, &map, gauges, &map, gauges, 0),
+            TickDecision::Snapshot
+        );
+    }
+
+    #[test]
+    fn decide_observe_tick_forces_full_on_row_cap() {
+        let mut last = ProjectionMap::new();
+        let mut now = ProjectionMap::new();
+        for i in 0..(DELTA_ROW_CAP as u64 + 2) {
+            last.insert((i, 1), sample_row(i, 1, "running"));
+            now.insert((i, 1), sample_row(i, 1, "exited"));
+        }
+        let gauges = SessionGauges { control_plane: now.len(), native_pty: 0 };
+        assert_eq!(
+            decide_observe_tick(ObserveMode::Delta, &last, gauges, &now, gauges, 0),
+            TickDecision::Snapshot
+        );
+    }
+
+    #[test]
+    fn observe_delta_frame_schema_has_basis_seq_and_no_secrets() {
+        let server = node_server();
+        let shared = &*server.shared;
+        let frame = observe_delta_frame(
+            shared, 3, 2, 1, 0,
+            &[sample_row(9, 1, "running")],
+            &[json!({"instance_id": 8u64, "generation": 1u64})],
+        );
+        let text = frame.to_string();
+        assert_eq!(frame["type"], "observe.delta");
+        assert_eq!(frame["seq"], 3);
+        assert_eq!(frame["basis_seq"], 2);
+        assert!(frame["upserts"].is_array() && frame["removes"].is_array());
+        assert!(!text.contains("terminal_frame"));
+        assert!(!text.contains("test-token"));
+        assert!(!text.contains("GATE4AGENT"));
+        assert!(!text.contains("cookie"));
+    }
+
+    async fn read_more_ws_text_frames(
+        stream: &mut TcpStream,
+        min_text_frames: usize,
+        wait: Duration,
+    ) -> Vec<Vec<u8>> {
+        let mut buf = Vec::new();
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                break;
+            }
+            let mut chunk = [0u8; 8192];
+            match timeout(Duration::from_millis(80), stream.read(&mut chunk)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+                Ok(Err(_)) => break,
+                Err(_) => {}
+            }
+            let text_frames: Vec<Vec<u8>> = decode_server_frames(&buf)
+                .into_iter()
+                .filter(|(op, _)| *op == 0x01)
+                .map(|(_, payload)| payload)
+                .collect();
+            if text_frames.len() >= min_text_frames {
+                return text_frames;
+            }
+        }
+        decode_server_frames(&buf)
+            .into_iter()
+            .filter(|(op, _)| *op == 0x01)
+            .map(|(_, payload)| payload)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn bridge_ws_delta_suppresses_unchanged_ticks() {
+        let server = node_server();
+        let shared = Arc::clone(&server.shared);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = BridgeAuth::from_optional(None).unwrap();
+        let task = tokio::spawn(serve_listener_with_observe_options(
+            listener, auth, Arc::clone(&shared),
+            Duration::from_millis(50), ObserveMode::Delta,
+        ));
+
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let request = format!(
+            "GET /bridge/ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let texts = read_ws_after_upgrade(&mut stream, 1).await;
+        assert!(!texts.is_empty());
+        let more = read_more_ws_text_frames(&mut stream, 1, Duration::from_millis(280)).await;
+        assert!(more.is_empty(), "expected suppress; got {} extra frames", more.len());
+        let hello = std::str::from_utf8(&texts[0]).unwrap();
+        assert!(hello.contains("\"type\":\"bridge.hello\"") && hello.contains("\"seq\":0"));
+
+        let _ = stream.write_all(&encode_client_frame(0x08, &[], [1, 2, 3, 4])).await;
+        server.shutdown_handle().request_shutdown().await.unwrap();
+        timeout(Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn bridge_ws_delta_emits_on_gauge_change() {
+        let server = node_server();
+        let shared = Arc::clone(&server.shared);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = BridgeAuth::from_optional(None).unwrap();
+        let task = tokio::spawn(serve_listener_with_observe_options(
+            listener, auth, Arc::clone(&shared),
+            Duration::from_millis(60), ObserveMode::Delta,
+        ));
+
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let request = format!(
+            "GET /bridge/ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        assert!(!read_ws_after_upgrade(&mut stream, 1).await.is_empty());
+
+        shared.native_session_gauge.store(7, Ordering::Relaxed);
+
+        let texts = read_more_ws_text_frames(&mut stream, 1, Duration::from_secs(2)).await;
+        let delta = texts
+            .iter()
+            .map(|p| std::str::from_utf8(p).unwrap())
+            .find(|b| b.contains("\"type\":\"observe.delta\""))
+            .expect("expected observe.delta after gauge change");
+        assert!(delta.contains("\"basis_seq\":0"), "delta: {delta}");
+        assert!(delta.contains("\"seq\":1"), "delta: {delta}");
+        assert!(delta.contains("\"native_pty\":7"), "delta: {delta}");
+        assert!(delta.contains("\"upserts\":[]") && delta.contains("\"removes\":[]"));
+        assert!(!delta.contains("terminal_frame") && !delta.contains("test-token"));
+        assert!(!delta.contains("GATE4AGENT"));
+
+        let _ = stream.write_all(&encode_client_frame(0x08, &[], [1, 2, 3, 4])).await;
+        server.shutdown_handle().request_shutdown().await.unwrap();
+        timeout(Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
     }
 }

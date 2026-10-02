@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-node"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 description = "Native gate4agent node server: wraps providers and owns PTY/inline sessions, the file browser, local git, and worktrees for its machine"
 license = "MIT"
@@ -13,14 +13,14 @@ name = "gate4agent-node"
 path = "src/main.rs"
 
 [dependencies]
-gate4agent-adapters = { path = "../gate4agent-adapters", version = "0.4.4" }
-gate4agent-catalog = { path = "../gate4agent-catalog", version = "0.4.4" }
-gate4agent-handle = { path = "../gate4agent-handle", version = "0.4.4" }
-gate4agent-node-protocol = { path = "../gate4agent-node-protocol", version = "0.4.4" }
-gate4agent-node-wire = { path = "../gate4agent-node-wire", version = "0.4.4" }
-gate4agent-runtime-native = { path = "../gate4agent-runtime-native", version = "0.4.4" }
-gate4agent-testkit = { path = "../gate4agent-testkit", optional = true, version = "0.4.4" }
-gate4agent-types = { path = "../gate4agent-types", version = "0.4.4" }
+gate4agent-adapters = { path = "../gate4agent-adapters", version = "0.4.5" }
+gate4agent-catalog = { path = "../gate4agent-catalog", version = "0.4.5" }
+gate4agent-handle = { path = "../gate4agent-handle", version = "0.4.5" }
+gate4agent-node-protocol = { path = "../gate4agent-node-protocol", version = "0.4.5" }
+gate4agent-node-wire = { path = "../gate4agent-node-wire", version = "0.4.5" }
+gate4agent-runtime-native = { path = "../gate4agent-runtime-native", version = "0.4.5" }
+gate4agent-testkit = { path = "../gate4agent-testkit", optional = true, version = "0.4.5" }
+gate4agent-types = { path = "../gate4agent-types", version = "0.4.5" }
 ring = "=0.17.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

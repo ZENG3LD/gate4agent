@@ -6323,6 +6323,35 @@ impl NodeShared {
         }
     }
 
+    /// One-owner workspace/env collision guard: a live session on
+    /// `workspace_id` with a different `environment_profile` (option
+    /// equality on the resolved receipt, including Some vs None) blocks
+    /// another spawn on that same cwd. Same profile may still share the
+    /// workspace; distinct profiles need distinct workspace ids (managed
+    /// worktree).
+    fn ensure_workspace_environment_profile_compatible(
+        &self,
+        workspace_id: &WorkspaceId,
+        environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
+    ) -> Result<(), NodeFailure> {
+        let bindings = self
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for binding in bindings.values() {
+            if &binding.workspace_id != workspace_id {
+                continue;
+            }
+            if binding.environment_profile.as_ref() != environment_profile {
+                return Err(failure(
+                    NodeFailureCode::WorkspaceBusy,
+                    "workspace already has a live session with a different environment profile; use a managed worktree for concurrent distinct ProviderHome/env bindings on one repo",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn bind_session(
         &self,
@@ -11354,6 +11383,13 @@ impl NodeShared {
                 ));
             }
         }
+        // Refuse concurrent distinct environment profiles (incl. ProviderHome
+        // bindings) on the same workspace cwd. Parallel path: managed worktree
+        // spawn so each profile gets its own workspace_id.
+        self.ensure_workspace_environment_profile_compatible(
+            &workspace_id,
+            environment_profile.as_ref(),
+        )?;
         let runtime_requirement = match (mode, initial_prompt.is_some()) {
             (SessionMode::Pty, false) => ProviderRuntimeRequirement::RawPty,
             (SessionMode::Pty, true) => ProviderRuntimeRequirement::SemanticPrompt,
@@ -16936,6 +16972,220 @@ mod standalone_capability_platform_tests {
             request_uses_unnegotiated_capability(&request, &capabilities),
             !cfg!(windows),
         );
+    }
+}
+
+#[cfg(test)]
+mod workspace_environment_collision_tests {
+    use super::*;
+    use crate::session_environment::{
+        NodeSessionMaterializationProfile, NodeSessionPathBinding, NodeSessionPathClass,
+    };
+    use gate4agent_catalog::EnvMutation;
+    use gate4agent_runtime_native::{
+        NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver, NativeLaunchProfile,
+        NativeLaunchProfileId,
+    };
+    use std::ffi::OsString;
+    use std::sync::Arc;
+
+    struct EmptyEnvironmentResolver;
+
+    impl NativeChildEnvironmentResolver for EmptyEnvironmentResolver {
+        fn resolve_child_environment(
+            &self,
+        ) -> Result<Vec<EnvMutation>, NativeChildEnvironmentResolveError> {
+            Ok(vec![EnvMutation {
+                key: OsString::from("GATE4AGENT_TEST_PROFILE"),
+                value: None,
+            }])
+        }
+    }
+
+    fn agent(value: &str) -> AgentId {
+        AgentId::new(value).unwrap()
+    }
+
+    /// Two Claude ProviderHome profiles (`CLAUDE_CONFIG_DIR` A vs B) on one node.
+    fn claude_config_dir_collision_fixture() -> (
+        NodeShared,
+        ResolvedEnvironmentProfileReceipt,
+        ResolvedEnvironmentProfileReceipt,
+    ) {
+        let catalog = active_registry().unwrap();
+        let (handle, mut runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let control = runtime.native_launch_profile_control();
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let shared = NodeShared::new_with_incarnation(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-env-collision-test").unwrap(),
+            NodeIncarnationId::from_bytes([3; crate::protocol::NODE_INCARNATION_ID_BYTES]),
+            vec![workspace],
+            vec![agent("claude")],
+            ProviderRuntimeStatuses::default(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            SpawnProfileRegistry::default(),
+            Some(control),
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            MUTATION_SETTLE_TIMEOUT_MS.saturating_add(READINESS_SETTLE_HEADROOM_MS),
+        );
+
+        let mut receipts = Vec::new();
+        for (suffix, native_suffix) in [("a", "a-pty"), ("b", "b-pty")] {
+            let profile_id =
+                SpawnEnvironmentProfileId::new(format!("claude-config-dir-{suffix}")).unwrap();
+            let profile_revision = crate::protocol::SpawnEnvironmentProfileRevision::new(format!(
+                "claude-config-dir-{suffix}-r1"
+            ))
+            .unwrap();
+            let materialization = NodeSessionMaterializationProfile::new(
+                Vec::new(),
+                vec![NodeSessionPathBinding::new(
+                    "CLAUDE_CONFIG_DIR",
+                    NodeSessionPathClass::ProviderHome,
+                )
+                .unwrap()],
+                Vec::new(),
+            )
+            .unwrap();
+            let node_profile = NodeEnvironmentProfile::new_with_materialization(
+                profile_id.clone(),
+                profile_revision.clone(),
+                agent("claude"),
+                [NativeLaunchProfile::new(
+                    NativeLaunchProfileId::new(format!("claude-config-dir-{native_suffix}"))
+                        .unwrap(),
+                    agent("claude"),
+                    TransportKind::Pty,
+                    vec![OsString::from("GATE4AGENT_TEST_PROFILE")],
+                    Arc::new(EmptyEnvironmentResolver),
+                )
+                .unwrap()],
+                Some(materialization),
+            )
+            .unwrap();
+            let (binding, native_profiles, materialization) = node_profile.into_parts();
+            for native_profile in native_profiles {
+                runtime.upsert_native_launch_profile(native_profile).unwrap();
+            }
+            shared
+                .environment_profiles
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(binding.id.clone(), binding);
+            shared
+                .environment_materialization_profiles
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(profile_id.clone(), materialization.unwrap());
+            receipts.push(ResolvedEnvironmentProfileReceipt {
+                profile_id,
+                profile_revision,
+            });
+        }
+        let profile_b = receipts.pop().unwrap();
+        let profile_a = receipts.pop().unwrap();
+        (shared, profile_a, profile_b)
+    }
+
+    #[test]
+    fn refuse_distinct_claude_config_dir_profiles_on_same_workspace_cwd() {
+        let (shared, profile_a, profile_b) = claude_config_dir_collision_fixture();
+        let primary = WorkspaceId::new("primary").unwrap();
+        let worktree = WorkspaceId::new("worktree-b").unwrap();
+        let address = SessionAddress {
+            workspace_id: primary.clone(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(41),
+                generation: SessionGeneration(1),
+            },
+        };
+        shared.bind_session_with_policy(
+            &address,
+            ProviderRuntimePolicy::raw_pty(),
+            Some(profile_a.clone()),
+        );
+
+        let refused = shared
+            .ensure_workspace_environment_profile_compatible(&primary, Some(&profile_b))
+            .unwrap_err();
+        assert_eq!(refused.code, NodeFailureCode::WorkspaceBusy);
+
+        // Some vs None on the same cwd is also a collision.
+        let refused_none = shared
+            .ensure_workspace_environment_profile_compatible(&primary, None)
+            .unwrap_err();
+        assert_eq!(refused_none.code, NodeFailureCode::WorkspaceBusy);
+
+        // Same profile on the same workspace remains allowed.
+        shared
+            .ensure_workspace_environment_profile_compatible(&primary, Some(&profile_a))
+            .unwrap();
+
+        // Distinct workspace id (managed-worktree parallel path) allows profile B.
+        shared
+            .ensure_workspace_environment_profile_compatible(&worktree, Some(&profile_b))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_session_refuses_conflicting_environment_profile_before_mutation() {
+        let (shared, profile_a, profile_b) = claude_config_dir_collision_fixture();
+        let primary = WorkspaceId::new("primary").unwrap();
+        let address = SessionAddress {
+            workspace_id: primary.clone(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(41),
+                generation: SessionGeneration(1),
+            },
+        };
+        shared.bind_session_with_policy(
+            &address,
+            ProviderRuntimePolicy::raw_pty(),
+            Some(profile_a),
+        );
+
+        let failure = shared
+            .spawn_session_with_deadline(
+                primary,
+                agent("claude"),
+                SessionMode::Pty,
+                gate4agent_types::TerminalSize {
+                    rows: 24,
+                    columns: 80,
+                },
+                None,
+                Some(profile_b),
+                None,
+                None,
+                None,
+                None,
+                SpawnRecordPolicy::ProviderIdentityOnly,
+                Some(Instant::now() + Duration::from_secs(30)),
+                &[],
+                None,
+                ApprovalLevel::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, NodeFailureCode::WorkspaceBusy);
+        // Guard runs before instance id mint / bind.
+        assert_eq!(shared.next_instance_id.load(Ordering::Acquire), 1);
+        assert!(shared.handle.snapshot().sessions.is_empty());
     }
 }
 

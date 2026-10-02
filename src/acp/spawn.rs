@@ -72,6 +72,14 @@ pub(crate) fn acp_command(tool: CliTool) -> Result<AcpSpawnSpec, std::io::Error>
             suffix_args: &["-y", "@agentclientprotocol/claude-agent-acp@0.74.0"],
             npm_tool: true,
         },
+        // Codex structured control today = ACP adapter package (pin below).
+        // First-party Codex embed API is `codex app-server` (Thread/Turn
+        // JSON-RPC; stdio/ws/unix) — parallel channel, not this spawn.
+        // `codex mcp-server` is removed/deprecated in current CLI docs; do
+        // not revive it. App-server is inventory-only as of 2026-10-02
+        // (hatchery research codex-app-server-vs-acp-adapter-2026-10-02);
+        // registry latest for this package may be ahead of the pin — bump
+        // only with a deliberate literal edit + live session/new remeasure.
         CliTool::Codex => AcpSpawnSpec {
             program: "npx",
             prefix_args: &[],

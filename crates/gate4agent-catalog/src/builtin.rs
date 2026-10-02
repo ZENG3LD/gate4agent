@@ -195,6 +195,9 @@ fn capabilities(id: &str) -> AgentCapabilities {
             pipe,
             // Claude/Codex ACP use npm adapter packages; Grok/Kimi are native.
             // Catalog admits ACP for all four fleet providers.
+            // Codex first-party `codex app-server` is NOT an AcpTransportSpec /
+            // launch_override here — parallel channel, inventory only
+            // (hatchery research codex-app-server-vs-acp-adapter-2026-10-02).
             acp: transport_adapter_id
                 .and_then(|adapter| binding(AdapterFamily::Acp, adapter))
                 .map(|adapter| AcpTransportSpec {

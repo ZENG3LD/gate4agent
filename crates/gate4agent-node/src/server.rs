@@ -3559,11 +3559,20 @@ impl NodeShared {
                 "spawn environment profile does not match the provider and mode",
             ));
         }
+        // Station knobs (plan station-network-and-browser-profile-knobs §4.3):
+        // echo opaque network_allowlist / browser_profile_id onto the receipt.
+        // Empty/whitespace ids already refuse at Spawn*Id construction.
+        // Dig2browser-station reachability: **no cheap local probe exists in
+        // gate4agent** (station client lives in dig2browser named-pipe IPC and
+        // is not a g4a dependency). Do **not** refuse when browser_profile_id
+        // is set but station is unreachable until such a probe lands — this
+        // slice is refuse-unknown-empty only (type-level). Never put cookies /
+        // OAuth / proxy credentials on C2.
         Ok(Some(ResolvedEnvironmentProfileReceipt {
             profile_id: binding.id.clone(),
             profile_revision: binding.revision.clone(),
-            network_allowlist: None,
-            browser_profile_id: None,
+            network_allowlist: resolved.network_allowlist.clone(),
+            browser_profile_id: resolved.browser_profile_id.clone(),
         }))
     }
 
@@ -16976,6 +16985,164 @@ mod standalone_capability_platform_tests {
             request_uses_unnegotiated_capability(&request, &capabilities),
             !cfg!(windows),
         );
+    }
+}
+
+
+#[cfg(test)]
+mod station_knobs_resolve_tests {
+    use super::*;
+    use gate4agent_catalog::EnvMutation;
+    use gate4agent_runtime_native::{
+        NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver, NativeLaunchProfile,
+        NativeLaunchProfileId,
+    };
+    use std::ffi::OsString;
+    use std::sync::Arc;
+
+    struct EmptyEnvironmentResolver;
+
+    impl NativeChildEnvironmentResolver for EmptyEnvironmentResolver {
+        fn resolve_child_environment(
+            &self,
+        ) -> Result<Vec<EnvMutation>, NativeChildEnvironmentResolveError> {
+            Ok(vec![EnvMutation {
+                key: OsString::from("GATE4AGENT_TEST_PROFILE"),
+                value: None,
+            }])
+        }
+    }
+
+    fn agent(value: &str) -> AgentId {
+        AgentId::new(value).unwrap()
+    }
+
+    fn station_knobs_fixture() -> (NodeShared, crate::protocol::SpawnProfileDefaults) {
+        let profile_id = SpawnEnvironmentProfileId::new("local-claude").unwrap();
+        let profile_revision =
+            crate::protocol::SpawnEnvironmentProfileRevision::new("local-claude-r1").unwrap();
+        let spawn_defaults = crate::protocol::SpawnProfileDefaults {
+            profile_id: crate::protocol::SpawnProfileId::new("default").unwrap(),
+            revision: crate::protocol::SpawnProfileRevision::new("test-r1").unwrap(),
+            provider: agent("claude"),
+            mode: SessionMode::Pty,
+            terminal_size: gate4agent_types::TerminalSize {
+                rows: 24,
+                columns: 80,
+            },
+            prompt: None,
+            bundle_id: None,
+            context_id: None,
+            environment_profile_id: Some(profile_id.clone()),
+        };
+        let spawn_profiles = SpawnProfileRegistry::new([spawn_defaults.clone()]).unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, mut runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let control = runtime.native_launch_profile_control();
+        let node_profile = NodeEnvironmentProfile::new(
+            profile_id.clone(),
+            profile_revision,
+            agent("claude"),
+            [NativeLaunchProfile::new(
+                NativeLaunchProfileId::new("local-claude-pty").unwrap(),
+                agent("claude"),
+                TransportKind::Pty,
+                vec![OsString::from("GATE4AGENT_TEST_PROFILE")],
+                Arc::new(EmptyEnvironmentResolver),
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let (binding, native_profiles, _materialization) = node_profile.into_parts();
+        for native_profile in native_profiles {
+            runtime.upsert_native_launch_profile(native_profile).unwrap();
+        }
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let shared = NodeShared::new_with_incarnation(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-station-knobs-test").unwrap(),
+            NodeIncarnationId::from_bytes([9; crate::protocol::NODE_INCARNATION_ID_BYTES]),
+            vec![workspace],
+            vec![agent("claude")],
+            ProviderRuntimeStatuses::default(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            spawn_profiles,
+            Some(control),
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            MUTATION_SETTLE_TIMEOUT_MS.saturating_add(READINESS_SETTLE_HEADROOM_MS),
+        );
+        shared
+            .environment_profiles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(binding.id.clone(), binding);
+        (shared, spawn_defaults)
+    }
+
+    /// Resolve echoes station network_allowlist + browser_profile_id onto the
+    /// env-profile receipt. Empty/whitespace refuse is type-level. Dig2browser
+    /// station reachability refuse is stubbed (no cheap g4a-local probe).
+    #[test]
+    fn resolve_environment_profile_echoes_station_network_and_browser_knobs() {
+        let (shared, defaults) = station_knobs_fixture();
+        let allowlist = crate::protocol::SpawnNetworkAllowlistId::new("egress-default").unwrap();
+        let browser = crate::protocol::SpawnBrowserProfileId::new("station-profile-a").unwrap();
+        let spec = crate::protocol::SpawnSpec {
+            target: crate::protocol::SpawnTarget {
+                node_id: shared.node_id.clone(),
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: defaults.profile_id.clone(),
+            expected_profile_revision: defaults.revision.clone(),
+            overrides: crate::protocol::SpawnOverrides {
+                network_allowlist: Some(allowlist.clone()),
+                browser_profile_id: Some(browser.clone()),
+                ..crate::protocol::SpawnOverrides::default()
+            },
+            deadline_ms: crate::protocol::SpawnDeadlineMs::new(30_000).unwrap(),
+            idempotency_key: crate::protocol::SpawnIdempotencyKey::new("station-knobs-echo")
+                .unwrap(),
+            required_capabilities: crate::protocol::SpawnRequiredCapabilities::default(),
+        };
+        let resolved = spec.resolve(&defaults).unwrap();
+        assert_eq!(resolved.network_allowlist.as_ref(), Some(&allowlist));
+        assert_eq!(resolved.browser_profile_id.as_ref(), Some(&browser));
+        let receipt = shared
+            .resolve_environment_profile(&resolved)
+            .expect("resolve ok")
+            .expect("env profile present");
+        assert_eq!(receipt.network_allowlist.as_ref(), Some(&allowlist));
+        assert_eq!(receipt.browser_profile_id.as_ref(), Some(&browser));
+        assert_eq!(receipt.profile_id.as_str(), "local-claude");
+
+        let omitted = crate::protocol::SpawnSpec {
+            overrides: crate::protocol::SpawnOverrides::default(),
+            idempotency_key: crate::protocol::SpawnIdempotencyKey::new("station-knobs-omit")
+                .unwrap(),
+            ..spec
+        };
+        let resolved_omit = omitted.resolve(&defaults).unwrap();
+        let bare = shared
+            .resolve_environment_profile(&resolved_omit)
+            .expect("resolve ok")
+            .expect("env profile present");
+        assert_eq!(bare.network_allowlist, None);
+        assert_eq!(bare.browser_profile_id, None);
     }
 }
 

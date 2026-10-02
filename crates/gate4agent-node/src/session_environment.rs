@@ -45,8 +45,10 @@ const MATERIALIZATION_LOCK_NAME: &str = ".gate4agent-materialization-lock";
 /// **providerHome** (+ path classes) and pairs with workspace **cwd**.
 /// **sandbox** is the separate `ApprovalLevel` / catalog argv axis;
 /// optional **network** allowlist + dig2browser **browserProfile** ids are
-/// typed on `SpawnOverrides` / env-profile receipts (serde only in this
-/// slice — no dig2browser-station bind yet). See hatchery-websession-docs
+/// typed on `SpawnOverrides` / env-profile receipts; resolve echoes ids onto
+/// `ResolvedEnvironmentProfileReceipt` (refuse empty/whitespace at type
+/// construction; dig2browser-station reachability refuse stubbed until a
+/// cheap g4a-local probe exists). See hatchery-websession-docs
 /// `research/station-profile-and-os-sandbox-matrix-2026-10-02.md` and plan
 /// `station-network-and-browser-profile-knobs-2026-10-02.md` (ids on node;
 /// secrets never on C2; `C2 → node → drivers` + local station IPC later).

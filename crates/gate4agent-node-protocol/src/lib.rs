@@ -499,7 +499,7 @@ pub struct SpawnEnvironmentProfileRevision(String);
 /// Ids / digests only on C2 — never cookies, OAuth material, or proxy
 /// credentials. See hatchery-websession-docs plan
 /// `station-network-and-browser-profile-knobs-2026-10-02.md`. Enforcement and
-/// dig2browser station bind are later slices; this type is schema only.
+/// dig2browser station bind / catalog enforce are later; resolve echoes the id.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SpawnNetworkAllowlistId(String);
@@ -510,7 +510,7 @@ pub struct SpawnNetworkAllowlistId(String);
 /// Profile id string only — never cookie bytes or route credentials on C2 /
 /// IPC. See hatchery-websession-docs plan
 /// `station-network-and-browser-profile-knobs-2026-10-02.md`. Local station
-/// pipe bind is a later slice; this type is schema only.
+/// pipe bind / reachability refuse wait on a cheap g4a-local probe (stubbed).
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SpawnBrowserProfileId(String);
@@ -1015,8 +1015,9 @@ impl<T> Default for SpawnOverride<T> {
 /// dig2browser **browserProfile** axes (ids only). See hatchery-websession-docs
 /// plan `station-network-and-browser-profile-knobs-2026-10-02.md` and research
 /// `station-profile-and-os-sandbox-matrix-2026-10-02.md`. Secrets stay on
-/// the node; C2 carries ids/receipts only (`C2 → node → drivers`). Dig2browser
-/// station IPC bind is **not** wired from these fields yet.
+/// the node; C2 carries ids/receipts only (`C2 → node → drivers`). Resolve
+/// echoes ids onto env-profile receipts; dig2browser station IPC bind /
+/// reachability refuse waits on a cheap g4a-local probe (stubbed on node).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpawnOverrides {
@@ -1041,13 +1042,16 @@ pub struct SpawnOverrides {
     /// Optional station **network** allowlist policy id (node-local catalog).
     /// Opaque id only — never credentials. Plan:
     /// `station-network-and-browser-profile-knobs-2026-10-02.md` §2.1 / §4.
-    /// Not enforced in this slice; unknown ids must refuse when resolve lands.
+    /// Resolve echoes this onto `ResolvedEnvironmentProfileReceipt`. Empty /
+    /// whitespace ids refuse at type construction; unknown-catalog enforce
+    /// is later. Dig2browser bind is separate (`browser_profile_id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_allowlist: Option<SpawnNetworkAllowlistId>,
     /// Optional dig2browser station **browserProfile** id (`profiles_root`).
     /// Id only — never cookie/OAuth/proxy material on C2. Plan:
     /// `station-network-and-browser-profile-knobs-2026-10-02.md` §2.2 / §4.
-    /// Not bound to dig2browser-station IPC in this slice.
+    /// Resolve echoes this onto `ResolvedEnvironmentProfileReceipt`. Station
+    /// IPC reachability refuse waits on a cheap g4a-local probe (stubbed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_profile_id: Option<SpawnBrowserProfileId>,
 }
@@ -1312,6 +1316,18 @@ pub struct ResolvedSpawnSpec {
     /// consumer of a `ResolvedSpawnSpec` reads a concrete launch-time value
     /// rather than re-deriving the same default independently.
     pub approval_level: ApprovalLevel,
+    /// Opaque station **network** allowlist policy id from
+    /// `SpawnOverrides::network_allowlist` (pass-through). Empty/whitespace
+    /// ids are refused at `SpawnNetworkAllowlistId` construction. Catalog
+    /// enforcement of unknown policy ids is a later slice — this field only
+    /// carries the id for receipt echo.
+    pub network_allowlist: Option<SpawnNetworkAllowlistId>,
+    /// Opaque dig2browser station **browserProfile** id from
+    /// `SpawnOverrides::browser_profile_id` (pass-through). Empty/whitespace
+    /// ids are refused at `SpawnBrowserProfileId` construction. Local station
+    /// reachability refuse is **not** applied here until a cheap g4a-local
+    /// probe exists (see node `resolve_environment_profile` stub).
+    pub browser_profile_id: Option<SpawnBrowserProfileId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1368,7 +1384,8 @@ impl SpawnPromptMetadata {
 /// `browser_profile_id` echo **opaque station ids only** (never cookies /
 /// OAuth / proxy credentials on C2). See hatchery-websession-docs plan
 /// `station-network-and-browser-profile-knobs-2026-10-02.md` §4. Dig2browser
-/// station IPC bind is not performed from this receipt.
+/// station IPC bind / reachability refuse is not performed from this receipt
+/// until a cheap g4a-local station probe exists (node stub).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedEnvironmentProfileReceipt {
@@ -2262,6 +2279,8 @@ impl SpawnSpec {
                 environment_profile_id: environment_profile_source,
             },
             approval_level: self.overrides.approval_level.unwrap_or_default(),
+            network_allowlist: self.overrides.network_allowlist.clone(),
+            browser_profile_id: self.overrides.browser_profile_id.clone(),
         })
     }
 }
@@ -8188,6 +8207,8 @@ mod tests {
             Some("repo-context"),
         );
         assert_eq!(first.environment_profile_id, None);
+        assert_eq!(first.network_allowlist, None);
+        assert_eq!(first.browser_profile_id, None);
         assert_eq!(first.provenance.provider, SpawnFieldProvenance::Profile);
         assert_eq!(first.provenance.mode, SpawnFieldProvenance::Override);
         assert_eq!(first.provenance.prompt, SpawnFieldProvenance::Override);
@@ -8321,8 +8342,9 @@ mod tests {
     /// `station-network-and-browser-profile-knobs-2026-10-02.md` §4): optional
     /// `network_allowlist` + `browser_profile_id` on `SpawnOverrides` and
     /// `ResolvedEnvironmentProfileReceipt` round-trip as opaque ids only.
-    /// Omitted when None; secret-looking unknown fields are refused. No
-    /// dig2browser-station bind in this slice.
+    /// Omitted when None; secret-looking unknown fields are refused.
+    /// Empty/whitespace ids refuse. Dig2browser-station bind / reachability
+    /// refuse is node-side (stubbed until a cheap local probe exists).
     #[test]
     fn station_network_and_browser_profile_knobs_serde_ids_only() {
         let allowlist = SpawnNetworkAllowlistId::new("egress-default").unwrap();
@@ -8330,6 +8352,10 @@ mod tests {
         assert_eq!(allowlist.as_str(), "egress-default");
         assert_eq!(browser.as_str(), "station-profile-a");
         assert!(SpawnNetworkAllowlistId::new("").is_err());
+        assert!(SpawnBrowserProfileId::new("").is_err());
+        assert!(SpawnNetworkAllowlistId::new(" ").is_err());
+        assert!(SpawnBrowserProfileId::new("\t").is_err());
+        assert!(SpawnNetworkAllowlistId::new("\n").is_err());
         assert!(SpawnBrowserProfileId::new("bad/id").is_err());
         assert!(SpawnNetworkAllowlistId::new(
             "x".repeat(MAX_SPAWN_RESOURCE_ID_BYTES + 1),
@@ -8410,6 +8436,78 @@ mod tests {
             r#"{"profile_id":"local-default","profile_revision":"r1","oauth_token":"x"}"#,
         )
         .is_err());
+        // Empty / whitespace ids refuse at type + serde (not silent ambient).
+        assert!(serde_json::from_str::<SpawnOverrides>(
+            r#"{"network_allowlist":""}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<SpawnOverrides>(
+            r#"{"browser_profile_id":" "}"#,
+        )
+        .is_err());
+    }
+
+    /// `SpawnSpec::resolve` copies station knobs onto `ResolvedSpawnSpec` so
+    /// node resolve can echo them onto `ResolvedEnvironmentProfileReceipt`.
+    /// Empty/whitespace already refused at id construction; no dig2browser
+    /// station probe in this crate.
+    #[test]
+    fn spawn_spec_resolve_echoes_station_network_and_browser_profile_knobs() {
+        let profile_id = SpawnProfileId::new("review-default").unwrap();
+        let defaults = SpawnProfileDefaults {
+            profile_id: profile_id.clone(),
+            revision: SpawnProfileRevision::new("review-default.r3").unwrap(),
+            provider: agent("claude"),
+            mode: SessionMode::Pty,
+            terminal_size: TerminalSize {
+                rows: 24,
+                columns: 80,
+            },
+            prompt: None,
+            bundle_id: None,
+            context_id: None,
+            environment_profile_id: Some(
+                SpawnEnvironmentProfileId::new("local-default").unwrap(),
+            ),
+        };
+        let allowlist = SpawnNetworkAllowlistId::new("egress-default").unwrap();
+        let browser = SpawnBrowserProfileId::new("station-profile-a").unwrap();
+        let spec = SpawnSpec {
+            target: SpawnTarget {
+                node_id: NodeId::new("node-a").unwrap(),
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                worktree_id: None,
+            },
+            profile_id,
+            expected_profile_revision: defaults.revision.clone(),
+            overrides: SpawnOverrides {
+                network_allowlist: Some(allowlist.clone()),
+                browser_profile_id: Some(browser.clone()),
+                ..SpawnOverrides::default()
+            },
+            deadline_ms: SpawnDeadlineMs::new(30_000).unwrap(),
+            idempotency_key: SpawnIdempotencyKey::new("request-station-knobs").unwrap(),
+            required_capabilities: SpawnRequiredCapabilities::default(),
+        };
+        let resolved = spec.resolve(&defaults).unwrap();
+        assert_eq!(resolved.network_allowlist.as_ref(), Some(&allowlist));
+        assert_eq!(resolved.browser_profile_id.as_ref(), Some(&browser));
+        assert_eq!(
+            resolved
+                .environment_profile_id
+                .as_ref()
+                .map(SpawnEnvironmentProfileId::as_str),
+            Some("local-default"),
+        );
+
+        let omitted = SpawnSpec {
+            overrides: SpawnOverrides::default(),
+            idempotency_key: SpawnIdempotencyKey::new("request-station-knobs-omit").unwrap(),
+            ..spec.clone()
+        };
+        let resolved_omit = omitted.resolve(&defaults).unwrap();
+        assert_eq!(resolved_omit.network_allowlist, None);
+        assert_eq!(resolved_omit.browser_profile_id, None);
     }
 
     #[test]

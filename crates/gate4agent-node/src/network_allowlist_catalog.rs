@@ -15,6 +15,9 @@
 //! Plan: `dig2browser-station-probe-and-network-permit-set-2026-10-02.md` §3.2.1.
 //! Dig2browser bind remains stubbed elsewhere. Codex provider-native first
 //! slice: `-c sandbox_workspace_write.network_access` under Moderate only.
+//! Claude: catalog `permits` → ProviderHome sidecar settings + documented
+//! `--settings` (Bash sandbox network; PTY / non-Windows). Kimi/Grok: no
+//! first-party network overlay — keep refuse invented `provider_native`.
 
 use crate::protocol::SpawnNetworkAllowlistId;
 use gate4agent_types::ApprovalLevel;
@@ -480,11 +483,112 @@ pub fn codex_network_access_config_overlay(enabled: bool) -> Vec<String> {
     ]
 }
 
+/// Sidecar settings filename under ProviderHome (`CLAUDE_CONFIG_DIR` home/).
+///
+/// Additive `--settings` path — does not rewrite user `settings.json` or
+/// touch real `~/.claude`.
+pub const CLAUDE_STATION_NETWORK_SETTINGS_FILE: &str =
+    "gate4agent-station-network-settings.json";
+
+/// Vendor Bash sandbox network overlay is macOS / Linux / WSL2 only.
+/// Native Windows (and WSL1 host without Linux node) has no vendor sandbox —
+/// refuse rather than silent no-op or invented argv.
+pub fn claude_bash_sandbox_network_os_supported() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        Err(
+            "Claude sandbox.network settings overlay requires vendor Bash sandbox (macOS/Linux/WSL2); native Windows has no vendor Bash sandbox"
+                .to_owned(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(())
+    }
+}
+
+/// Map catalog permit `peer` → Claude `sandbox.network.allowedDomains` host.
+///
+/// Peers are dig2-spirit `host` / `host:port` / `[ipv6]:port` sketches (never
+/// credentials). Claude settings are **domain-shaped** — ports are stripped;
+/// protocol is ignored. Returns `None` when the peer cannot yield a domain.
+pub fn permit_peer_to_allowed_domain(peer: &str) -> Option<String> {
+    let peer = peer.trim();
+    if peer.is_empty() {
+        return None;
+    }
+    // Bracketed IPv6: `[::1]:443` → `[::1]`; `[::1]` stays.
+    if let Some(rest) = peer.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return None;
+        };
+        let host = format!("[{}]", &rest[..end]);
+        let after = &rest[end + 1..];
+        if after.is_empty() || after.starts_with(':') {
+            return Some(host);
+        }
+        return None;
+    }
+    // host:port when trailing segment is all digits; else whole peer is domain
+    // (incl. wildcards like `*.npmjs.org`).
+    if let Some((host, port)) = peer.rsplit_once(':') {
+        if !host.is_empty()
+            && !host.contains(':')
+            && !port.is_empty()
+            && port.chars().all(|c| c.is_ascii_digit())
+        {
+            return Some(host.to_owned());
+        }
+    }
+    Some(peer.to_owned())
+}
+
+/// Deduplicated Claude `allowedDomains` from catalog permits (stable order).
+pub fn claude_allowed_domains_from_permits(permits: &[NetworkPermitSketch]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for permit in permits {
+        let Some(domain) = permit_peer_to_allowed_domain(&permit.peer) else {
+            continue;
+        };
+        if seen.insert(domain.clone()) {
+            out.push(domain);
+        }
+    }
+    out
+}
+
+/// Settings JSON fragment for Claude Bash sandbox network (vendor documented
+/// `sandbox.enabled` + `sandbox.network.allowedDomains`).
+pub fn claude_station_network_settings_json(allowed_domains: &[String]) -> String {
+    let value = serde_json::json!({
+        "sandbox": {
+            "enabled": true,
+            "network": {
+                "allowedDomains": allowed_domains,
+            }
+        }
+    });
+    // Stable, compact — file under ProviderHome; not pretty-printed secrets.
+    serde_json::to_string(&value).expect("claude station network settings serialize")
+}
+
+/// Documented Claude CLI argv: `--settings <absolute-path>`.
+pub fn claude_settings_network_overlay_args(settings_path: &Path) -> Vec<String> {
+    vec![
+        "--settings".to_owned(),
+        settings_path.to_string_lossy().into_owned(),
+    ]
+}
+
 /// Resolve provider-native launch overlay argv for a catalog entry, or refuse.
 ///
 /// Empty when `native` is empty / unset. Codex Moderate + `Some(flag)` yields
 /// [`codex_network_access_config_overlay`]. Other cases refuse via
 /// [`provider_native_mapping_supported`].
+///
+/// Claude settings-domain overlay is **not** provider_native — see
+/// [`claude_allowed_domains_from_permits`] / server resolve path.
 pub fn resolve_provider_native_launch_overlay(
     provider: &str,
     approval_level: ApprovalLevel,
@@ -812,5 +916,78 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    #[test]
+    fn permit_peer_maps_host_port_and_ipv6_to_allowed_domain() {
+        assert_eq!(
+            permit_peer_to_allowed_domain("github.com:443").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            permit_peer_to_allowed_domain("127.0.0.1:443").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            permit_peer_to_allowed_domain("*.npmjs.org").as_deref(),
+            Some("*.npmjs.org")
+        );
+        assert_eq!(
+            permit_peer_to_allowed_domain("[::1]:443").as_deref(),
+            Some("[::1]")
+        );
+        assert_eq!(permit_peer_to_allowed_domain("").as_deref(), None);
+    }
+
+    #[test]
+    fn claude_allowed_domains_dedupe_preserve_order() {
+        let permits = vec![
+            NetworkPermitSketch {
+                protocol: NetworkPermitProtocol::Tcp,
+                peer: "github.com:443".to_owned(),
+            },
+            NetworkPermitSketch {
+                protocol: NetworkPermitProtocol::Udp,
+                peer: "github.com:53".to_owned(),
+            },
+            NetworkPermitSketch {
+                protocol: NetworkPermitProtocol::Tcp,
+                peer: "registry.npmjs.org".to_owned(),
+            },
+        ];
+        assert_eq!(
+            claude_allowed_domains_from_permits(&permits),
+            ["github.com", "registry.npmjs.org"]
+        );
+    }
+
+    #[test]
+    fn claude_station_network_settings_json_enables_sandbox_domains() {
+        let json = claude_station_network_settings_json(&[
+            "github.com".to_owned(),
+            "*.npmjs.org".to_owned(),
+        ]);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["sandbox"]["enabled"], true);
+        assert_eq!(
+            value["sandbox"]["network"]["allowedDomains"],
+            serde_json::json!(["github.com", "*.npmjs.org"])
+        );
+        let path = std::env::temp_dir().join("gate4agent-claude-settings-test.json");
+        assert_eq!(
+            claude_settings_network_overlay_args(&path),
+            [
+                "--settings".to_owned(),
+                path.to_string_lossy().into_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_bash_sandbox_network_os_gate_matches_cfg() {
+        #[cfg(windows)]
+        assert!(claude_bash_sandbox_network_os_supported().is_err());
+        #[cfg(not(windows))]
+        assert!(claude_bash_sandbox_network_os_supported().is_ok());
     }
 }

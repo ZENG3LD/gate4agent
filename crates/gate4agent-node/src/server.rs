@@ -3233,11 +3233,18 @@ impl Drop for NativeEnvironmentSelectionGuard {
 struct SessionMaterializationGuard<'a> {
     shared: &'a NodeShared,
     id: Option<MaterializationId>,
+    /// Absolute ProviderHome (`home/`) under the session materialization root.
+    /// Used for Claude station network `--settings` sidecar writes.
+    provider_home: Option<PathBuf>,
 }
 
 impl SessionMaterializationGuard<'_> {
     fn id(&self) -> Option<&MaterializationId> {
         self.id.as_ref()
+    }
+
+    fn provider_home(&self) -> Option<&Path> {
+        self.provider_home.as_deref()
     }
 
     fn retain(mut self) {
@@ -3651,16 +3658,27 @@ impl NodeShared {
         .expect("granting hook semantics over a raw-PTY policy is internally valid")
     }
 
-    /// Codex first-slice network_access argv (`-c sandbox_workspace_write.network_access`).
+    /// Station network allowlist → provider launch overlay argv.
     ///
-    /// Empty when no allowlist / no provider-native mapping. Resolve already
-    /// refused ReadOnly / FullAuto / non-Codex; this only returns overlay argv.
-    fn resolve_codex_network_access_overlay_args(
+    /// - **Codex**: first-slice `-c sandbox_workspace_write.network_access` from
+    ///   `provider_native` under Moderate (PTY or ACP).
+    /// - **Claude**: catalog `permits` → ProviderHome sidecar settings JSON +
+    ///   documented `--settings <path>` on **PTY** only (Linux/macOS/WSL2).
+    ///   ACP refuses (no measured ACP settings-path surface). Native Windows
+    ///   refuses (no vendor Bash sandbox). Membership-only (empty permits) =
+    ///   no overlay.
+    /// - **Kimi / Grok**: no first-party settings/argv network surface here —
+    ///   empty overlay when no `provider_native`; invented native keys already
+    ///   refuse at load / resolve.
+    ///
+    /// Empty when no allowlist / nothing to map. Never cookies / secrets.
+    fn resolve_network_allowlist_overlay_args(
         &self,
         provider: &AgentId,
         mode: SessionMode,
         approval_level: ApprovalLevel,
         network_allowlist: Option<&crate::protocol::SpawnNetworkAllowlistId>,
+        provider_home: Option<&Path>,
     ) -> Result<Vec<std::ffi::OsString>, NodeFailure> {
         let Some(allowlist_id) = network_allowlist else {
             return Ok(Vec::new());
@@ -3675,6 +3693,55 @@ impl NodeShared {
                 "spawn network allowlist is unavailable on this node",
             ));
         };
+
+        // Claude: settings-shaped overlay from permits (not provider_native).
+        if provider.as_str() == "claude" && !entry.permits.is_empty() {
+            crate::network_allowlist_catalog::claude_bash_sandbox_network_os_supported().map_err(
+                |message| {
+                    failure(
+                        NodeFailureCode::UnsupportedNetworkAllowlistMapping,
+                        &message,
+                    )
+                },
+            )?;
+            if !matches!(mode, SessionMode::Pty) {
+                return Err(failure(
+                    NodeFailureCode::UnsupportedNetworkAllowlistMapping,
+                    "Claude sandbox.network --settings overlay requires PTY transport; ACP has no measured settings-path surface (refuse rather than invent RPC)",
+                ));
+            }
+            let Some(home) = provider_home else {
+                return Err(failure(
+                    NodeFailureCode::UnsupportedNetworkAllowlistMapping,
+                    "Claude sandbox.network --settings overlay requires ProviderHome materialization (CLAUDE_CONFIG_DIR)",
+                ));
+            };
+            let domains =
+                crate::network_allowlist_catalog::claude_allowed_domains_from_permits(&entry.permits);
+            if domains.is_empty() {
+                return Err(failure(
+                    NodeFailureCode::UnsupportedNetworkAllowlistMapping,
+                    "Claude sandbox.network overlay could not map catalog permits to allowedDomains",
+                ));
+            }
+            let settings_path = home.join(
+                crate::network_allowlist_catalog::CLAUDE_STATION_NETWORK_SETTINGS_FILE,
+            );
+            let json =
+                crate::network_allowlist_catalog::claude_station_network_settings_json(&domains);
+            crate::session_environment::secure_create_file(&settings_path, json.as_bytes()).map_err(
+                |_| {
+                    failure(
+                        NodeFailureCode::UnsupportedNetworkAllowlistMapping,
+                        "Claude station network settings sidecar could not be written under ProviderHome",
+                    )
+                },
+            )?;
+            let overlay =
+                crate::network_allowlist_catalog::claude_settings_network_overlay_args(&settings_path);
+            return Ok(overlay.into_iter().map(std::ffi::OsString::from).collect());
+        }
+
         let Some(native) = entry.provider_native.as_ref() else {
             return Ok(Vec::new());
         };
@@ -3699,6 +3766,23 @@ impl NodeShared {
             ));
         }
         Ok(overlay.into_iter().map(std::ffi::OsString::from).collect())
+    }
+
+    /// Backward-compatible alias used by Codex-focused unit tests.
+    fn resolve_codex_network_access_overlay_args(
+        &self,
+        provider: &AgentId,
+        mode: SessionMode,
+        approval_level: ApprovalLevel,
+        network_allowlist: Option<&crate::protocol::SpawnNetworkAllowlistId>,
+    ) -> Result<Vec<std::ffi::OsString>, NodeFailure> {
+        self.resolve_network_allowlist_overlay_args(
+            provider,
+            mode,
+            approval_level,
+            network_allowlist,
+            None,
+        )
     }
 
     fn resolve_environment_profile(
@@ -4322,6 +4406,7 @@ impl NodeShared {
         let guard = SessionMaterializationGuard {
             shared: self,
             id: Some(id),
+            provider_home: Some(ownership.provider_home().to_path_buf()),
         };
         let bundle_arguments = match bundle {
             Some(receipt) => {
@@ -11884,13 +11969,17 @@ impl NodeShared {
             mode,
             environment_profile.as_ref(),
         )?;
-        // Track B Codex first slice: merge `-c sandbox_workspace_write.network_access`
-        // into the instance launch overlay (PTY argv / ACP approval_level_args).
-        let network_overlay_args = self.resolve_codex_network_access_overlay_args(
+        // Station network overlays: Codex `-c network_access` and/or Claude
+        // ProviderHome `--settings` sidecar (permits → allowedDomains).
+        let provider_home = materialization_guard
+            .as_ref()
+            .and_then(SessionMaterializationGuard::provider_home);
+        let network_overlay_args = self.resolve_network_allowlist_overlay_args(
             &provider,
             mode,
             approval_level,
             network_allowlist.as_ref(),
+            provider_home,
         )?;
         let environment_overlay = match (environment_overlay.flatten(), network_overlay_args) {
             (prepared, args) if args.is_empty() => prepared,
@@ -11898,7 +11987,7 @@ impl NodeShared {
                 overlay.append_extra_args(args).map_err(|_| {
                     failure(
                         NodeFailureCode::UnsupportedNetworkAllowlistMapping,
-                        "Codex network_access overlay could not merge with instance launch args",
+                        "network allowlist overlay could not merge with instance launch args",
                     )
                 })?;
                 Some(PreparedNativeLaunchOverlay::Instance(overlay))
@@ -11910,7 +11999,7 @@ impl NodeShared {
                         .map_err(|_| {
                             failure(
                                 NodeFailureCode::UnsupportedNetworkAllowlistMapping,
-                                "Codex network_access overlay could not merge with environment overlay",
+                                "network allowlist overlay could not merge with environment overlay",
                             )
                         })?,
                 ))
@@ -11929,7 +12018,7 @@ impl NodeShared {
                 .map_err(|_| {
                     failure(
                         NodeFailureCode::UnsupportedNetworkAllowlistMapping,
-                        "Codex network_access -c overlay is invalid for this transport",
+                        "network allowlist overlay is invalid for this transport",
                     )
                 })?,
             )),
@@ -17994,6 +18083,159 @@ mod station_knobs_resolve_tests {
             assert_eq!(
                 failure.code,
                 NodeFailureCode::UnsupportedNetworkAllowlistMapping
+            );
+        }
+    }
+
+    /// Claude PTY + catalog permits → ProviderHome `--settings` sidecar with
+    /// sandbox.network.allowedDomains. ACP / missing ProviderHome refuse.
+    /// Never secrets on C2; does not invent provider_native Claude keys.
+    #[test]
+    fn resolve_claude_settings_network_overlay_pty_writes_sidecar() {
+        let (shared, _defaults) = station_knobs_fixture();
+        let allowlist =
+            crate::protocol::SpawnNetworkAllowlistId::new("egress-claude-domains").unwrap();
+        let entry = crate::network_allowlist_catalog::NetworkAllowlistEntry {
+            id: allowlist.clone(),
+            permits: vec![
+                crate::network_allowlist_catalog::NetworkPermitSketch {
+                    protocol: crate::network_allowlist_catalog::NetworkPermitProtocol::Tcp,
+                    peer: "github.com:443".to_owned(),
+                },
+                crate::network_allowlist_catalog::NetworkPermitSketch {
+                    protocol: crate::network_allowlist_catalog::NetworkPermitProtocol::Tcp,
+                    peer: "*.npmjs.org".to_owned(),
+                },
+            ],
+            provider_native: None,
+        };
+        shared
+            .network_allowlist_catalog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(entry)
+            .unwrap();
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let provider_home = std::env::temp_dir().join(format!(
+            "gate4agent-claude-provider-home-{}-{unique}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&provider_home).unwrap();
+
+        let overlay = shared
+            .resolve_network_allowlist_overlay_args(
+                &agent("claude"),
+                SessionMode::Pty,
+                ApprovalLevel::Moderate,
+                Some(&allowlist),
+                Some(provider_home.as_path()),
+            )
+            .expect("Claude PTY settings overlay on unix");
+        let settings_path = provider_home.join(
+            crate::network_allowlist_catalog::CLAUDE_STATION_NETWORK_SETTINGS_FILE,
+        );
+        assert_eq!(
+            overlay,
+            vec![
+                std::ffi::OsString::from("--settings"),
+                std::ffi::OsString::from(settings_path.as_os_str()),
+            ]
+        );
+        let body = std::fs::read_to_string(&settings_path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["sandbox"]["enabled"], true);
+        assert_eq!(
+            value["sandbox"]["network"]["allowedDomains"],
+            serde_json::json!(["github.com", "*.npmjs.org"])
+        );
+        assert!(settings_path.starts_with(&provider_home));
+
+        let acp = shared
+            .resolve_network_allowlist_overlay_args(
+                &agent("claude"),
+                SessionMode::Acp,
+                ApprovalLevel::Moderate,
+                Some(&allowlist),
+                Some(provider_home.as_path()),
+            )
+            .expect_err("Claude ACP must refuse settings overlay");
+        assert_eq!(
+            acp.code,
+            NodeFailureCode::UnsupportedNetworkAllowlistMapping
+        );
+
+        let no_home = shared
+            .resolve_network_allowlist_overlay_args(
+                &agent("claude"),
+                SessionMode::Pty,
+                ApprovalLevel::Moderate,
+                Some(&allowlist),
+                None,
+            )
+            .expect_err("Claude overlay requires ProviderHome");
+        assert_eq!(
+            no_home.code,
+            NodeFailureCode::UnsupportedNetworkAllowlistMapping
+        );
+
+        let bare = crate::protocol::SpawnNetworkAllowlistId::new("egress-claude-bare").unwrap();
+        shared
+            .network_allowlist_catalog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert_id(bare.clone())
+            .unwrap();
+        let empty = shared
+            .resolve_network_allowlist_overlay_args(
+                &agent("claude"),
+                SessionMode::Pty,
+                ApprovalLevel::Moderate,
+                Some(&bare),
+                Some(provider_home.as_path()),
+            )
+            .unwrap();
+        assert!(empty.is_empty());
+
+        let _ = std::fs::remove_dir_all(&provider_home);
+    }
+
+    /// Kimi / Grok with permits stay without invented argv overlays.
+    #[test]
+    fn resolve_kimi_grok_network_overlay_stays_empty_without_native() {
+        let (shared, _defaults) = station_knobs_fixture();
+        let allowlist =
+            crate::protocol::SpawnNetworkAllowlistId::new("egress-kimi-permits").unwrap();
+        let entry = crate::network_allowlist_catalog::NetworkAllowlistEntry {
+            id: allowlist.clone(),
+            permits: vec![crate::network_allowlist_catalog::NetworkPermitSketch {
+                protocol: crate::network_allowlist_catalog::NetworkPermitProtocol::Tcp,
+                peer: "example.com:443".to_owned(),
+            }],
+            provider_native: None,
+        };
+        shared
+            .network_allowlist_catalog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(entry)
+            .unwrap();
+        for provider in ["kimi", "grok"] {
+            let overlay = shared
+                .resolve_network_allowlist_overlay_args(
+                    &agent(provider),
+                    SessionMode::Pty,
+                    ApprovalLevel::Moderate,
+                    Some(&allowlist),
+                    None,
+                )
+                .unwrap();
+            assert!(
+                overlay.is_empty(),
+                "{provider} must not invent network argv from permits"
             );
         }
     }

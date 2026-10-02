@@ -299,7 +299,7 @@ pub enum ApprovalLevelResolution {
 /// approval** axis of `{providerHome, cwd, sandbox, network,
 /// browserProfile?}`. It does **not** encode OS Landlock/Seatbelt/Windows
 /// token choice, Codex `networkAccess` (catalog `provider_native` Moderate
-/// `-c` overlay), Claude Bash `sandbox.network.*` settings, Grok `--sandbox`
+/// `-c` overlay), Claude Bash `sandbox.network.*` via ProviderHome `--settings` overlay (permits→allowedDomains; PTY/non-Win), Grok `--sandbox`
 /// profiles, or a dig2browser profile id — see hatchery-websession-docs
 /// `research/station-profile-and-os-sandbox-matrix-2026-10-02.md`,
 /// `research/claude-kimi-network-argv-vs-station-catalog-2026-10-02.md`,

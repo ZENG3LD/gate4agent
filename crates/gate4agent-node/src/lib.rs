@@ -40,12 +40,16 @@ mod server;
 
 pub use network_allowlist_catalog::{
     load_network_allowlist_catalog_file, parse_network_allowlist_catalog_text,
-    codex_network_access_config_overlay, provider_native_mapping_supported,
-    resolve_network_allowlist_catalog, resolve_provider_native_launch_overlay,
-    NetworkAllowlistCatalog, NetworkAllowlistCatalogError, NetworkAllowlistEntry,
-    NetworkPermitProtocol, NetworkPermitSketch, ProviderNativeNetworkSketch,
-    MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES, MAX_NETWORK_PERMITS_PER_ENTRY,
-    NETWORK_ALLOWLIST_CATALOG_ENV, NETWORK_ALLOWLIST_CATALOG_SCHEMA_VERSION,
+    claude_allowed_domains_from_permits, claude_bash_sandbox_network_os_supported,
+    claude_settings_network_overlay_args, claude_station_network_settings_json,
+    codex_network_access_config_overlay, permit_peer_to_allowed_domain,
+    provider_native_mapping_supported, resolve_network_allowlist_catalog,
+    resolve_provider_native_launch_overlay, NetworkAllowlistCatalog,
+    NetworkAllowlistCatalogError, NetworkAllowlistEntry, NetworkPermitProtocol,
+    NetworkPermitSketch, ProviderNativeNetworkSketch,
+    CLAUDE_STATION_NETWORK_SETTINGS_FILE, MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES,
+    MAX_NETWORK_PERMITS_PER_ENTRY, NETWORK_ALLOWLIST_CATALOG_ENV,
+    NETWORK_ALLOWLIST_CATALOG_SCHEMA_VERSION,
 };
 pub use server::{
     default_node_endpoint, default_state_path, NodeServer, NodeServerConfig, NodeServerError,

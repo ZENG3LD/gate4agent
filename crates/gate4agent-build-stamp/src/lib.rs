@@ -5,7 +5,10 @@
 //! and untracked-but-not-ignored file, folded into a single 40-hex-digit
 //! id. Two binaries built from byte-identical checkouts get the same
 //! stamp; two binaries built from checkouts that differ by even one byte
-//! almost certainly do not. It answers exactly one question at connection
+//! almost certainly do not. A crates.io build is not a checkout: it uses
+//! the stamp recorded in `published-stamp.txt` at publish time, which is
+//! the same hash a checkout of that published commit produces. It answers
+//! exactly one question at connection
 //! time -- "did this peer come from the same tree I did?" -- compared for
 //! exact equality, nothing else.
 //!

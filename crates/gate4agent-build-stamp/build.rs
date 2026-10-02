@@ -1,11 +1,16 @@
 //! Computes `G4A_BUILD_STAMP`: a git content hash of the working tree that
 //! contains this crate, exposed to `src/lib.rs` via `cargo:rustc-env`.
 //!
-//! No fallback value exists anywhere in this script. A stamp that silently
-//! defaulted on a missing `git` binary or a non-repository checkout would
-//! make mismatched binaries look compatible -- exactly the failure this
-//! crate exists to remove. Every failure path below ends the build with one
+//! Inside a git checkout there is no fallback. A stamp that silently
+//! defaulted on a missing `git` binary or a broken repository would make
+//! mismatched binaries look compatible -- exactly the failure this crate
+//! exists to remove. Every git failure path below ends the build with one
 //! sentence naming the command and the reason it failed.
+//!
+//! A crates.io unpack has no parent `.git`. That build reads
+//! `published-stamp.txt` (the stamp of the tree that was packaged) and
+//! panics if the file is missing or not 40 hex digits. The file is left
+//! out of the hash, so committing it does not change the stamp.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -19,9 +24,20 @@ fn main() {
     }
 }
 
+const PACKAGED_STAMP_REL: &str = "crates/gate4agent-build-stamp/published-stamp.txt";
+
 fn run() -> Result<(), String> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR")
         .map_err(|_| "gate4agent-build-stamp: CARGO_MANIFEST_DIR is not set".to_owned())?;
+    let manifest_path = PathBuf::from(&manifest_dir);
+
+    // `cargo publish` verifies dependents against the registry copy under
+    // `$CARGO_HOME/registry/src/`, which is not a checkout (and may still
+    // sit inside some parent `.git`). `target/package/` during this crate's
+    // own publish stays on the git path.
+    if is_registry_src(&manifest_path) || !inside_work_tree(&manifest_path) {
+        return emit_packaged_stamp(&manifest_path);
+    }
 
     // Step 1: the repository root that contains this crate.
     let toplevel = run_git(&manifest_dir, &["rev-parse", "--show-toplevel"], None)?;
@@ -49,6 +65,9 @@ fn run() -> Result<(), String> {
         let path = String::from_utf8(chunk.to_vec()).map_err(|_| {
             "gate4agent-build-stamp: git ls-files returned a non-UTF-8 path".to_owned()
         })?;
+        if path.replace('\\', "/") == PACKAGED_STAMP_REL {
+            continue;
+        }
         paths.insert(path);
     }
     if paths.is_empty() {
@@ -139,6 +158,42 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-changed={}", root.join(".git").join("HEAD").display());
     println!("cargo:rerun-if-changed={}", root.join(".git").join("index").display());
 
+    Ok(())
+}
+
+fn is_registry_src(path: &Path) -> bool {
+    path.to_string_lossy().replace('\\', "/").contains("/registry/src/")
+}
+
+fn inside_work_tree(start: &Path) -> bool {
+    let mut current = Some(start.to_path_buf());
+    while let Some(dir) = current {
+        if dir.join(".git").exists() {
+            return true;
+        }
+        current = dir.parent().map(Path::to_path_buf);
+    }
+    false
+}
+
+fn emit_packaged_stamp(manifest_dir: &Path) -> Result<(), String> {
+    let path = manifest_dir.join("published-stamp.txt");
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "gate4agent-build-stamp: '{}' is not inside a git checkout, and '{}' could not be read: {error}",
+            manifest_dir.display(),
+            path.display(),
+        )
+    })?;
+    let stamp = text.trim();
+    if !is_git_hex_id(stamp) {
+        return Err(format!(
+            "gate4agent-build-stamp: '{}' is not a 40-hex-digit stamp",
+            path.display(),
+        ));
+    }
+    println!("cargo:rustc-env=G4A_BUILD_STAMP={stamp}");
+    println!("cargo:rerun-if-changed={}", path.display());
     Ok(())
 }
 

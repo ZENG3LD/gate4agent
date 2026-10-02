@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-build-stamp"
-version = "0.4.1"
+version = "0.4.2"
 
 [[package]]
 name = "gate4agent-c2"

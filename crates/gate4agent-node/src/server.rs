@@ -208,6 +208,8 @@ use tokio::time::{sleep, timeout};
 
 mod http_api;
 
+mod browser_bridge;
+
 mod drive_loop_profile;
 
 #[path = "bundle_delivery.rs"]
@@ -1038,6 +1040,12 @@ impl WorkspaceConfig {
 pub struct NodeServerConfig {
     pub endpoint: String,
     api_listen: Option<std::net::SocketAddr>,
+    /// Opt-in node-envelope HTTP+WS browser bridge (separate from `--api-listen`
+    /// ops HTTP and from framed C2). Loopback only; default `None` = off.
+    bridge_listen: Option<std::net::SocketAddr>,
+    /// Optional bridge shared secret (`GATE4AGENT_BRIDGE_TOKEN`). Distinct from
+    /// NODE_TOKEN; never logged. `None` = loopback bind is the only gate.
+    bridge_token: Option<String>,
     /// A relay to CALL, rather than wait to be called by. `None` keeps the
     /// node purely a listener, which is what it has always been.
     call_home: Option<std::net::SocketAddr>,
@@ -1124,6 +1132,8 @@ impl NodeServerConfig {
         Ok(Self {
             endpoint,
             api_listen: None,
+            bridge_listen: None,
+            bridge_token: None,
             call_home: None,
             node_id,
             workspaces,
@@ -1149,6 +1159,34 @@ impl NodeServerConfig {
             return Err(NodeServerError::InvalidApiListen(api_listen));
         }
         self.api_listen = Some(api_listen);
+        Ok(self)
+    }
+
+    /// Opt-in node-envelope HTTP+WS bridge listener. Loopback only (same spirit
+    /// as `with_api_listen`). Does not enable by default — libraries and the
+    /// binary leave this `None` until `--bridge-listen` / `with_bridge_listen`.
+    pub fn with_bridge_listen(
+        mut self,
+        bridge_listen: std::net::SocketAddr,
+    ) -> Result<Self, NodeServerError> {
+        if !bridge_listen.ip().is_loopback() {
+            return Err(NodeServerError::InvalidBridgeListen(bridge_listen));
+        }
+        self.bridge_listen = Some(bridge_listen);
+        Ok(self)
+    }
+
+    /// Optional bridge shared secret, distinct from the C2/node access token.
+    /// Never log the value. Empty / oversize refused.
+    pub fn with_bridge_token(
+        mut self,
+        bridge_token: impl Into<String>,
+    ) -> Result<Self, NodeServerError> {
+        let bridge_token = bridge_token.into();
+        if bridge_token.is_empty() || bridge_token.len() > 4_096 {
+            return Err(NodeServerError::InvalidBridgeToken);
+        }
+        self.bridge_token = Some(bridge_token);
         Ok(self)
     }
 
@@ -2380,8 +2418,12 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         let endpoint = config.endpoint.clone();
         let call_home = config.call_home;
         let api_listen = config.api_listen;
+        let bridge_listen = config.bridge_listen;
+        let bridge_auth = browser_bridge::BridgeAuth::from_optional(config.bridge_token)
+            .map_err(|_| NodeServerError::InvalidBridgeToken)?;
         let accept_shared = Arc::clone(&shared);
         let api_shared = Arc::clone(&shared);
+        let bridge_shared = Arc::clone(&shared);
         let shutdown_shared = Arc::clone(&shared);
         let shutdown_timeout = Duration::from_millis(
             config.runtime.provider_shutdown_timeout_ms.max(1),
@@ -2395,21 +2437,25 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
             );
             let accept_loop = accept_connections(&endpoint, call_home, accept_shared);
             let api_loop = http_api::run(api_listen, api_shared);
+            let bridge_loop = browser_bridge::run(bridge_listen, bridge_auth, bridge_shared);
             tokio::pin!(runtime_loop);
             tokio::pin!(accept_loop);
             tokio::pin!(api_loop);
+            tokio::pin!(bridge_loop);
             tokio::select! {
                 runtime_result = &mut runtime_loop => {
                     let shutdown_result = shutdown_shared
                         .begin_shutdown()
                         .await
                         .map_err(NodeServerError::ShutdownDispatch);
-                    let (accept_result, api_result) = tokio::join!(&mut accept_loop, &mut api_loop);
+                    let (accept_result, api_result, bridge_result) =
+                        tokio::join!(&mut accept_loop, &mut api_loop, &mut bridge_loop);
                     match runtime_result {
                         Err(error) => Err(error),
                         Ok(()) => shutdown_result
                             .and(accept_result)
-                            .and(api_result.map_err(NodeServerError::HttpApi)),
+                            .and(api_result.map_err(NodeServerError::HttpApi))
+                            .and(bridge_result.map_err(NodeServerError::BridgeApi)),
                     }
                 }
                 accept_result = &mut accept_loop => {
@@ -2417,12 +2463,14 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
                         .begin_shutdown()
                         .await
                         .map_err(NodeServerError::ShutdownDispatch);
-                    let (runtime_result, api_result) = tokio::join!(&mut runtime_loop, &mut api_loop);
+                    let (runtime_result, api_result, bridge_result) =
+                        tokio::join!(&mut runtime_loop, &mut api_loop, &mut bridge_loop);
                     match accept_result {
                         Err(error) => Err(error),
                         Ok(()) => shutdown_result
                             .and(runtime_result)
-                            .and(api_result.map_err(NodeServerError::HttpApi)),
+                            .and(api_result.map_err(NodeServerError::HttpApi))
+                            .and(bridge_result.map_err(NodeServerError::BridgeApi)),
                     }
                 }
                 api_result = &mut api_loop => {
@@ -2430,12 +2478,29 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
                         .begin_shutdown()
                         .await
                         .map_err(NodeServerError::ShutdownDispatch);
-                    let (runtime_result, accept_result) = tokio::join!(&mut runtime_loop, &mut accept_loop);
+                    let (runtime_result, accept_result, bridge_result) =
+                        tokio::join!(&mut runtime_loop, &mut accept_loop, &mut bridge_loop);
                     match api_result {
                         Err(error) => Err(NodeServerError::HttpApi(error)),
                         Ok(()) => shutdown_result
                             .and(runtime_result)
-                            .and(accept_result),
+                            .and(accept_result)
+                            .and(bridge_result.map_err(NodeServerError::BridgeApi)),
+                    }
+                }
+                bridge_result = &mut bridge_loop => {
+                    let shutdown_result = shutdown_shared
+                        .begin_shutdown()
+                        .await
+                        .map_err(NodeServerError::ShutdownDispatch);
+                    let (runtime_result, accept_result, api_result) =
+                        tokio::join!(&mut runtime_loop, &mut accept_loop, &mut api_loop);
+                    match bridge_result {
+                        Err(error) => Err(NodeServerError::BridgeApi(error)),
+                        Ok(()) => shutdown_result
+                            .and(runtime_result)
+                            .and(accept_result)
+                            .and(api_result.map_err(NodeServerError::HttpApi)),
                     }
                 }
             }
@@ -16851,6 +16916,10 @@ pub enum NodeServerError {
     InvalidAccessToken,
     #[error("node HTTP observer must listen on a loopback address: {0}")]
     InvalidApiListen(std::net::SocketAddr),
+    #[error("node browser bridge must listen on a loopback address: {0}")]
+    InvalidBridgeListen(std::net::SocketAddr),
+    #[error("node browser bridge token must contain 1..=4096 bytes")]
+    InvalidBridgeToken,
     #[error("node call-home relay must be a loopback address with a nonzero port: {0}")]
     InvalidCallHome(std::net::SocketAddr),
     #[error("node could not reach its call-home relay: {0}")]
@@ -16941,6 +17010,8 @@ pub enum NodeServerError {
     Io(#[from] io::Error),
     #[error("node HTTP observer failed: {0}")]
     HttpApi(io::Error),
+    #[error("node browser bridge failed: {0}")]
+    BridgeApi(io::Error),
     #[error(transparent)]
     Frame(#[from] FrameError),
     #[error("node handshake failed: {0}")]

@@ -15,6 +15,11 @@
 //! (`dispatch_input_bounded` + runtime policy). Bridge token + loopback are
 //! the auth barrier (not C2 controller lease). No raw PTY bytes / TerminalBytes
 //! / cookies / OAuth as product API.
+//!
+//! Streaming observe (tip after drive): `/bridge/ws` keeps the connection,
+//! sends an initial `bridge.hello` slim snapshot, then periodic
+//! `observe.snapshot` frames. Client ping→pong; close or node shutdown ends
+//! the loop. Not a C2 controller; no cookies/OAuth/secrets on the wire.
 
 use super::NodeShared;
 use crate::protocol::{
@@ -47,6 +52,14 @@ const MAX_BRIDGE_CONNECTIONS: usize = 8;
 /// JSON envelope overhead budget on top of `MAX_NODE_TEXT_BYTES` for drive POST.
 const BRIDGE_DRIVE_BODY_OVERHEAD: usize = 1_024;
 const MAX_BRIDGE_DRIVE_BODY_BYTES: usize = MAX_NODE_TEXT_BYTES + BRIDGE_DRIVE_BODY_OVERHEAD;
+/// Default period between slim observe snapshots on an open `/bridge/ws`.
+/// Slim projections only — keep short enough for MLC attach, long enough to
+/// avoid busy-looping the node snapshot lock.
+const DEFAULT_OBSERVE_PERIOD: Duration = Duration::from_secs(1);
+/// Cap client control-frame payload (RFC6455 ping/pong/close body).
+const WS_CONTROL_PAYLOAD_MAX: usize = 125;
+/// Cap inbound client data frame for this tip (observe-only; drive is HTTP).
+const WS_CLIENT_DATA_PAYLOAD_MAX: usize = 64 * 1024;
 /// RFC6455 GUID for `Sec-WebSocket-Accept`.
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -111,6 +124,15 @@ async fn serve_listener(
     auth: BridgeAuth,
     shared: Arc<NodeShared>,
 ) -> io::Result<()> {
+    serve_listener_with_observe_period(listener, auth, shared, DEFAULT_OBSERVE_PERIOD).await
+}
+
+async fn serve_listener_with_observe_period(
+    listener: TcpListener,
+    auth: BridgeAuth,
+    shared: Arc<NodeShared>,
+    observe_period: Duration,
+) -> io::Result<()> {
     let permits = Arc::new(Semaphore::new(MAX_BRIDGE_CONNECTIONS));
     let mut connections = JoinSet::new();
     loop {
@@ -141,7 +163,13 @@ async fn serve_listener(
                 let connection_auth = auth.clone();
                 connections.spawn(async move {
                     let _permit = permit;
-                    let _ = serve_connection(stream, connection_auth, connection_shared).await;
+                    let _ = serve_connection(
+                        stream,
+                        connection_auth,
+                        connection_shared,
+                        observe_period,
+                    )
+                    .await;
                 });
             }
         }
@@ -157,6 +185,7 @@ async fn serve_connection(
     mut stream: TcpStream,
     auth: BridgeAuth,
     shared: Arc<NodeShared>,
+    observe_period: Duration,
 ) -> io::Result<()> {
     let request = match timeout(HEADER_READ_TIMEOUT, read_request(&mut stream)).await {
         Ok(Ok(request)) => request,
@@ -173,7 +202,7 @@ async fn serve_connection(
         .map_or(request.target.as_str(), |(path, _)| path);
 
     if path_only == "/bridge/ws" {
-        return handle_websocket_upgrade(stream, request, &auth, &shared).await;
+        return handle_websocket_upgrade(stream, request, &auth, &shared, observe_period).await;
     }
 
     if path_only == "/bridge/drive" {
@@ -210,6 +239,7 @@ async fn handle_websocket_upgrade(
     request: Request,
     auth: &BridgeAuth,
     shared: &NodeShared,
+    observe_period: Duration,
 ) -> io::Result<()> {
     if request.method != "GET" {
         return write_http(
@@ -255,20 +285,150 @@ Sec-WebSocket-Accept: {accept}\r\n\
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bridge ws upgrade write timed out"))??;
 
-    // Observe frame: typed hello + slim per-session projections (tip 3).
-    // Drive is HTTP POST /bridge/drive (tip 4). Streaming push remains later.
-    let payload = serde_json::to_vec(&observe_frame(shared)).map_err(|error| {
-        io::Error::new(io::ErrorKind::InvalidData, error)
-    })?;
+    // Initial hello + keep connection for periodic slim snapshots.
+    // Drive remains HTTP POST /bridge/drive (tip 4). Mesh underlay later.
+    run_ws_observe_loop(&mut stream, shared, observe_period).await
+}
+
+/// Keep `/bridge/ws` open: hello once, then periodic `observe.snapshot`.
+/// Responds to client ping with pong; ends on client close, read error, or
+/// node shutdown. Ignores inbound text/binary (drive is HTTP, not WS C2).
+async fn run_ws_observe_loop(
+    stream: &mut TcpStream,
+    shared: &NodeShared,
+    observe_period: Duration,
+) -> io::Result<()> {
+    write_ws_text(stream, &observe_hello_frame(shared)).await?;
+
+    let period = if observe_period.is_zero() {
+        DEFAULT_OBSERVE_PERIOD
+    } else {
+        observe_period
+    };
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first interval tick completes immediately; hello already covers it.
+    ticker.tick().await;
+
+    let mut seq: u64 = 0;
+    loop {
+        let shutdown = shared.shutdown_notify.notified();
+        tokio::pin!(shutdown);
+        if shared.shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                if shared.shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            _ = ticker.tick() => {
+                seq = seq.saturating_add(1);
+                if write_ws_text(stream, &observe_tick_frame(shared, seq)).await.is_err() {
+                    break;
+                }
+            }
+            frame = read_client_ws_frame(stream) => {
+                match frame {
+                    Ok(ClientWsFrame::Close) => break,
+                    Ok(ClientWsFrame::Ping(payload)) => {
+                        if write_ws_control(stream, 0x0A, &payload).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(ClientWsFrame::Pong | ClientWsFrame::Data) => {
+                        // Observe-only stream; ignore application data + unsolicited pong.
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    // Best-effort close; ignore write failures (peer may already be gone).
+    let _ = write_ws_control(stream, 0x08, &[]).await;
+    Ok(())
+}
+
+async fn write_ws_text(stream: &mut TcpStream, value: &Value) -> io::Result<()> {
+    let payload = serde_json::to_vec(value)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let frame = encode_server_text_frame(&payload);
     timeout(WRITE_TIMEOUT, stream.write_all(&frame))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bridge ws frame write timed out"))??;
-
-    // One observe text frame then close. Streaming push is a later tip.
-    let close = [0x88u8, 0x00]; // FIN + opcode close, empty payload
-    let _ = timeout(WRITE_TIMEOUT, stream.write_all(&close)).await;
     Ok(())
+}
+
+async fn write_ws_control(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> io::Result<()> {
+    let frame = encode_server_control_frame(opcode, payload);
+    timeout(WRITE_TIMEOUT, stream.write_all(&frame))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bridge ws control write timed out"))??;
+    Ok(())
+}
+
+enum ClientWsFrame {
+    Data,
+    Ping(Vec<u8>),
+    Pong,
+    Close,
+}
+
+/// Read one client WebSocket frame (masked per RFC6455).
+async fn read_client_ws_frame(stream: &mut TcpStream) -> io::Result<ClientWsFrame> {
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await?;
+    let opcode = header[0] & 0x0f;
+    let masked = header[1] & 0x80 != 0;
+    if !masked {
+        // RFC6455: client→server frames MUST be masked.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bridge ws client frame missing mask",
+        ));
+    }
+    let mut payload_len = (header[1] & 0x7f) as u64;
+    if payload_len == 126 {
+        let mut ext = [0u8; 2];
+        stream.read_exact(&mut ext).await?;
+        payload_len = u16::from_be_bytes(ext) as u64;
+    } else if payload_len == 127 {
+        let mut ext = [0u8; 8];
+        stream.read_exact(&mut ext).await?;
+        payload_len = u64::from_be_bytes(ext);
+    }
+    let max = match opcode {
+        0x8 | 0x9 | 0xA => WS_CONTROL_PAYLOAD_MAX as u64,
+        _ => WS_CLIENT_DATA_PAYLOAD_MAX as u64,
+    };
+    if payload_len > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bridge ws client frame too large",
+        ));
+    }
+    let mut mask = [0u8; 4];
+    stream.read_exact(&mut mask).await?;
+    let mut payload = vec![0u8; payload_len as usize];
+    if !payload.is_empty() {
+        stream.read_exact(&mut payload).await?;
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % 4];
+        }
+    }
+    match opcode {
+        0x1 | 0x2 | 0x0 => Ok(ClientWsFrame::Data),
+        0x8 => Ok(ClientWsFrame::Close),
+        0x9 => Ok(ClientWsFrame::Ping(payload)),
+        0xA => Ok(ClientWsFrame::Pong),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bridge ws unsupported opcode",
+        )),
+    }
 }
 
 fn is_websocket_upgrade(request: &Request) -> bool {
@@ -309,29 +469,55 @@ fn health_body(shared: &NodeShared) -> Value {
 }
 
 fn observe_snapshot_body(shared: &NodeShared) -> Value {
-    observe_frame(shared)
+    observe_hello_frame(shared)
 }
 
 /// Typed observe payload with slim per-session projections.
 /// Privacy: no terminal_frame contents/formatted, no history messages, no
 /// cookies/OAuth, no bridge/node tokens. Screen is kind (+ short classifiers)
 /// only — OperatorGate options (on-screen choice labels) are stripped.
-fn observe_frame(shared: &NodeShared) -> Value {
+fn observe_core(shared: &NodeShared) -> (usize, usize, Vec<Value>) {
     let control = shared.handle.snapshot();
     let control_plane_sessions = control.sessions.len();
     let native_pty_sessions = shared.native_session_gauge.load(Ordering::Relaxed);
     let session_projections = slim_session_projections(shared, &control.sessions);
+    (
+        control_plane_sessions,
+        native_pty_sessions,
+        session_projections,
+    )
+}
+
+fn observe_hello_frame(shared: &NodeShared) -> Value {
+    let (control_plane_sessions, native_pty_sessions, session_projections) = observe_core(shared);
     json!({
         "type": "bridge.hello",
         "observe": {
             "type": "observe.snapshot",
+            "seq": 0,
             "sessions": {
                 "control_plane": control_plane_sessions,
                 "native_pty": native_pty_sessions,
             },
             "session_projections": session_projections,
-            "note": "slim session projection; drive via POST /bridge/drive (prompt|paste); streaming push/mesh later",
+            "note": "slim session projection; drive via POST /bridge/drive (prompt|paste); WS streams periodic observe.snapshot; mesh underlay later",
         },
+        "node_id": shared.node_id,
+        "incarnation_id": shared.incarnation_id,
+        "door": "node-envelope-bridge",
+    })
+}
+
+fn observe_tick_frame(shared: &NodeShared, seq: u64) -> Value {
+    let (control_plane_sessions, native_pty_sessions, session_projections) = observe_core(shared);
+    json!({
+        "type": "observe.snapshot",
+        "seq": seq,
+        "sessions": {
+            "control_plane": control_plane_sessions,
+            "native_pty": native_pty_sessions,
+        },
+        "session_projections": session_projections,
         "node_id": shared.node_id,
         "incarnation_id": shared.incarnation_id,
         "door": "node-envelope-bridge",
@@ -751,8 +937,22 @@ fn sec_websocket_accept(key: &str) -> String {
 }
 
 fn encode_server_text_frame(payload: &[u8]) -> Vec<u8> {
+    encode_server_data_frame(0x01, payload)
+}
+
+fn encode_server_control_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    // Control frames: payload must fit in one byte length (≤125).
+    let truncated = if payload.len() > WS_CONTROL_PAYLOAD_MAX {
+        &payload[..WS_CONTROL_PAYLOAD_MAX]
+    } else {
+        payload
+    };
+    encode_server_data_frame(opcode & 0x0f, truncated)
+}
+
+fn encode_server_data_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(2 + payload.len() + 8);
-    frame.push(0x81); // FIN + text
+    frame.push(0x80 | (opcode & 0x0f)); // FIN + opcode
     if payload.len() < 126 {
         frame.push(payload.len() as u8);
     } else if payload.len() <= u16::MAX as usize {
@@ -1168,6 +1368,7 @@ Sec-WebSocket-Version: 13\r\n\
         assert!(body.contains("\"type\":\"observe.snapshot\""));
         assert!(body.contains("\"session_projections\":[]"));
         assert!(body.contains("slim session projection"));
+        assert!(body.contains("periodic observe.snapshot"));
         assert!(!body.contains("test-token"));
         assert!(!body.contains("terminal_frame"));
         assert!(!body.contains("GATE4AGENT"));
@@ -1282,6 +1483,7 @@ Sec-WebSocket-Version: 13\r\n\
         assert!(body.contains("\"session_projections\":[]"));
         assert!(body.contains("slim session projection"));
         assert!(body.contains("POST /bridge/drive"));
+        assert!(body.contains("periodic observe.snapshot"));
         assert!(!body.contains("test-token"));
         assert!(!body.contains("terminal_frame"));
 
@@ -1458,5 +1660,223 @@ Sec-WebSocket-Version: 13\r\n\
         assert_eq!(drive_http_status(NodeFailureCode::UnsupportedCapability), 422);
         assert_eq!(drive_http_status(NodeFailureCode::BackendBusy), 503);
         assert_eq!(drive_http_status(NodeFailureCode::InvalidRequest), 400);
+    }
+
+    fn decode_server_frames(mut bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut frames = Vec::new();
+        while bytes.len() >= 2 {
+            let opcode = bytes[0] & 0x0f;
+            let mut len = (bytes[1] & 0x7f) as usize;
+            let mut offset = 2usize;
+            if bytes[1] & 0x80 != 0 {
+                break;
+            }
+            if len == 126 {
+                if bytes.len() < 4 {
+                    break;
+                }
+                len = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+                offset = 4;
+            } else if len == 127 {
+                if bytes.len() < 10 {
+                    break;
+                }
+                len = u64::from_be_bytes(bytes[2..10].try_into().unwrap()) as usize;
+                offset = 10;
+            }
+            if bytes.len() < offset + len {
+                break;
+            }
+            frames.push((opcode, bytes[offset..offset + len].to_vec()));
+            bytes = &bytes[offset + len..];
+        }
+        frames
+    }
+
+    fn encode_client_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(2 + 4 + payload.len());
+        frame.push(0x80 | (opcode & 0x0f));
+        assert!(payload.len() < 126, "test helper only supports small payloads");
+        frame.push(0x80 | (payload.len() as u8));
+        frame.extend_from_slice(&mask);
+        for (index, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask[index % 4]);
+        }
+        frame
+    }
+
+    async fn read_ws_after_upgrade(stream: &mut TcpStream, min_text_frames: usize) -> Vec<Vec<u8>> {
+        let mut buf = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                break;
+            }
+            let mut chunk = [0u8; 8192];
+            match timeout(Duration::from_millis(100), stream.read(&mut chunk)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+                Ok(Err(_)) => break,
+                Err(_) => {}
+            }
+            let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            let text_frames: Vec<Vec<u8>> = decode_server_frames(&buf[header_end..])
+                .into_iter()
+                .filter(|(op, _)| *op == 0x01)
+                .map(|(_, payload)| payload)
+                .collect();
+            if text_frames.len() >= min_text_frames {
+                return text_frames;
+            }
+        }
+        let header_end = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|i| i + 4)
+            .unwrap_or(0);
+        decode_server_frames(&buf[header_end..])
+            .into_iter()
+            .filter(|(op, _)| *op == 0x01)
+            .map(|(_, payload)| payload)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn bridge_ws_streams_periodic_observe_snapshots() {
+        let server = node_server();
+        let shared = Arc::clone(&server.shared);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = BridgeAuth::from_optional(None).unwrap();
+        let task = tokio::spawn(serve_listener_with_observe_period(
+            listener,
+            auth,
+            Arc::clone(&shared),
+            Duration::from_millis(80),
+        ));
+
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let request = format!(
+            "GET /bridge/ws HTTP/1.1\r\n\
+Host: localhost\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: {key}\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let texts = read_ws_after_upgrade(&mut stream, 3).await;
+        assert!(
+            texts.len() >= 3,
+            "expected hello + >=2 ticks, got {}",
+            texts.len()
+        );
+        let hello = std::str::from_utf8(&texts[0]).unwrap();
+        assert!(hello.contains("\"type\":\"bridge.hello\""));
+        assert!(hello.contains("\"seq\":0"));
+        assert!(hello.contains("periodic observe.snapshot"));
+        assert!(!hello.contains("test-token"));
+        assert!(!hello.contains("GATE4AGENT"));
+
+        let tick = std::str::from_utf8(&texts[1]).unwrap();
+        assert!(
+            tick.contains("\"type\":\"observe.snapshot\""),
+            "tick1: {tick}"
+        );
+        assert!(
+            tick.contains("\"seq\":1") || tick.contains("\"seq\":2"),
+            "tick1 seq: {tick}"
+        );
+        assert!(!tick.contains("bridge.hello"));
+        assert!(!tick.contains("terminal_frame"));
+        assert!(!tick.contains("test-token"));
+
+        let tick2 = std::str::from_utf8(&texts[2]).unwrap();
+        assert!(tick2.contains("\"type\":\"observe.snapshot\""));
+        assert!(tick2.contains("\"session_projections\":[]"));
+
+        let close = encode_client_frame(0x08, &[], [1, 2, 3, 4]);
+        let _ = stream.write_all(&close).await;
+
+        server.shutdown_handle().request_shutdown().await.unwrap();
+        timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bridge_ws_ping_gets_pong() {
+        let server = node_server();
+        let shared = Arc::clone(&server.shared);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = BridgeAuth::from_optional(None).unwrap();
+        let task = tokio::spawn(serve_listener_with_observe_period(
+            listener,
+            auth,
+            Arc::clone(&shared),
+            Duration::from_secs(30),
+        ));
+
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let request = format!(
+            "GET /bridge/ws HTTP/1.1\r\n\
+Host: localhost\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: {key}\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let texts = read_ws_after_upgrade(&mut stream, 1).await;
+        assert!(!texts.is_empty(), "expected hello frame");
+
+        // Drain any bytes already buffered after hello by sending ping on a
+        // fresh read window; leftover ticks (unlikely with 30s period) are ok.
+        let ping_payload = b"ko";
+        let ping = encode_client_frame(0x09, ping_payload, [9, 8, 7, 6]);
+        stream.write_all(&ping).await.unwrap();
+
+        let mut buf = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut saw_pong = false;
+        while tokio::time::Instant::now() < deadline && !saw_pong {
+            let mut chunk = [0u8; 2048];
+            match timeout(Duration::from_millis(100), stream.read(&mut chunk)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+            for (op, payload) in decode_server_frames(&buf) {
+                if op == 0x0A {
+                    assert_eq!(payload, ping_payload);
+                    saw_pong = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_pong, "expected pong echoing ping payload; buf={buf:02x?}");
+
+        let close = encode_client_frame(0x08, &[], [1, 2, 3, 4]);
+        let _ = stream.write_all(&close).await;
+
+        server.shutdown_handle().request_shutdown().await.unwrap();
+        timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

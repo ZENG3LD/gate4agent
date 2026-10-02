@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-c2"
-version = "0.2.37"
+version = "0.4.1"
 edition = "2021"
 description = "Relay daemon that aggregates gate4agent node state/events and routes commands down to attached nodes"
 publish = false

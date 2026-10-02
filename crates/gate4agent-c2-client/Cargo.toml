@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-c2-client"
-version = "0.2.37"
+version = "0.4.1"
 edition = "2021"
 description = "Typed client library and CLI (gate4agent-c2ctl) for the gate4agent C2 control and observer APIs"
 publish = false

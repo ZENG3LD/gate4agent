@@ -91,9 +91,14 @@ impl NetworkPermitProtocol {
 /// Honest, partial provider-native network mapping (node-local).
 ///
 /// Only measured / documented knobs appear here. Unknown JSON keys refuse at
-/// load (`deny_unknown_fields`). Claude / Kimi have no first-class network
-/// axis — omit rather than fake flags; resolve refuses when a required
-/// Codex-only mapping is asked of a non-Codex provider.
+/// load (`deny_unknown_fields`). Claude network is **settings-shaped**
+/// (`sandbox.network.allowedDomains` / `--settings`) — not a Codex-style
+/// bool argv; Kimi has **no** first-party network allowlist on the CLI.
+/// Omit invented `claude_*` / `kimi_*` fields rather than fake flags; resolve
+/// refuses when a required Codex-only mapping is asked of a non-Codex
+/// provider. Inventory:
+/// hatchery-websession-docs
+/// `research/claude-kimi-network-argv-vs-station-catalog-2026-10-02.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderNativeNetworkSketch {
@@ -666,25 +671,30 @@ mod tests {
 
     #[test]
     fn json_v2_refuses_unknown_provider_native_keys() {
-        let text = r#"
-        {
-          "schema_version": 2,
-          "entries": [{
-            "id": "egress-default",
-            "provider_native": { "claude_network": true }
-          }]
+        // Claude/Kimi have no Codex-style provider_native bool — invented
+        // keys must refuse at load (deny_unknown_fields), same honesty as
+        // UnsupportedNetworkAllowlistMapping at resolve for non-Codex.
+        for bad_key in ["claude_network", "kimi_network", "allowed_domains"] {
+            let text = format!(
+                r#"{{
+                  "schema_version": 2,
+                  "entries": [{{
+                    "id": "egress-default",
+                    "provider_native": {{ "{bad_key}": true }}
+                  }}]
+                }}"#
+            );
+            let error = parse_network_allowlist_catalog_text(&text).unwrap_err();
+            assert!(matches!(
+                error,
+                NetworkAllowlistCatalogError::InvalidCatalog(_)
+            ));
+            let message = error.to_string();
+            assert!(
+                message.contains(bad_key) || message.contains("unknown field"),
+                "key={bad_key} message={message}"
+            );
         }
-        "#;
-        let error = parse_network_allowlist_catalog_text(text).unwrap_err();
-        assert!(matches!(
-            error,
-            NetworkAllowlistCatalogError::InvalidCatalog(_)
-        ));
-        let message = error.to_string();
-        assert!(
-            message.contains("claude_network") || message.contains("unknown field"),
-            "message={message}"
-        );
     }
 
     #[test]

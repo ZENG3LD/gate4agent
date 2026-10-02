@@ -1,3 +1,14 @@
+//! Harness MCP door — local control envelope for session↔harness reads.
+//!
+//! The node owns this envelope (`HarnessMcpProxyRegistry`): reservations,
+//! owner-only local endpoint, token barrier, and opaque call relay. The
+//! reviewed helper (`gate4agent-harness-mcp` bin / `hatchery-harness-mcp`
+//! crate) may speak MCP/JSON-RPC on the **session's** stdio. Provider
+//! dialects (ACP JSON-RPC, pipe NDJSON, PTY) stay node-local adapters.
+//! C2 carries only our node envelopes — never provider RPC. Remote control
+//! path: C2 → node → (pty | acp | inline). See hatchery-websession-docs
+//! `plans/node-stdio-jsonrpc-entry-2026-10-02.md`.
+
 use crate::protocol::{
     HarnessMcpActivationDigest, HarnessMcpCallId, HarnessMcpLaunchV1, HarnessMcpLocalReplyV1,
     HarnessMcpLocalRequestV1, HarnessMcpLocalToken, HarnessMcpOpaquePayloadV1,

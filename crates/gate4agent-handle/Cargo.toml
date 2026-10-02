@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-handle"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 description = "Bounded dispatch, snapshot, and event port for gate4agent"
 license = "MIT"
@@ -9,10 +9,10 @@ license = "MIT"
 name = "gate4agent_handle"
 
 [dependencies]
-gate4agent-kernel = { path = "../gate4agent-kernel", version = "0.4.3" }
-gate4agent-tool-protocol = { path = "../gate4agent-tool-protocol", version = "0.4.3" }
-gate4agent-types = { path = "../gate4agent-types", version = "0.4.3" }
+gate4agent-kernel = { path = "../gate4agent-kernel", version = "0.4.4" }
+gate4agent-tool-protocol = { path = "../gate4agent-tool-protocol", version = "0.4.4" }
+gate4agent-types = { path = "../gate4agent-types", version = "0.4.4" }
 thiserror = "2"
 
 [dev-dependencies]
-gate4agent-catalog = { path = "../gate4agent-catalog", version = "0.4.3" }
+gate4agent-catalog = { path = "../gate4agent-catalog", version = "0.4.4" }

@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-engine"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 description = "Deterministic single-writer agent-session engine for gate4agent"
 license = "MIT"
@@ -9,4 +9,4 @@ license = "MIT"
 name = "gate4agent_engine"
 
 [dependencies]
-gate4agent-types = { path = "../gate4agent-types", version = "0.4.3" }
+gate4agent-types = { path = "../gate4agent-types", version = "0.4.4" }

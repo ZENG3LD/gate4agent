@@ -1,13 +1,13 @@
 [package]
 name = "gate4agent-shell-capabilities"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 description = "Native, bounded execution authority for gate4agent capability-probe plans"
 license = "MIT"
 
 [dependencies]
-gate4agent-catalog = { path = "../gate4agent-catalog", version = "0.4.3" }
-gate4agent-types = { path = "../gate4agent-types", version = "0.4.3" }
+gate4agent-catalog = { path = "../gate4agent-catalog", version = "0.4.4" }
+gate4agent-types = { path = "../gate4agent-types", version = "0.4.4" }
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "time"] }
 
 [dev-dependencies]

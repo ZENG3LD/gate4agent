@@ -249,11 +249,11 @@ dependencies = [
 
 [[package]]
 name = "g4a"
-version = "0.4.3"
+version = "0.4.4"
 
 [[package]]
 name = "gate4agent"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "chrono",
  "gate4agent-catalog",
@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-adapters"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-types",
  "serde_json",
@@ -281,11 +281,11 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-build-stamp"
-version = "0.4.3"
+version = "0.4.4"
 
 [[package]]
 name = "gate4agent-c2"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-c2-client",
  "gate4agent-c2-protocol",
@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-c2-client"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-c2-protocol",
  "gate4agent-node-protocol",
@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-c2-protocol"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-build-stamp",
  "gate4agent-node-protocol",
@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-catalog"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-adapters",
  "gate4agent-types",
@@ -342,14 +342,14 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-engine"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-types",
 ]
 
 [[package]]
 name = "gate4agent-handle"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-catalog",
  "gate4agent-kernel",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-kernel"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-catalog",
  "gate4agent-engine",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-node"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-adapters",
  "gate4agent-catalog",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-node-protocol"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-build-stamp",
  "gate4agent-types",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-node-wire"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-node-protocol",
  "gate4agent-types",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-provider-ports"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-adapters",
  "gate4agent-catalog",
@@ -431,11 +431,11 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-pty"
-version = "0.4.3"
+version = "0.4.4"
 
 [[package]]
 name = "gate4agent-runtime-native"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-adapters",
  "gate4agent-catalog",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-shell-capabilities"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-catalog",
  "gate4agent-types",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-shell-history"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-adapters",
  "gate4agent-catalog",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-shell-native"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent",
  "gate4agent-adapters",
@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-shell-one-shot"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent",
  "gate4agent-adapters",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-testkit"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-adapters",
  "gate4agent-types",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-tool-engine"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-tool-protocol",
  "gate4agent-types",
@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-tool-protocol"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gate4agent-types",
  "serde",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-types"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "serde",
  "serde_json",

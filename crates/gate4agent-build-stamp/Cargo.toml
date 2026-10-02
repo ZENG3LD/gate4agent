@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-build-stamp"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 description = "One content-hash build stamp for gate4agent binaries -- computed by git at build time from the working tree, carried by every wire handshake that used to carry a hand-typed protocol version number"
 license = "MIT"

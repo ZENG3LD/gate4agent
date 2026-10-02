@@ -151,7 +151,7 @@ pub const MAX_DELIVERY_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_DELIVERY_RELATIVE_PATH_BYTES: usize = 512;
 pub const MAX_DELIVERY_CHUNK_RAW_BYTES: usize = 48 * 1024;
 pub const MAX_HARNESS_MCP_REPLY_CHUNK_RAW_BYTES: usize = MAX_DELIVERY_CHUNK_RAW_BYTES;
-// Owned independently of `gate4agent-harness-api::HARNESS_READ_REQUEST_MAX_
+// Owned independently of `hatchery-harness-api::HARNESS_READ_REQUEST_MAX_
 // BYTES`/`HARNESS_READ_RESPONSE_MAX_BYTES` -- this crate must not depend on
 // the harness's crate at all (Nested Control Plane doctrine, Law 3; see this
 // crate's own CLAUDE.md `Forbidden:` line). The values are chosen to match
@@ -1900,8 +1900,8 @@ pub enum HarnessMcpContentTypeV1 {
 /// response`, `NodeEvent::HarnessMcpReadCall::request`): `body` is whatever
 /// bytes the originating endpoint encoded, and this crate never decodes it.
 /// Only `gate4agent-harness-mcp` (the reviewed local helper program spawned
-/// by the node, which holds `gate4agent-harness-api` types via `gate4agent-
-/// harness-client` directly) and `gate4agent-harness-service` (the harness
+/// by the node, which holds `hatchery-harness-api` types via `gate4agent-
+/// harness-client` directly) and `hatchery-harness-service` (the harness
 /// itself) know what `body` actually contains.
 ///
 /// This is the Nested Control Plane doctrine's Law 3 made mechanical
@@ -1909,7 +1909,7 @@ pub enum HarnessMcpContentTypeV1 {
 /// wrapped by `c2`) must never import a higher tier's (the harness's) crate.
 /// Before this type existed, `HarnessMcpLocalRequestV1`/`HarnessMcpLocalReplyV1`
 /// carried the harness's own `HarnessReadRequestV1`/`HarnessReadResponseV1`
-/// typed, which pulled `gate4agent-harness-api` into this crate's dependency
+/// typed, which pulled `hatchery-harness-api` into this crate's dependency
 /// graph and, through it, into every crate that re-exports this one --
 /// `node`, `node-wire`, `c2`, `c2-client`. A relay that
 /// cannot read what it relays is a relay done right.

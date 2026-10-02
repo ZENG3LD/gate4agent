@@ -287,7 +287,7 @@ const WORKSPACE_TREE_MAX_ENTRIES: usize = 512;
 /// chain, overridable via `GATE4AGENT_NODE_WORKSPACE_INSPECTION_BUDGET_MS`.
 const WORKSPACE_INSPECTION_TIME_BUDGET_MS_DEFAULT: u64 = 8_000;
 /// The harness relay enforces its own flat response deadline
-/// (`HOST_RUN_READ_RESPONSE_DEADLINE`, `gate4agent-harness-service::runtime`,
+/// (`HOST_RUN_READ_RESPONSE_DEADLINE`, `hatchery-harness-service::runtime`,
 /// 12s) above this node-side budget. The two constants live in different
 /// crates with no shared definition, so clamp any override here comfortably
 /// below that external ceiling — a misconfigured value above it would
@@ -10045,7 +10045,7 @@ impl NodeShared {
                 }) = undelivered.first() {
                     // `request.content_type` only, never a per-tool label --
                     // this crate does not decode `request.body` and does not
-                    // hold `gate4agent-harness-api` (Nested Control Plane
+                    // hold `hatchery-harness-api` (Nested Control Plane
                     // doctrine, Law 3; see this crate's dependency on
                     // `gate4agent-node-protocol`'s own `Forbidden:` line).
                     tracing::warn!(
@@ -10186,7 +10186,7 @@ impl NodeShared {
         // is exactly the counter the next drop-measurement pass needs: what
         // the node actually emitted (`source_sequence`, `kind`) versus what
         // a harness subscriber's own forwarder later logs having received
-        // (`gate4agent-harness-service::runtime`'s "forwarding agent stream
+        // (`hatchery-harness-service::runtime`'s "forwarding agent stream
         // event"), so a gap between the two logs names itself instead of
         // needing a new counter added ad hoc.
         tracing::debug!(
@@ -12004,7 +12004,7 @@ impl NodeShared {
 
 /// Coarse label for one `AgentStreamChunkKindV1`, used only by
 /// `NodeShared::publish_agent_stream_chunk`'s own debug log -- mirrors
-/// `gate4agent-harness-service`'s `agent_stream_event_kind_label` (same
+/// `hatchery-harness-service`'s `agent_stream_event_kind_label` (same
 /// "name what crossed this boundary" reasoning, one layer upstream of it).
 fn agent_stream_chunk_kind_label(kind: &AgentStreamChunkKindV1) -> &'static str {
     match kind {

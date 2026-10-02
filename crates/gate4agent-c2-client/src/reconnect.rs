@@ -98,7 +98,7 @@ pub enum C2LinkState {
 
 /// The C2 control token, retained for the reconnect supervisor's entire
 /// lifetime. Never `Clone`, never formatted with `{}` -- mirrors
-/// `HarnessOperatorCredential` (`gate4agent-harness-api/src/lib.rs`) and
+/// `HarnessOperatorCredential` (`hatchery-harness-api/src/lib.rs`) and
 /// `C2Client`'s own redacted `Debug` (`gate4agent-c2-client/src/lib.rs`).
 struct ReconnectToken(String);
 

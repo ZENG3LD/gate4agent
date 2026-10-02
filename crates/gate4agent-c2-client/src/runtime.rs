@@ -1657,7 +1657,7 @@ fn c2_node_event_is_agent_stream(event: &C2NodeEvent) -> bool {
 }
 
 /// Coarse label for a dropped/tearing-down `C2NodeEvent` -- used only by
-/// `control_owner`'s event-delivery warns, mirroring `gate4agent-harness-
+/// `control_owner`'s event-delivery warns, mirroring `hatchery-harness-
 /// service`'s own `agent_stream_event_kind_label` (same "name every drop"
 /// reasoning): a log line that fires once per backpressure episode still
 /// needs to say WHAT kind of event was in flight when it fired.

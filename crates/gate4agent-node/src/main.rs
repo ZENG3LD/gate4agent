@@ -1,7 +1,8 @@
 use gate4agent_node::{
     default_node_endpoint, default_state_path, ManagedWorktreeProfile, NodeServer,
     HistorySourceLayout, NativeHistoryConfig, NativeHistoryRoot, NodeServerConfig,
-    WorkspaceConfig, WorktreeServiceMode,
+    WorkspaceConfig, WorktreeServiceMode, NETWORK_ALLOWLIST_CATALOG_ENV,
+    resolve_network_allowlist_catalog,
 };
 use gate4agent_node::protocol::{
     ManagedWorktreeRetention, NodeId, SessionRecordRetentionConfig, WorktreeProfileId,
@@ -38,6 +39,7 @@ async fn main() {
     let mut managed_profiles = Vec::new();
     let mut history_roots = Vec::new();
     let mut harness_mcp_helper: Option<PathBuf> = None;
+    let mut network_allowlist_catalog: Option<PathBuf> = None;
     let mut session_record_retention = SessionRecordRetentionConfig::default();
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -150,12 +152,22 @@ async fn main() {
             // Retained as a compatibility no-op. History discovery is opt-in;
             // Gate4Agent never derives provider storage from the process home.
             "--no-default-history" => {}
+            // Station network allowlist catalog file (opaque ids, one per line).
+            // Empty/unset keeps the empty-default catalog (unknown ids refuse).
+            // Dig2browser dig2 probe remains stubbed — this flag is network ids only.
+            "--network-allowlist-catalog" => {
+                let value = PathBuf::from(required_value("--network-allowlist-catalog", args.next()));
+                if network_allowlist_catalog.replace(value).is_some() {
+                    fail("--network-allowlist-catalog may only be supplied once");
+                }
+            }
             "--help" | "-h" => {
-                println!("gate4agent-node --node-id ID --workspace ID=ABSOLUTE_PATH [--worktree-mode ID=manual|managed|off] [--managed-worktree-profile 'ID=PROFILE|REVISION|ABS_ROOT|BRANCH_PREFIX|BASE|RETENTION'] [--history-root 'ADAPTER|LAYOUT|ABS_ROOT'] [--harness-mcp-helper ABSOLUTE_REGULAR_FILE] [--endpoint ABSOLUTE_LOCAL_ENDPOINT] [--api-listen 127.0.0.1:PORT] [--c2-dial 127.0.0.1:PORT] [--session-record-retention-age-ms MILLISECONDS] [--session-record-retention-keep COUNT]");
+                println!("gate4agent-node --node-id ID --workspace ID=ABSOLUTE_PATH [--worktree-mode ID=manual|managed|off] [--managed-worktree-profile 'ID=PROFILE|REVISION|ABS_ROOT|BRANCH_PREFIX|BASE|RETENTION'] [--history-root 'ADAPTER|LAYOUT|ABS_ROOT'] [--harness-mcp-helper ABSOLUTE_REGULAR_FILE] [--network-allowlist-catalog ABSOLUTE_REGULAR_FILE] [--endpoint ABSOLUTE_LOCAL_ENDPOINT] [--api-listen 127.0.0.1:PORT] [--c2-dial 127.0.0.1:PORT] [--session-record-retention-age-ms MILLISECONDS] [--session-record-retention-keep COUNT]");
                 println!("RETENTION: remove-when-released or retain");
                 println!("--session-record-retention-age-ms/--session-record-retention-keep: retire dead Unavailable managed session records; both default to 0 (disabled)");
                 println!("LAYOUT: single-ndjson|single-json|json-or-ndjson|ndjson-with-optional-index|summary-json-with-sibling-ndjson|metadata-json-with-sibling-json|session-json-with-sibling-message-json|readonly-sqlite-projection|state-json-with-index-and-sibling-ndjson");
                 println!("control token: {NODE_TOKEN_ENV} environment variable");
+                println!("network allowlist catalog: --network-allowlist-catalog or {NETWORK_ALLOWLIST_CATALOG_ENV} (opaque ids, one per line; empty default)");
                 println!("--c2-dial: dial a relay's call-home listener instead of waiting to be dialled");
                 return;
             }
@@ -204,6 +216,13 @@ async fn main() {
         config
     };
     let config = config.with_session_record_retention(session_record_retention);
+    // Station network allowlist catalog: CLI path wins, else env path, else empty.
+    // Dig2browser dig2 probe stays stubbed. Never print GATE4AGENT_NODE_TOKEN.
+    let allowlist_catalog = resolve_network_allowlist_catalog(network_allowlist_catalog)
+        .unwrap_or_else(|error| fail(&error.to_string()));
+    let config = config
+        .with_network_allowlist_catalog(allowlist_catalog)
+        .unwrap_or_else(|error| fail(&error.to_string()));
     let server = NodeServer::new(config).unwrap_or_else(|error| fail(&error.to_string()));
     if let Err(error) = server.run_until_ctrl_signal().await {
         fail(&error.to_string());

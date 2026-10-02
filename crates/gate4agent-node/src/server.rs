@@ -1052,6 +1052,10 @@ pub struct NodeServerConfig {
     session_environment: Option<NodeSessionEnvironmentConfig>,
     history: Option<NativeHistoryConfig>,
     harness_mcp_helper: Option<ReviewedHarnessMcpProgram>,
+    /// Station network allowlist catalog (opaque ids). Empty default.
+    /// Loaded at startup from `--network-allowlist-catalog` / env
+    /// `GATE4AGENT_NODE_NETWORK_ALLOWLIST_CATALOG` file. Never secrets.
+    network_allowlist_catalog: BTreeSet<SpawnNetworkAllowlistId>,
     #[cfg(feature = "fixture")]
     fixture_raw_pty_runtime: bool,
 }
@@ -1132,6 +1136,7 @@ impl NodeServerConfig {
             session_environment: None,
             history: None,
             harness_mcp_helper: None,
+            network_allowlist_catalog: BTreeSet::new(),
             #[cfg(feature = "fixture")]
             fixture_raw_pty_runtime: false,
         })
@@ -1249,6 +1254,41 @@ impl NodeServerConfig {
         );
         Ok(self)
         }
+    }
+
+    /// Install an in-memory station network allowlist catalog (opaque ids).
+    /// Empty remains the default — unknown spawn ids refuse at resolve.
+    /// Never cookies / OAuth / proxy credentials.
+    pub fn with_network_allowlist_catalog(
+        mut self,
+        catalog: impl IntoIterator<Item = SpawnNetworkAllowlistId>,
+    ) -> Result<Self, NodeServerError> {
+        let mut set = BTreeSet::new();
+        for id in catalog {
+            if set.len() == crate::network_allowlist_catalog::MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES
+                && !set.contains(&id)
+            {
+                return Err(NodeServerError::NetworkAllowlistCatalogCapacity {
+                    max: crate::network_allowlist_catalog::MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES,
+                });
+            }
+            set.insert(id);
+        }
+        self.network_allowlist_catalog = set;
+        Ok(self)
+    }
+
+    /// Load station network allowlist catalog from an absolute regular file
+    /// (one opaque id per line; `#` comments / blanks skipped). Unset path
+    /// is not used here — callers that want env fallback use
+    /// `resolve_network_allowlist_catalog`.
+    pub fn with_network_allowlist_catalog_file(
+        self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, NodeServerError> {
+        let catalog = crate::network_allowlist_catalog::load_network_allowlist_catalog_file(path)
+            .map_err(NodeServerError::from)?;
+        self.with_network_allowlist_catalog(catalog)
     }
 }
 
@@ -2185,6 +2225,8 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         );
         shared.harness_mcp_registry = harness_mcp_registry.clone();
         shared.session_record_retention = config.session_record_retention;
+        shared.network_allowlist_catalog =
+            RwLock::new(config.network_allowlist_catalog.clone());
         shared.bundle_catalog = RwLock::new(delivered_catalog);
         shared.delivery_store = Mutex::new(delivery_store);
         shared.context_catalog = RwLock::new(durable_context_catalog);
@@ -2889,7 +2931,9 @@ struct NodeShared {
         RwLock<BTreeMap<SpawnEnvironmentProfileId, NodeSessionMaterializationProfile>>,
     /// Station **network** allowlist catalog (opaque policy ids only).
     /// Empty by default — any `network_allowlist` on spawn must be registered
-    /// here or resolve refuses with `UnknownNetworkAllowlist`. Plan
+    /// here or resolve refuses with `UnknownNetworkAllowlist`. Optional
+    /// startup load via `NodeServerConfig::with_network_allowlist_catalog(_file)`
+    /// / env `GATE4AGENT_NODE_NETWORK_ALLOWLIST_CATALOG`. Plan
     /// `station-network-and-browser-profile-knobs-2026-10-02.md` §2.1 / §4.
     /// Never holds cookies / OAuth / proxy credentials.
     network_allowlist_catalog: RwLock<BTreeSet<SpawnNetworkAllowlistId>>,
@@ -16592,6 +16636,14 @@ pub enum NodeServerError {
     InvalidStatePath(String),
     #[error("harness MCP helper must be an exact reviewed absolute regular file")]
     InvalidHarnessMcpHelper,
+    #[error("network allowlist catalog path must be an absolute regular file: {0}")]
+    InvalidNetworkAllowlistCatalogPath(String),
+    #[error("network allowlist catalog could not be read: {0}")]
+    NetworkAllowlistCatalogIo(#[source] std::io::Error),
+    #[error("network allowlist catalog line {line}: {message}")]
+    InvalidNetworkAllowlistCatalogEntry { line: usize, message: String },
+    #[error("network allowlist catalog exceeds the {max}-entry limit")]
+    NetworkAllowlistCatalogCapacity { max: usize },
     #[error("the local state directory is unavailable; supply an explicit state path")]
     LocalStateDirectoryUnavailable,
     #[error("the local runtime directory is unavailable; supply an explicit endpoint")]
@@ -16684,6 +16736,20 @@ pub enum NodeServerError {
     ShutdownDispatch(NodeFailure),
     #[error("node shutdown timed out with {active_native_sessions} physical sessions retained")]
     ShutdownTimedOut { active_native_sessions: usize },
+}
+
+impl From<crate::network_allowlist_catalog::NetworkAllowlistCatalogError> for NodeServerError {
+    fn from(error: crate::network_allowlist_catalog::NetworkAllowlistCatalogError) -> Self {
+        use crate::network_allowlist_catalog::NetworkAllowlistCatalogError as E;
+        match error {
+            E::InvalidPath(path) => Self::InvalidNetworkAllowlistCatalogPath(path),
+            E::Io(error) => Self::NetworkAllowlistCatalogIo(error),
+            E::InvalidEntry { line, message } => {
+                Self::InvalidNetworkAllowlistCatalogEntry { line, message }
+            }
+            E::Capacity { max } => Self::NetworkAllowlistCatalogCapacity { max },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -17208,6 +17274,63 @@ mod station_knobs_resolve_tests {
             .expect("env profile present");
         assert_eq!(bare.network_allowlist, None);
         assert_eq!(bare.browser_profile_id, None);
+    }
+
+    /// Startup file loader registers ids into the empty-default catalog.
+    /// Dig2browser dig2 probe remains stub. Never secrets on C2.
+    #[test]
+    fn network_allowlist_catalog_loads_from_temp_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "gate4agent-node-allowlist-config-{}-{unique}.txt",
+            std::process::id(),
+        ));
+        std::fs::write(
+            &path,
+            "# opaque station allowlist ids\negress-default\nlab-egress\n",
+        )
+        .unwrap();
+        let loaded = crate::network_allowlist_catalog::load_network_allowlist_catalog_file(&path)
+            .expect("temp catalog file must load");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.len(), 2);
+        let (shared, defaults) = station_knobs_fixture();
+        {
+            let mut catalog = shared
+                .network_allowlist_catalog
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *catalog = loaded;
+        }
+        let allowlist = crate::protocol::SpawnNetworkAllowlistId::new("egress-default").unwrap();
+        let spec = crate::protocol::SpawnSpec {
+            target: crate::protocol::SpawnTarget {
+                node_id: shared.node_id.clone(),
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: defaults.profile_id.clone(),
+            expected_profile_revision: defaults.revision.clone(),
+            overrides: crate::protocol::SpawnOverrides {
+                network_allowlist: Some(allowlist.clone()),
+                ..crate::protocol::SpawnOverrides::default()
+            },
+            deadline_ms: crate::protocol::SpawnDeadlineMs::new(30_000).unwrap(),
+            idempotency_key: crate::protocol::SpawnIdempotencyKey::new(
+                "station-knobs-catalog-file",
+            )
+            .unwrap(),
+            required_capabilities: crate::protocol::SpawnRequiredCapabilities::default(),
+        };
+        let resolved = spec.resolve(&defaults).unwrap();
+        let receipt = shared
+            .resolve_environment_profile(&resolved)
+            .expect("registered via file load")
+            .expect("env profile present");
+        assert_eq!(receipt.network_allowlist.as_ref(), Some(&allowlist));
     }
 }
 

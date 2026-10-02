@@ -28,11 +28,17 @@ mod workspace_file_windows;
 #[cfg(unix)]
 mod workspace_file_unix;
 
+mod network_allowlist_catalog;
 mod platform;
 mod provider_runtime;
 mod spawn_spec;
 mod server;
 
+pub use network_allowlist_catalog::{
+    load_network_allowlist_catalog_file, parse_network_allowlist_catalog_text,
+    resolve_network_allowlist_catalog, NetworkAllowlistCatalogError,
+    MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES, NETWORK_ALLOWLIST_CATALOG_ENV,
+};
 pub use server::{
     default_node_endpoint, default_state_path, NodeServer, NodeServerConfig, NodeServerError,
     NodeShutdownHandle, WorkspaceConfig,

@@ -93,12 +93,16 @@ impl NetworkPermitProtocol {
 /// Only measured / documented knobs appear here. Unknown JSON keys refuse at
 /// load (`deny_unknown_fields`). Claude network is **settings-shaped**
 /// (`sandbox.network.allowedDomains` / `--settings`) — not a Codex-style
-/// bool argv; Kimi has **no** first-party network allowlist on the CLI.
-/// Omit invented `claude_*` / `kimi_*` fields rather than fake flags; resolve
+/// bool argv; Kimi has **no** first-party network allowlist on the CLI;
+/// Grok child-network is **profile-shaped** (`--sandbox` /
+/// `restrict_network` in sandbox.toml), Linux-only, and does not block
+/// in-process web/API — not a `provider_native` bool. Omit invented
+/// `claude_*` / `kimi_*` / `grok_*` fields rather than fake flags; resolve
 /// refuses when a required Codex-only mapping is asked of a non-Codex
-/// provider. Inventory:
+/// provider. Inventories:
 /// hatchery-websession-docs
-/// `research/claude-kimi-network-argv-vs-station-catalog-2026-10-02.md`.
+/// `research/claude-kimi-network-argv-vs-station-catalog-2026-10-02.md`,
+/// `research/grok-linux-child-network-vs-station-catalog-2026-10-02.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderNativeNetworkSketch {
@@ -671,10 +675,18 @@ mod tests {
 
     #[test]
     fn json_v2_refuses_unknown_provider_native_keys() {
-        // Claude/Kimi have no Codex-style provider_native bool — invented
+        // Claude/Kimi/Grok have no Codex-style provider_native bool — invented
         // keys must refuse at load (deny_unknown_fields), same honesty as
         // UnsupportedNetworkAllowlistMapping at resolve for non-Codex.
-        for bad_key in ["claude_network", "kimi_network", "allowed_domains"] {
+        // Grok child-network is --sandbox / sandbox.toml shaped (Linux-only).
+        for bad_key in [
+            "claude_network",
+            "kimi_network",
+            "allowed_domains",
+            "grok_network",
+            "grok_linux_child_network",
+            "restrict_network",
+        ] {
             let text = format!(
                 r#"{{
                   "schema_version": 2,

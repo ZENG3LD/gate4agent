@@ -301,11 +301,13 @@ pub enum ApprovalLevelResolution {
 /// token choice, Codex `networkAccess` (catalog `provider_native` Moderate
 /// `-c` overlay), Claude Bash `sandbox.network.*` settings, Grok `--sandbox`
 /// profiles, or a dig2browser profile id — see hatchery-websession-docs
-/// `research/station-profile-and-os-sandbox-matrix-2026-10-02.md` and
-/// `research/claude-kimi-network-argv-vs-station-catalog-2026-10-02.md`
+/// `research/station-profile-and-os-sandbox-matrix-2026-10-02.md`,
+/// `research/claude-kimi-network-argv-vs-station-catalog-2026-10-02.md`,
+/// and `research/grok-linux-child-network-vs-station-catalog-2026-10-02.md`
 /// (Claude native Windows = no vendor Bash sandbox; Claude network is
 /// settings-shaped not ApprovalLevel; Kimi has no first-party OS-sandbox /
-/// network matrix; inventing Claude/Kimi `provider_native` keys is refused).
+/// network matrix; Grok child-network is profile/Linux-only — inventing
+/// Claude/Kimi/Grok `provider_native` network keys is refused).
 pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> ApprovalLevelResolution {
     use ApprovalLevelResolution::{Supported, Unsupported};
     match (agent_id.as_str(), level) {

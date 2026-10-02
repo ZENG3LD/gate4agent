@@ -1242,6 +1242,14 @@ impl NativeEffectShell {
                         mcp_servers.len(),
                     );
                 }
+                // Codex station network_access first slice: argv-only `-c`
+                // overlays arrive as instance_extra_args (same channel as
+                // catalog windows_wsl_setup). Merge after approval flags.
+                let mut approval_level_args =
+                    acp_approval_level_args(&agent_id, request.approval_level);
+                for argument in &instance_extra_args {
+                    approval_level_args.push(argument.to_string_lossy().into_owned());
+                }
                 let acp_options = AcpSessionOptions {
                     host_policy: host_policy_for_approval_level(request.approval_level),
                     // Empty for an agent that announced an `acp_mode_id` for
@@ -1256,11 +1264,9 @@ impl NativeEffectShell {
                     // every `g4a_*` MCP tool call at its OWN approval
                     // prompt without ever sending the host a
                     // `session/request_permission`. For that shape argv is
-                    // the only lever there is.
-                    approval_level_args: acp_approval_level_args(
-                        &agent_id,
-                        request.approval_level,
-                    ),
+                    // the only lever there is. Codex `-c` network overlays
+                    // may still append via `instance_extra_args` above.
+                    approval_level_args,
                     defer_permission_requests: defers_permission_requests(
                         &agent_id,
                         request.approval_level,
@@ -2242,6 +2248,19 @@ fn validate_spawn_runtime_policy(
     Ok(())
 }
 
+
+fn is_codex_config_c_overlay_args(arguments: &[OsString]) -> bool {
+    if arguments.is_empty() || arguments.len() % 2 != 0 {
+        return false;
+    }
+    arguments.chunks_exact(2).all(|pair| {
+        pair[0].as_os_str() == "-c"
+            && pair[1]
+                .to_str()
+                .is_some_and(|value| !value.is_empty() && value.contains('=') && !value.contains('\0'))
+    })
+}
+
 fn validate_instance_launch_arguments(
     agent_id: &AgentId,
     transport: TransportKind,
@@ -2250,8 +2269,14 @@ fn validate_instance_launch_arguments(
     if arguments.is_empty() {
         return Ok(());
     }
-    if transport != TransportKind::Pty {
-        return Err("native instance launch arguments require PTY transport".to_owned());
+    let acp_codex_c_overlay = transport == TransportKind::Acp
+        && agent_id.as_str() == "codex"
+        && is_codex_config_c_overlay_args(arguments);
+    if transport != TransportKind::Pty && !acp_codex_c_overlay {
+        return Err(
+            "native instance launch arguments require PTY transport (or Codex -c overlays on ACP)"
+                .to_owned(),
+        );
     }
     if arguments.len() > INSTANCE_LAUNCH_ARGS_MAX {
         return Err("native instance launch argument count exceeds its bound".to_owned());

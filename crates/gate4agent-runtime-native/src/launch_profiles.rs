@@ -286,8 +286,15 @@ impl NativeInstanceLaunchOverlay {
         environment: Vec<EnvMutation>,
         extra_args: Vec<OsString>,
     ) -> Result<Self, NativeLaunchProfileError> {
-        if transport != TransportKind::Pty {
-            return Err(NativeLaunchProfileError::InstanceOverlayUnsupportedTransport);
+        match transport {
+            TransportKind::Pty => {}
+            // Codex first-slice network_access: argv-only `-c` overlays may
+            // ride ACP the same channel as catalog `windows_wsl_setup_*`.
+            // Environment mutations on ACP stay refused.
+            TransportKind::Acp
+                if environment.is_empty()
+                    && is_codex_config_c_overlay_args(&agent_id, &extra_args) => {}
+            _ => return Err(NativeLaunchProfileError::InstanceOverlayUnsupportedTransport),
         }
         validate_environment_mutations(&environment)?;
         validate_launch_arguments(&agent_id, &extra_args)?;
@@ -366,6 +373,47 @@ impl NativeLaunchEnvironmentOverlay {
             extra_args: Vec::new(),
             profile_selection_required: self.profile_selection_required,
         }
+    }
+
+    /// Promote an environment overlay into an instance overlay that also
+    /// carries argv (Codex `-c` network_access first slice merge).
+    pub fn into_instance_with_extra_args(
+        self,
+        extra_args: Vec<OsString>,
+    ) -> Result<NativeInstanceLaunchOverlay, NativeLaunchProfileError> {
+        validate_launch_arguments(&self.agent_id, &extra_args)?;
+        if self.transport != TransportKind::Pty && !extra_args.is_empty() {
+            return Err(NativeLaunchProfileError::InstanceOverlayUnsupportedTransport);
+        }
+        Ok(NativeInstanceLaunchOverlay {
+            agent_id: self.agent_id,
+            transport: self.transport,
+            environment: self.environment,
+            extra_args,
+            profile_selection_required: self.profile_selection_required,
+        })
+    }
+}
+
+impl NativeInstanceLaunchOverlay {
+    /// Append validated argv (Codex `-c` network_access merge onto an
+    /// existing instance overlay).
+    pub fn append_extra_args(
+        &mut self,
+        extra_args: Vec<OsString>,
+    ) -> Result<(), NativeLaunchProfileError> {
+        if extra_args.is_empty() {
+            return Ok(());
+        }
+        if self.transport != TransportKind::Pty
+            && !is_codex_config_c_overlay_args(&self.agent_id, &extra_args)
+        {
+            return Err(NativeLaunchProfileError::InstanceOverlayUnsupportedTransport);
+        }
+        validate_launch_arguments(&self.agent_id, &extra_args)?;
+        self.extra_args.extend(extra_args);
+        validate_launch_arguments(&self.agent_id, &self.extra_args)?;
+        Ok(())
     }
 }
 
@@ -514,7 +562,7 @@ pub enum NativeLaunchProfileError {
     BindingMismatch,
     #[error("persistent one-shot sessions require exact agent 'codex' and Pipe transport")]
     OneShotSessionPersistenceBindingMismatch,
-    #[error("native instance launch overlay supports PTY transport only")]
+    #[error("native instance launch overlay supports PTY, or argv-only Codex -c overlays on ACP")]
     InstanceOverlayUnsupportedTransport,
     #[error("native MCP server launch overlay requires PTY or ACP transport and the exact provider binding; saw transport {transport:?}, overlay provider '{overlay_provider}', spawn provider '{spawn_provider}'")]
     McpServerOverlayBindingMismatch {
@@ -1058,6 +1106,22 @@ fn validate_instance_overlay_spawn_binding(
         return Err(NativeLaunchProfileError::EnvironmentOverlayBindingMismatch);
     }
     Ok(())
+}
+
+
+/// Codex config overlays are `-c` / `key=value` pairs (same channel as
+/// catalog `windows_wsl_setup_acknowledged=true` and station
+/// `sandbox_workspace_write.network_access`).
+fn is_codex_config_c_overlay_args(agent_id: &AgentId, arguments: &[OsString]) -> bool {
+    if agent_id.as_str() != "codex" || arguments.is_empty() || arguments.len() % 2 != 0 {
+        return false;
+    }
+    arguments.chunks_exact(2).all(|pair| {
+        pair[0].as_os_str() == "-c"
+            && pair[1]
+                .to_str()
+                .is_some_and(|value| !value.is_empty() && value.contains('=') && !value.contains('\0'))
+    })
 }
 
 fn validate_launch_arguments(

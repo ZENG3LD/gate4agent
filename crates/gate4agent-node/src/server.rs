@@ -3579,6 +3579,56 @@ impl NodeShared {
         .expect("granting hook semantics over a raw-PTY policy is internally valid")
     }
 
+    /// Codex first-slice network_access argv (`-c sandbox_workspace_write.network_access`).
+    ///
+    /// Empty when no allowlist / no provider-native mapping. Resolve already
+    /// refused ReadOnly / FullAuto / non-Codex; this only returns overlay argv.
+    fn resolve_codex_network_access_overlay_args(
+        &self,
+        provider: &AgentId,
+        mode: SessionMode,
+        approval_level: ApprovalLevel,
+        network_allowlist: Option<&crate::protocol::SpawnNetworkAllowlistId>,
+    ) -> Result<Vec<std::ffi::OsString>, NodeFailure> {
+        let Some(allowlist_id) = network_allowlist else {
+            return Ok(Vec::new());
+        };
+        let catalog = self
+            .network_allowlist_catalog
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(entry) = catalog.get(allowlist_id) else {
+            return Err(failure(
+                NodeFailureCode::UnknownNetworkAllowlist,
+                "spawn network allowlist is unavailable on this node",
+            ));
+        };
+        let Some(native) = entry.provider_native.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let overlay = crate::network_allowlist_catalog::resolve_provider_native_launch_overlay(
+            provider.as_str(),
+            approval_level,
+            native,
+        )
+        .map_err(|message| {
+            failure(
+                NodeFailureCode::UnsupportedNetworkAllowlistMapping,
+                &message,
+            )
+        })?;
+        if overlay.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !matches!(mode, SessionMode::Pty | SessionMode::Acp) {
+            return Err(failure(
+                NodeFailureCode::UnsupportedNetworkAllowlistMapping,
+                "Codex network_access -c overlay requires PTY or ACP transport",
+            ));
+        }
+        Ok(overlay.into_iter().map(std::ffi::OsString::from).collect())
+    }
+
     fn resolve_environment_profile(
         &self,
         resolved: &ResolvedSpawnSpec,
@@ -3604,6 +3654,7 @@ impl NodeShared {
             if let Some(native) = entry.provider_native.as_ref() {
                 if let Err(message) = crate::network_allowlist_catalog::provider_native_mapping_supported(
                     resolved.provider.as_str(),
+                    resolved.approval_level,
                     native,
                 ) {
                     return Err(failure(
@@ -5400,6 +5451,7 @@ impl NodeShared {
                 &required_capabilities,
                 harness_mcp,
                 resolved.approval_level,
+                resolved.network_allowlist.clone(),
             )
             .await
             .map(|(session, _runtime_policy)| {
@@ -5740,6 +5792,7 @@ impl NodeShared {
             &required_capabilities,
             None,
             resolved.approval_level,
+            resolved.network_allowlist.clone(),
         ).await;
         let (session, effective_runtime_policy) = match spawn {
             Ok(spawned) => spawned,
@@ -11467,6 +11520,7 @@ impl NodeShared {
                 // the one operator-wire path that can choose something other
                 // than the axis default.
                 ApprovalLevel::default(),
+                None,
             )
             .await
             .map(|(session, _runtime_policy)| session)
@@ -11489,6 +11543,7 @@ impl NodeShared {
         required_capabilities: &[ProviderRuntimeCapability],
         harness_mcp: Option<&PreparedHarnessMcpSpawn>,
         approval_level: ApprovalLevel,
+        network_allowlist: Option<crate::protocol::SpawnNetworkAllowlistId>,
     ) -> Result<(SessionAddress, ProviderRuntimePolicy), NodeFailure> {
         let reserved_lease = self.managed_worktrees.lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -11700,8 +11755,57 @@ impl NodeShared {
             mode,
             environment_profile.as_ref(),
         )?;
+        // Track B Codex first slice: merge `-c sandbox_workspace_write.network_access`
+        // into the instance launch overlay (PTY argv / ACP approval_level_args).
+        let network_overlay_args = self.resolve_codex_network_access_overlay_args(
+            &provider,
+            mode,
+            approval_level,
+            network_allowlist.as_ref(),
+        )?;
+        let environment_overlay = match (environment_overlay.flatten(), network_overlay_args) {
+            (prepared, args) if args.is_empty() => prepared,
+            (Some(PreparedNativeLaunchOverlay::Instance(mut overlay)), args) => {
+                overlay.append_extra_args(args).map_err(|_| {
+                    failure(
+                        NodeFailureCode::UnsupportedNetworkAllowlistMapping,
+                        "Codex network_access overlay could not merge with instance launch args",
+                    )
+                })?;
+                Some(PreparedNativeLaunchOverlay::Instance(overlay))
+            }
+            (Some(PreparedNativeLaunchOverlay::Environment(overlay)), args) => {
+                Some(PreparedNativeLaunchOverlay::Instance(
+                    overlay
+                        .into_instance_with_extra_args(args)
+                        .map_err(|_| {
+                            failure(
+                                NodeFailureCode::UnsupportedNetworkAllowlistMapping,
+                                "Codex network_access overlay could not merge with environment overlay",
+                            )
+                        })?,
+                ))
+            }
+            (None, args) => Some(PreparedNativeLaunchOverlay::Instance(
+                NativeInstanceLaunchOverlay::new(
+                    provider.clone(),
+                    match mode {
+                        SessionMode::Pty => TransportKind::Pty,
+                        SessionMode::Acp => TransportKind::Acp,
+                        SessionMode::Inline => TransportKind::Pipe,
+                    },
+                    Vec::new(),
+                    args,
+                )
+                .map_err(|_| {
+                    failure(
+                        NodeFailureCode::UnsupportedNetworkAllowlistMapping,
+                        "Codex network_access -c overlay is invalid for this transport",
+                    )
+                })?,
+            )),
+        };
         let mut instance_overlay = environment_overlay
-            .flatten()
             .map(|overlay| self.install_prepared_launch_overlay(instance_id, overlay))
             .transpose()?
             .flatten();
@@ -17500,7 +17604,7 @@ mod station_knobs_resolve_tests {
 
     /// Track B: registered id with provider_native codex_network_access refuses
     /// clearly for Claude (fixture provider). Unknown id still UnknownNetworkAllowlist.
-    /// Never secrets on C2. Codex argv apply is a later tip.
+    /// Never secrets on C2. Codex Moderate maps to `-c` overlay; RO/FullAuto refuse.
     #[test]
     fn resolve_environment_profile_refuses_unsupported_provider_native_mapping() {
         let (shared, defaults) = station_knobs_fixture();
@@ -17551,6 +17655,108 @@ mod station_knobs_resolve_tests {
             failure.code,
             NodeFailureCode::UnsupportedNetworkAllowlistMapping
         );
+    }
+
+    /// Codex Moderate + codex_network_access yields `-c` overlay argv.
+    /// ReadOnly / FullAuto refuse UnsupportedNetworkAllowlistMapping.
+    /// Never secrets on C2.
+    #[test]
+    fn resolve_codex_network_access_overlay_moderate_only() {
+        let (shared, defaults) = station_knobs_fixture();
+        let allowlist = crate::protocol::SpawnNetworkAllowlistId::new("egress-codex-net").unwrap();
+        let entry = crate::network_allowlist_catalog::NetworkAllowlistEntry {
+            id: allowlist.clone(),
+            permits: Vec::new(),
+            provider_native: Some(
+                crate::network_allowlist_catalog::ProviderNativeNetworkSketch {
+                    codex_network_access: Some(true),
+                },
+            ),
+        };
+        shared
+            .network_allowlist_catalog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(entry)
+            .unwrap();
+
+        let overlay = shared
+            .resolve_codex_network_access_overlay_args(
+                &agent("codex"),
+                SessionMode::Pty,
+                ApprovalLevel::Moderate,
+                Some(&allowlist),
+            )
+            .expect("Moderate Codex maps network_access");
+        assert_eq!(
+            overlay,
+            vec![
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("sandbox_workspace_write.network_access=true"),
+            ]
+        );
+
+        let acp = shared
+            .resolve_codex_network_access_overlay_args(
+                &agent("codex"),
+                SessionMode::Acp,
+                ApprovalLevel::Moderate,
+                Some(&allowlist),
+            )
+            .unwrap();
+        assert_eq!(acp, overlay);
+
+        let inline = shared
+            .resolve_codex_network_access_overlay_args(
+                &agent("codex"),
+                SessionMode::Inline,
+                ApprovalLevel::Moderate,
+                Some(&allowlist),
+            )
+            .unwrap_err();
+        assert_eq!(
+            inline.code,
+            NodeFailureCode::UnsupportedNetworkAllowlistMapping
+        );
+
+        for level in [ApprovalLevel::ReadOnly, ApprovalLevel::FullAuto] {
+            let spec = crate::protocol::SpawnSpec {
+                target: crate::protocol::SpawnTarget {
+                    node_id: shared.node_id.clone(),
+                    workspace_id: WorkspaceId::new("primary").unwrap(),
+                    worktree_id: None,
+                },
+                profile_id: defaults.profile_id.clone(),
+                expected_profile_revision: defaults.revision.clone(),
+                overrides: crate::protocol::SpawnOverrides {
+                    provider: crate::protocol::SpawnOverride::Set {
+                        value: agent("codex"),
+                    },
+                    approval_level: Some(level),
+                    network_allowlist: Some(allowlist.clone()),
+                    ..crate::protocol::SpawnOverrides::default()
+                },
+                deadline_ms: crate::protocol::SpawnDeadlineMs::new(30_000).unwrap(),
+                idempotency_key: crate::protocol::SpawnIdempotencyKey::new(format!(
+                    "codex-net-refuse-{}",
+                    match level {
+                        ApprovalLevel::ReadOnly => "ro",
+                        ApprovalLevel::FullAuto => "fa",
+                        _ => "other",
+                    }
+                ))
+                .unwrap(),
+                required_capabilities: crate::protocol::SpawnRequiredCapabilities::default(),
+            };
+            let resolved = spec.resolve(&defaults).unwrap();
+            let failure = shared
+                .resolve_environment_profile(&resolved)
+                .expect_err("RO/FullAuto must refuse");
+            assert_eq!(
+                failure.code,
+                NodeFailureCode::UnsupportedNetworkAllowlistMapping
+            );
+        }
     }
 
     /// Track B: JSON v2 catalog file loads permits; inventory still ids only.
@@ -17844,6 +18050,7 @@ mod workspace_environment_collision_tests {
                 &[],
                 None,
                 ApprovalLevel::default(),
+                None,
             )
             .await
             .unwrap_err();
@@ -20869,6 +21076,7 @@ mod tests {
                 &[],
                 None,
                 ApprovalLevel::default(),
+                None,
             )
             .await
             .unwrap_err();

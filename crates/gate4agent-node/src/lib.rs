@@ -38,7 +38,8 @@ mod server;
 
 pub use network_allowlist_catalog::{
     load_network_allowlist_catalog_file, parse_network_allowlist_catalog_text,
-    provider_native_mapping_supported, resolve_network_allowlist_catalog,
+    codex_network_access_config_overlay, provider_native_mapping_supported,
+    resolve_network_allowlist_catalog, resolve_provider_native_launch_overlay,
     NetworkAllowlistCatalog, NetworkAllowlistCatalogError, NetworkAllowlistEntry,
     NetworkPermitProtocol, NetworkPermitSketch, ProviderNativeNetworkSketch,
     MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES, MAX_NETWORK_PERMITS_PER_ENTRY,

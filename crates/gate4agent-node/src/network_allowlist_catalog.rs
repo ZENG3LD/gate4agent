@@ -13,10 +13,11 @@
 //!   non-blank content starts with `{`.
 //!
 //! Plan: `dig2browser-station-probe-and-network-permit-set-2026-10-02.md` §3.2.1.
-//! Dig2browser bind remains stubbed elsewhere; provider-native argv apply is
-//! a later tip (Codex `networkAccess` research first).
+//! Dig2browser bind remains stubbed elsewhere. Codex provider-native first
+//! slice: `-c sandbox_workspace_write.network_access` under Moderate only.
 
 use crate::protocol::SpawnNetworkAllowlistId;
+use gate4agent_types::ApprovalLevel;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -415,12 +416,17 @@ fn parse_network_allowlist_catalog_json(
     Ok(catalog)
 }
 
-/// Whether `provider_native` on a catalog entry can be honored for `provider`.
+
+/// Whether `provider_native` on a catalog entry can be honored for `provider`
+/// at the resolved [`ApprovalLevel`].
 ///
-/// Codex-only knobs refuse clearly for other providers (Claude / Kimi / …).
-/// Actual Codex argv apply remains a later tip — membership + honesty first.
+/// Codex first slice (research `codex-network-access-mapping-2026-10-02`):
+/// `codex_network_access` maps only under **Moderate** (workspace-write).
+/// ReadOnly / FullAuto / Unmanaged refuse clearly rather than silent ambient.
+/// Non-Codex providers refuse Codex-only knobs.
 pub fn provider_native_mapping_supported(
     provider: &str,
+    approval_level: ApprovalLevel,
     native: &ProviderNativeNetworkSketch,
 ) -> Result<(), String> {
     if native.is_empty() {
@@ -432,9 +438,56 @@ pub fn provider_native_mapping_supported(
                 "provider-native codex_network_access is unsupported for provider {provider:?}"
             ));
         }
-        return Ok(());
+        match approval_level {
+            ApprovalLevel::Moderate => Ok(()),
+            ApprovalLevel::ReadOnly => Err(
+                "provider-native codex_network_access requires Codex Moderate (workspace-write); ReadOnly has no workspace-write network axis"
+                    .to_owned(),
+            ),
+            ApprovalLevel::FullAuto => Err(
+                "provider-native codex_network_access is unsupported under Codex FullAuto (sandbox bypass); refuse clear mapping rather than silent no-op"
+                    .to_owned(),
+            ),
+            ApprovalLevel::Unmanaged => Err(
+                "provider-native codex_network_access requires Codex Moderate (workspace-write); Unmanaged has no sandbox contract"
+                    .to_owned(),
+            ),
+        }
+    } else {
+        Ok(())
     }
-    Ok(())
+}
+
+/// Codex `-c` overlay for legacy `sandbox_workspace_write.network_access`.
+///
+/// Same argv channel as catalog `windows_wsl_setup_acknowledged=true`.
+pub fn codex_network_access_config_overlay(enabled: bool) -> Vec<String> {
+    vec![
+        "-c".to_owned(),
+        format!(
+            "sandbox_workspace_write.network_access={}",
+            if enabled { "true" } else { "false" }
+        ),
+    ]
+}
+
+/// Resolve provider-native launch overlay argv for a catalog entry, or refuse.
+///
+/// Empty when `native` is empty / unset. Codex Moderate + `Some(flag)` yields
+/// [`codex_network_access_config_overlay`]. Other cases refuse via
+/// [`provider_native_mapping_supported`].
+pub fn resolve_provider_native_launch_overlay(
+    provider: &str,
+    approval_level: ApprovalLevel,
+    native: &ProviderNativeNetworkSketch,
+) -> Result<Vec<String>, String> {
+    provider_native_mapping_supported(provider, approval_level, native)?;
+    match native.codex_network_access {
+        Some(flag) if provider == "codex" && approval_level == ApprovalLevel::Moderate => {
+            Ok(codex_network_access_config_overlay(flag))
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
 #[cfg(test)]
@@ -661,13 +714,81 @@ mod tests {
         let native = ProviderNativeNetworkSketch {
             codex_network_access: Some(true),
         };
-        let err = provider_native_mapping_supported("claude", &native).unwrap_err();
+        let err = provider_native_mapping_supported(
+            "claude",
+            ApprovalLevel::Moderate,
+            &native,
+        )
+        .unwrap_err();
         assert!(err.contains("claude"));
-        assert!(provider_native_mapping_supported("codex", &native).is_ok());
+        assert!(provider_native_mapping_supported(
+            "codex",
+            ApprovalLevel::Moderate,
+            &native,
+        )
+        .is_ok());
         assert!(provider_native_mapping_supported(
             "claude",
+            ApprovalLevel::Moderate,
             &ProviderNativeNetworkSketch::default()
         )
         .is_ok());
+    }
+
+    #[test]
+    fn provider_native_mapping_refuses_codex_readonly_and_full_auto() {
+        let native = ProviderNativeNetworkSketch {
+            codex_network_access: Some(true),
+        };
+        let ro = provider_native_mapping_supported(
+            "codex",
+            ApprovalLevel::ReadOnly,
+            &native,
+        )
+        .unwrap_err();
+        assert!(ro.contains("ReadOnly") || ro.contains("workspace-write"));
+        let fa = provider_native_mapping_supported(
+            "codex",
+            ApprovalLevel::FullAuto,
+            &native,
+        )
+        .unwrap_err();
+        assert!(fa.contains("FullAuto"));
+        let un = provider_native_mapping_supported(
+            "codex",
+            ApprovalLevel::Unmanaged,
+            &native,
+        )
+        .unwrap_err();
+        assert!(un.contains("Unmanaged") || un.contains("workspace-write"));
+    }
+
+    #[test]
+    fn codex_network_access_overlay_uses_legacy_c_channel() {
+        assert_eq!(
+            codex_network_access_config_overlay(true),
+            ["-c", "sandbox_workspace_write.network_access=true"]
+        );
+        assert_eq!(
+            codex_network_access_config_overlay(false),
+            ["-c", "sandbox_workspace_write.network_access=false"]
+        );
+        let overlay = resolve_provider_native_launch_overlay(
+            "codex",
+            ApprovalLevel::Moderate,
+            &ProviderNativeNetworkSketch {
+                codex_network_access: Some(true),
+            },
+        )
+        .unwrap();
+        assert_eq!(overlay, codex_network_access_config_overlay(true));
+        assert!(resolve_provider_native_launch_overlay(
+            "codex",
+            ApprovalLevel::FullAuto,
+            &ProviderNativeNetworkSketch {
+                codex_network_access: Some(false),
+            },
+        )
+        .is_err());
     }
 }

@@ -185,13 +185,16 @@ fn capabilities(id: &str) -> AgentCapabilities {
     AgentCapabilities {
         agent_commands: matches!(id, "claude" | "codex").then_some(AgentCommandMode::SlashLine),
         transports: AgentTransportCapabilities {
-            pty: true,
+            // Grok is ACP-native (`grok agent stdio`); catalog forbids
+            // TransportKind::Pty as a control driver. PTY remains an
+            // operator attach/replay concern outside this flag — see
+            // hatchery research agent-harness-isolation-and-vendor-cli-recon-2026-10-02.
+            pty: id != "grok",
             pty_adapter: transport_adapter_id
                 .and_then(|adapter| binding(AdapterFamily::PtySemantic, adapter)),
             pipe,
-            // The legacy Claude/Codex ACP adapters use npm packages that may
-            // be downloaded at launch. They are deliberately not enabled by
-            // the catalog-backed control plane.
+            // Claude/Codex ACP use npm adapter packages; Grok/Kimi are native.
+            // Catalog admits ACP for all four fleet providers.
             acp: transport_adapter_id
                 .and_then(|adapter| binding(AdapterFamily::Acp, adapter))
                 .map(|adapter| AcpTransportSpec {
@@ -350,22 +353,13 @@ mod tests {
                 "missing ACP transport for {id}"
             );
         }
-        // Grok gets an ACP transport, but no PTY or pipe transport was
-        // requested — it must stay conspicuously absent, not silently wired.
-        assert!(registry
-            .get_by_id("grok")
-            .unwrap()
-            .capabilities
-            .transports
-            .pty_adapter
-            .is_none());
-        assert!(registry
-            .get_by_id("grok")
-            .unwrap()
-            .capabilities
-            .transports
-            .pipe
-            .is_none());
+        // Grok is ACP-native: no raw PTY driver flag, no PTY semantic /
+        // pipe adapters. PTY attach/replay is outside this catalog surface.
+        let grok_t = &registry.get_by_id("grok").unwrap().capabilities.transports;
+        assert!(!grok_t.pty, "grok must not advertise TransportKind::Pty");
+        assert!(grok_t.pty_adapter.is_none());
+        assert!(grok_t.pipe.is_none());
+        assert!(grok_t.acp.is_some());
 
         for id in ["claude", "codex", "grok", "kimi"] {
             let adapters = &registry.get_by_id(id).unwrap().capabilities.adapters;

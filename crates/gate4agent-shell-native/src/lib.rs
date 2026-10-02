@@ -2047,23 +2047,18 @@ const ACP_MODE_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// and apply for `agent_id` at `level`, or the exact refusal message when no
 /// mechanism exists to enforce it at all.
 ///
-/// `Ok(Some(id))` is the only outcome that lets a non-[`ApprovalLevel::
-/// Unmanaged`] spawn proceed: `gate4agent_catalog::approval_level_
-/// resolution`'s own `acp_mode_id` column named a real, catalog-sourced
-/// vendor mode id. `Ok(None)` is returned ONLY for `Unmanaged`, whose own
-/// row is `Supported` with `acp_mode_id: None` by design -- it imposes
-/// nothing, so there is nothing to apply. Every other case is `Err`:
-/// [`ApprovalLevelResolution::Unsupported`] (no verified vendor mode exists
-/// at all for this level) and a `Supported` row this catalog has no sourced
-/// ACP mode id for yet (today, every level on `codex`/`grok`/`kimi` except
-/// `Unmanaged` -- see `approval_level_resolution`'s own doc comment for why)
-/// are refused identically: ACP now applies a level exclusively through
-/// `session/set_mode`, with no argv fallback left to fall through to (see
-/// `applicable_approval_args`, `src/acp/spawn.rs`), so "no known mode id"
-/// and "no verified mode at all" are the same defect from this transport's
-/// point of view -- letting either through would spawn the vendor's own
-/// default instead, measured live as `mode:Mode="auto"`, which approves
-/// itself.
+/// Outcomes:
+/// - `Ok(Some(id))` — catalog named a sourced `acp_mode_id`; spawn applies it
+///   via `session/set_mode` (claude/codex managed levels today).
+/// - `Ok(None)` for [`ApprovalLevel::Unmanaged`] — imposes nothing.
+/// - `Ok(None)` when the level is `Supported` with `acp_mode_id: None` **and**
+///   non-empty vendor `args` — argv is the only lever left (grok FullAuto /
+///   Moderate; kimi FullAuto). `acp_approval_level_args` carries those flags
+///   into the process ahead of the ACP subcommand.
+/// - `Err` for [`ApprovalLevelResolution::Unsupported`] (e.g. grok ReadOnly)
+///   or a `Supported` row with neither mode id nor flags (kimi Moderate /
+///   ReadOnly today): refuse rather than launch at the vendor default
+///   (`mode:Mode="auto"`), which approves itself.
 fn required_acp_mode(agent_id: &AgentId, level: ApprovalLevel) -> Result<Option<ModeId>, String> {
     let (acp_mode_id, carries_argv_flags) = match approval_level_resolution(agent_id, level) {
         ApprovalLevelResolution::Unsupported => (None, false),
@@ -6849,19 +6844,17 @@ mod tests {
             "Unmanaged imposes nothing, so it must add no argv flags either"
         );
 
-        // grok: `acp_mode_id` is `None` for every managed level (`FullAuto`
-        // and `Moderate` are `Supported` with no sourced ACP id yet,
-        // `ReadOnly` is outright `Unsupported`) -- every one must refuse
-        // rather than spawn unconfigured.
-        // Same split as kimi: `FullAuto` carries real flags
-        // (`--permission-mode bypassPermissions`) and so is applied through
-        // argv; `Moderate` carries none and refuses; `ReadOnly` is outright
-        // `Unsupported` and refuses for that reason.
+        // grok: `acp_mode_id` is `None` for every managed level (no live
+        // mode catalogue sourced yet — slice-1 skipped grok). `FullAuto` and
+        // `Moderate` are `Supported` with argv flags, so they resolve
+        // `Ok(None)` and apply through argv; `ReadOnly` is outright
+        // `Unsupported` and refuses. Flag spellings for FullAuto remain
+        // UNCONFIRMED against Grok Build's own CLI surface (catalog docs).
         let grok = AgentId::new("grok").unwrap();
         assert_eq!(required_acp_mode(&grok, ApprovalLevel::FullAuto), Ok(None));
         assert_eq!(
             acp_approval_level_args(&grok, ApprovalLevel::FullAuto),
-            vec!["--permission-mode".to_owned(), "bypassPermissions".to_owned()],
+            vec!["--always-approve".to_owned()],
         );
         assert_eq!(required_acp_mode(&grok, ApprovalLevel::Moderate), Ok(None));
         assert_eq!(

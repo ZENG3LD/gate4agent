@@ -25,8 +25,15 @@ use gate4agent_types::LaunchSpec;
 pub(crate) struct AcpSpawnSpec {
     /// Base program name (e.g. `"grok"`, `"npx"`).
     pub program: &'static str,
-    /// Arguments passed after the program (e.g. `["--experimental-acp"]`).
-    pub args: &'static [&'static str],
+    /// Args before approval flags. For Grok Build agent mode this is `["agent"]`
+    /// so vendor options land between `agent` and the transport name
+    /// (`grok agent --always-approve stdio` — confirmed 2026-10-02 against
+    /// xAI agent-mode user guide). For kimi / npm adapters this is empty and
+    /// approval flags precede [`Self::suffix_args`].
+    pub prefix_args: &'static [&'static str],
+    /// Args after approval flags (e.g. `["stdio"]` for grok, `["acp"]` for
+    /// kimi, or the full `npx -y @…` package list for Claude/Codex).
+    pub suffix_args: &'static [&'static str],
     /// Whether this is an npm-installed tool that needs `cmd /C` wrapping on Windows.
     pub npm_tool: bool,
 }
@@ -61,22 +68,29 @@ pub(crate) fn acp_command(tool: CliTool) -> Result<AcpSpawnSpec, std::io::Error>
         // resolution.
         CliTool::ClaudeCode => AcpSpawnSpec {
             program: "npx",
-            args: &["-y", "@agentclientprotocol/claude-agent-acp@0.74.0"],
+            prefix_args: &[],
+            suffix_args: &["-y", "@agentclientprotocol/claude-agent-acp@0.74.0"],
             npm_tool: true,
         },
         CliTool::Codex => AcpSpawnSpec {
             program: "npx",
-            args: &["-y", "@agentclientprotocol/codex-acp@1.10.0"],
+            prefix_args: &[],
+            suffix_args: &["-y", "@agentclientprotocol/codex-acp@1.10.0"],
             npm_tool: true,
         },
+        // Confirmed 2026-10-02 (xAI agent-mode user guide): agent options go
+        // AFTER `agent` and BEFORE the transport name. Wrong order
+        // (`grok --always-approve agent stdio`) does not apply agent options.
         CliTool::Grok => AcpSpawnSpec {
             program: "grok",
-            args: &["agent", "stdio"],
+            prefix_args: &["agent"],
+            suffix_args: &["stdio"],
             npm_tool: false,
         },
         CliTool::KimiCode => AcpSpawnSpec {
             program: "kimi",
-            args: &["acp"],
+            prefix_args: &[],
+            suffix_args: &["acp"],
             npm_tool: false,
         },
     };
@@ -167,12 +181,14 @@ impl AcpProcess {
     /// npm-installed tools), sets `stdin`/`stdout` to piped, and starts a
     /// background reader thread on stdout.
     ///
-    /// `approval_args` is accepted for signature compatibility with
-    /// callers that still resolve `gate4agent_catalog::approval_level_args`
-    /// for other purposes, but `applicable_approval_args` now discards it
-    /// unconditionally: ACP applies an approval level exclusively through
-    /// `session/set_mode`, never argv (see `applicable_approval_args`'s own
-    /// doc comment).
+    /// `approval_args` is the caller-decided approval flag slice. This
+    /// method passes it through `applicable_approval_args` unchanged: the
+    /// decision of *whether* a level may use argv lives in
+    /// `gate4agent-shell-native`'s `acp_approval_level_args` (flags only when
+    /// `approval_level_resolution` named no `acp_mode_id`). Providers that
+    /// announce ACP modes (claude/codex) get an empty slice and use
+    /// `session/set_mode`; providers that announce none (grok/kimi today)
+    /// get the catalog flags ahead of the ACP subcommand.
     pub(crate) fn spawn(
         tool: CliTool,
         working_dir: &std::path::Path,
@@ -372,9 +388,8 @@ impl AcpProcess {
 /// found`, exit 127). There is no POSIX shell in the loop on Windows for
 /// this project's tools any more, full stop.
 ///
-/// `extra_args` are appended after `spec.args` -- callers are expected to
-/// have already applied `applicable_approval_args` (an empty slice is a
-/// no-op here either way).
+/// `extra_args` land between `prefix_args` and `suffix_args` (see
+/// `direct_command`). Callers apply `applicable_approval_args` first.
 fn build_command(spec: &AcpSpawnSpec, extra_args: &[String]) -> Command {
     if cfg!(windows) {
         build_command_windows(spec, extra_args)
@@ -384,15 +399,20 @@ fn build_command(spec: &AcpSpawnSpec, extra_args: &[String]) -> Command {
 }
 
 fn build_command_unix(spec: &AcpSpawnSpec, extra_args: &[String]) -> Command {
-    direct_command(spec.program, spec.args, extra_args)
+    direct_command(spec.program, spec.prefix_args, spec.suffix_args, extra_args)
 }
 
 fn build_command_windows(spec: &AcpSpawnSpec, extra_args: &[String]) -> Command {
     // npm-installed tools always have a `.cmd` wrapper on Windows.
     if spec.npm_tool {
-        windows_cmd_wrapper(&format!("{}.cmd", spec.program), spec.args, extra_args)
+        windows_cmd_wrapper(
+            &format!("{}.cmd", spec.program),
+            spec.prefix_args,
+            spec.suffix_args,
+            extra_args,
+        )
     } else {
-        direct_command(spec.program, spec.args, extra_args)
+        direct_command(spec.program, spec.prefix_args, spec.suffix_args, extra_args)
     }
 }
 
@@ -400,21 +420,29 @@ fn build_command_windows(spec: &AcpSpawnSpec, extra_args: &[String]) -> Command 
 /// entries -- no shell, no `.cmd` detection, no wrapping. See
 /// [`build_command`]'s doc comment for why this is correct on every
 /// platform for every non-npm tool.
-fn direct_command(program: &str, args: &[&str], extra_args: &[String]) -> Command {
+fn direct_command(
+    program: &str,
+    prefix_args: &[&str],
+    suffix_args: &[&str],
+    extra_args: &[String],
+) -> Command {
     let mut cmd = Command::new(program);
     crate::utils::hide_console_window(&mut cmd);
-    // `extra_args` (the approval flags) go BEFORE `args`, because `args` ends
-    // in the vendor's ACP SUBCOMMAND and both directly-spawned CLIs take
-    // their options ahead of it, not after: `kimi [options] [command]` and
-    // `grok [OPTIONS] [PROMPT] [COMMAND]` (measured 2026-09-09 from their own
-    // `--help`). Appending instead produced `kimi acp --yolo`, which `kimi
-    // acp` -- whose only options are `--login` and `--help` -- does not
-    // accept, and the session then died on `Handshake timed out
-    // (step=initialize)`. `kimi --yolo acp` is accepted.
+    // Order is prefix → approval flags → suffix:
+    // - kimi: `[]` + `--auto` + `["acp"]` → `kimi --auto acp` (kimi's
+    //   top-level options precede the ACP subcommand; measured 2026-09-09).
+    // - grok: `["agent"]` + `--always-approve` + `["stdio"]` →
+    //   `grok agent --always-approve stdio` (agent options sit between
+    //   `agent` and the transport name; confirmed 2026-10-02 against xAI
+    //   agent-mode user guide). Prefixing flags before `agent` does not
+    //   apply them as agent options.
+    for arg in prefix_args {
+        cmd.arg(arg);
+    }
     for arg in extra_args {
         cmd.arg(arg);
     }
-    for arg in args {
+    for arg in suffix_args {
         cmd.arg(arg);
     }
     cmd
@@ -422,11 +450,22 @@ fn direct_command(program: &str, args: &[&str], extra_args: &[String]) -> Comman
 
 /// `cmd /C <cmd_name> <args...> <extra_args...>` -- each argument is its own
 /// `Command::arg`, so no shell-quoting is needed here.
-fn windows_cmd_wrapper(cmd_name: &str, args: &[&str], extra_args: &[String]) -> Command {
+fn windows_cmd_wrapper(
+    cmd_name: &str,
+    prefix_args: &[&str],
+    suffix_args: &[&str],
+    extra_args: &[String],
+) -> Command {
     let mut cmd = Command::new("cmd");
     crate::utils::hide_console_window(&mut cmd);
     cmd.arg("/C").arg(cmd_name);
-    for arg in args {
+    // npm wrappers keep package args contiguous; approval flags (normally
+    // empty for Claude/Codex ACP) trail. Prefix/suffix split matches
+    // `direct_command` so a future non-empty prefix stays consistent.
+    for arg in prefix_args {
+        cmd.arg(arg);
+    }
+    for arg in suffix_args {
         cmd.arg(arg);
     }
     for arg in extra_args {
@@ -491,7 +530,7 @@ mod tests {
         let spec = acp_command(CliTool::ClaudeCode).unwrap();
         assert_eq!(spec.program, "npx");
         assert!(spec.npm_tool);
-        assert!(spec.args.contains(&"@agentclientprotocol/claude-agent-acp@0.74.0"));
+        assert!(spec.suffix_args.contains(&"@agentclientprotocol/claude-agent-acp@0.74.0"));
     }
 
     #[test]
@@ -499,14 +538,15 @@ mod tests {
         let spec = acp_command(CliTool::Codex).unwrap();
         assert_eq!(spec.program, "npx");
         assert!(spec.npm_tool);
-        assert!(spec.args.contains(&"@agentclientprotocol/codex-acp@1.10.0"));
+        assert!(spec.suffix_args.contains(&"@agentclientprotocol/codex-acp@1.10.0"));
     }
 
     #[test]
     fn acp_command_grok() {
         let spec = acp_command(CliTool::Grok).unwrap();
         assert_eq!(spec.program, "grok");
-        assert_eq!(spec.args, &["agent", "stdio"]);
+        assert_eq!(spec.prefix_args, &["agent"]);
+        assert_eq!(spec.suffix_args, &["stdio"]);
         assert!(!spec.npm_tool);
     }
 
@@ -514,7 +554,8 @@ mod tests {
     fn acp_command_kimi_is_native() {
         let spec = acp_command(CliTool::KimiCode).unwrap();
         assert_eq!(spec.program, "kimi");
-        assert_eq!(spec.args, &["acp"]);
+        assert!(spec.prefix_args.is_empty());
+        assert_eq!(spec.suffix_args, &["acp"]);
         assert!(!spec.npm_tool);
     }
 
@@ -539,8 +580,14 @@ mod tests {
                 "{tool}: a direct-binary spec must receive the flag the caller handed it"
             );
             let argv = command_args(&build_command_unix(&spec, &args));
-            assert_eq!(&argv[..2], ["--some-flag", "value"], "{tool}: flags come first");
-            assert_eq!(&argv[2..], spec.args, "{tool}: the subcommand follows them");
+            let expected: Vec<&str> = spec
+                .prefix_args
+                .iter()
+                .copied()
+                .chain(["--some-flag", "value"])
+                .chain(spec.suffix_args.iter().copied())
+                .collect();
+            assert_eq!(argv, expected, "{tool}: prefix → flags → suffix");
         }
     }
 
@@ -608,27 +655,24 @@ mod tests {
         cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
     }
 
-    /// Approval flags precede the spec's args, because those args END in the
-    /// vendor's ACP subcommand and both directly-spawned CLIs take options
-    /// ahead of it: `grok [OPTIONS] [PROMPT] [COMMAND]`, `kimi [options]
-    /// [command]` (their own `--help`, measured 2026-09-09). The appended
-    /// order this test used to pin produced `kimi acp --yolo`, which `kimi
-    /// acp` rejects -- its only options are `--login`/`--help` -- and the
-    /// session died on `Handshake timed out (step=initialize)`.
+    /// Grok agent options sit between `agent` and `stdio`; kimi top-level
+    /// options still precede `acp`. Confirmed 2026-10-02 (xAI agent-mode
+    /// guide) and 2026-09-09 (kimi --help / live handshake).
     #[test]
-    fn build_command_unix_puts_extra_args_before_the_spec_subcommand() {
+    fn build_command_unix_puts_extra_args_between_agent_and_stdio_for_grok() {
         let spec = acp_command(CliTool::Grok).unwrap();
-        let extra = vec!["--permission-mode".to_owned(), "bypassPermissions".to_owned()];
+        let extra = vec!["--always-approve".to_owned()];
         let cmd = build_command_unix(&spec, &extra);
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("grok"));
         assert_eq!(
             command_args(&cmd),
-            ["--permission-mode", "bypassPermissions", "agent", "stdio"]
+            ["agent", "--always-approve", "stdio"],
+            "xAI agent-mode: options between `agent` and transport name"
         );
 
         let kimi = acp_command(CliTool::KimiCode).unwrap();
-        let yolo = vec!["--yolo".to_owned()];
-        assert_eq!(command_args(&build_command_unix(&kimi, &yolo)), ["--yolo", "acp"]);
+        let yolo = vec!["--auto".to_owned()];
+        assert_eq!(command_args(&build_command_unix(&kimi, &yolo)), ["--auto", "acp"]);
     }
 
     #[test]
@@ -641,7 +685,7 @@ mod tests {
     #[test]
     fn windows_cmd_wrapper_appends_extra_args_after_spec_args() {
         let extra = vec!["--yolo".to_owned()];
-        let cmd = windows_cmd_wrapper("kimi.cmd", &["acp"], &extra);
+        let cmd = windows_cmd_wrapper("kimi.cmd", &[], &["acp"], &extra);
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("cmd"));
         assert_eq!(command_args(&cmd), ["/C", "kimi.cmd", "acp", "--yolo"]);
     }
@@ -650,6 +694,7 @@ mod tests {
     fn windows_cmd_wrapper_for_an_npm_tool_ignores_an_empty_extra_args() {
         let cmd = windows_cmd_wrapper(
             "npx.cmd",
+            &[],
             &["-y", "@agentclientprotocol/claude-agent-acp@0.74.0"],
             &[],
         );
@@ -693,14 +738,14 @@ mod tests {
     }
 
     #[test]
-    fn build_command_windows_puts_extra_args_before_the_subcommand_for_a_direct_tool() {
+    fn build_command_windows_puts_extra_args_between_agent_and_stdio_for_grok() {
         let spec = acp_command(CliTool::Grok).unwrap();
-        let extra = vec!["--permission-mode".to_owned(), "bypassPermissions".to_owned()];
+        let extra = vec!["--always-approve".to_owned()];
         let cmd = build_command_windows(&spec, &extra);
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("grok"));
         assert_eq!(
             command_args(&cmd),
-            ["--permission-mode", "bypassPermissions", "agent", "stdio"]
+            ["agent", "--always-approve", "stdio"]
         );
     }
 

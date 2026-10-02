@@ -256,17 +256,16 @@ pub enum ApprovalLevelResolution {
 ///
 /// - `claude` and `codex` have a verified flag and verified `asks_for_permission`
 ///   for all three non-`Unmanaged` levels.
-/// - `grok` (xAI Grok Build) has three documented modes -- Ask (default,
-///   prompts for anything not pre-allowed), Auto (classifier auto-approves
-///   safer tools, dangerous ones still prompt), Always-approve (skips
-///   prompts; deny rules and hooks still apply) -- but no documented
-///   read-only mode. `FullAuto`'s flag string is inherited, UNCONFIRMED
-///   against Grok Build's own CLI surface (its *mode semantics* --
-///   "skips prompts" -- are confirmed from the vendor user guide, only the
-///   exact flag spelling is not); `Moderate` has no confirmed flag for
-///   "Auto" and falls back to the vendor's own interactive default rather
-///   than inventing one; `ReadOnly` is `Unsupported` -- refused, not
-///   silently downgraded to "Ask".
+/// - `grok` (xAI Grok Build) has Ask (default), Auto, and Always-approve
+///   modes, but no documented read-only mode. Confirmed 2026-10-02 against
+///   xAI agent-mode + permissions user guides: `FullAuto` uses
+///   `--always-approve` (alias `--yolo`; Claude-compat
+///   `--permission-mode bypassPermissions` is also accepted) as an *agent*
+///   option between `agent` and `stdio`; `Moderate` uses
+///   `--permission-mode auto`; `ReadOnly` is `Unsupported` -- refused, not
+///   silently downgraded to Ask. ACP `_meta.yoloMode` / `autoMode` on
+///   `session/new` are documented peer levers (not yet wired into
+///   `AcpSessionOptions`).
 /// - `kimi` (Kimi Code) confirms `--yolo` as a real flag (from its own
 ///   release notes: rejected only when combined with `--prompt`, i.e. it is
 ///   otherwise accepted); its "skip everything" semantics are inferred from
@@ -389,35 +388,27 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
         // grok (xAI Grok Build) -- see this function's own doc comment for
         // the three documented modes and per-row confidence.
         ("grok", ApprovalLevel::FullAuto) => Supported {
-            args: vec!["--permission-mode".to_owned(), "bypassPermissions".to_owned()],
-            // Mapped to vendor-documented "Always-approve": "skips prompts;
-            // explicit deny rules and PreToolUse hooks still apply." Mode
-            // semantics confirmed; this exact flag spelling is not --
-            // UNCONFIRMED, needs live confirmation.
+            // Confirmed 2026-10-02 (xAI agent-mode + permissions guides):
+            // `grok agent --always-approve stdio` (alias `--yolo`). Claude-
+            // compatible `--permission-mode bypassPermissions` is accepted
+            // as the same mode, but `--always-approve` is the product name
+            // the agent-mode examples use. Spawn inserts these between
+            // `agent` and `stdio` (`src/acp/spawn.rs`).
+            args: vec!["--always-approve".to_owned()],
             asks_for_permission: false,
-            // No confirmed ACP mode id: `current_mode_update` emission by
-            // Grok Build is itself UNCONFIRMED (`gate4agent-acp-progress-
-            // and-result-handoff-2026-09-02.md` §2), and no source names a
-            // `modes.availableModes[].id` string for it -- sharing the argv
-            // spelling with claude does not confirm it is also the ACP mode
-            // id space grok announces over `grok agent stdio`. `None` until
-            // a live capture sources one.
+            // No sourced ACP `modes.availableModes[].id` yet (slice-1 skipped
+            // grok). `_meta.yoloMode: true` on `session/new` is a documented
+            // peer lever; not wired into `AcpSessionOptions` this pass.
             acp_mode_id: None,
         },
         ("grok", ApprovalLevel::Moderate) => Supported {
-            // CONFIRMED 2026-09-02 against xAI's own documentation, which
-            // spells this invocation out literally. The earlier empty argv
-            // was wrong in a way worth naming: no flag does not mean "Auto",
-            // it means the vendor's default, which is the stricter "Ask".
-            // So a Moderate session silently ran at a narrower authority
-            // than it asked for -- the mirror image of the ReadOnly defect
-            // this map was rewritten to fix, and equally a case of assuming
-            // a default rather than reading one.
+            // Confirmed 2026-10-02: `--permission-mode auto` (classifier
+            // auto-approves safer tools; others may still prompt / block in
+            // non-interactive sessions). Same agent-option position as
+            // FullAuto. `_meta.autoMode: true` is the ACP peer lever.
             args: vec!["--permission-mode".to_owned(), "auto".to_owned()],
-            // Auto auto-approves the safer tools by classifier and still
-            // prompts for dangerous ones, so a request can still arrive.
             asks_for_permission: true,
-            acp_mode_id: None, // see FullAuto's comment above.
+            acp_mode_id: None,
         },
         // No documented read-only mode exists for Grok Build at all (Ask /
         // Auto / Always-approve, none of them a restriction) -- refuse by
@@ -1055,7 +1046,7 @@ mod tests {
         let grok = AgentId::new("grok").unwrap();
         assert_eq!(
             approval_level_args(&grok, ApprovalLevel::FullAuto),
-            ["--permission-mode", "bypassPermissions"]
+            ["--always-approve"]
         );
         assert_eq!(
             approval_level_args(&grok, ApprovalLevel::Moderate),
@@ -1189,7 +1180,7 @@ mod tests {
         let grok = AgentId::new("grok").unwrap();
         assert_eq!(
             approval_level_resolution(&grok, ApprovalLevel::FullAuto),
-            supported(&["--permission-mode", "bypassPermissions"], false, None)
+            supported(&["--always-approve"], false, None)
         );
         assert_eq!(
             approval_level_resolution(&grok, ApprovalLevel::Moderate),

@@ -945,7 +945,8 @@ pub struct ConfigOptionChoice {
 /// name from being silently dropped.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionConfigOption {
-    #[serde(default)]
+    // ACP v2 + Grok agent-mode docs use `configId`; older captures used `id`.
+    #[serde(default, alias = "configId")]
     pub id: String,
     #[serde(default)]
     pub name: String,
@@ -2877,7 +2878,17 @@ mod tests {
         assert_eq!(option.kind, ConfigOptionKind::Unknown);
     }
 
+
     #[test]
+    fn session_config_option_accepts_acp_v2_config_id_alias() {
+        let raw = r#"{"configId":"model","name":"Model","type":"select","currentValue":"grok-4.6"}"#;
+        let option: SessionConfigOption = serde_json::from_str(raw).unwrap();
+        assert_eq!(option.id, "model");
+        assert_eq!(option.name, "Model");
+        assert_eq!(option.value, Value::String("grok-4.6".to_owned()));
+    }
+
+        #[test]
     fn session_config_option_reads_the_live_wire_key_names() {
         // Verbatim shape of one `configOptions` entry from `session/new`'s
         // result on claude-agent-acp 0.71.0 (`acp-claude.jsonl`) -- the

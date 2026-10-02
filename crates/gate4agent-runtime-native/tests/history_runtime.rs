@@ -49,6 +49,10 @@ fn write(path: &Path, content: &str) {
 
 fn controlled_resume_registry(fixture: &FixtureDir) -> AgentRegistry {
     let mut spec = builtin_registry().get_by_id("grok").unwrap().clone();
+    // Fleet grok is ACP-native (`transports.pty = false`). This fixture
+    // speaks plain stdout (`fixture-resume:…`), not ACP JSON-RPC, so admit
+    // raw PTY for the controlled resume harness only.
+    spec.capabilities.transports.pty = true;
     #[cfg(windows)]
     let launch = {
         let script = fixture.0.join("resume-fixture.ps1");
@@ -149,7 +153,7 @@ async fn public_handle_discovers_and_loads_history_without_blocking_the_tick() {
             ControlCommand::Register {
                 instance_id,
                 agent_id: AgentId::new("grok").unwrap(),
-                transport: TransportKind::Pty,
+                transport: TransportKind::Acp,
             },
         ))
         .unwrap();
@@ -227,7 +231,7 @@ async fn unconfigured_history_authority_fails_through_the_same_snapshot() {
             ControlCommand::Register {
                 instance_id,
                 agent_id: AgentId::new("grok").unwrap(),
-                transport: TransportKind::Pty,
+                transport: TransportKind::Acp,
             },
         ))
         .unwrap();

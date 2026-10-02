@@ -1046,6 +1046,9 @@ pub struct NodeServerConfig {
     /// Optional bridge shared secret (`GATE4AGENT_BRIDGE_TOKEN`). Distinct from
     /// NODE_TOKEN; never logged. `None` = loopback bind is the only gate.
     bridge_token: Option<String>,
+    /// Tip 6: optional mesh underlay UDP bind that relays to local `--bridge-listen`.
+    /// Requires bridge_listen + bridge_token. HQ never accepts (NodePeer).
+    bridge_underlay: Option<browser_bridge::BridgeUnderlayAccept>,
     /// A relay to CALL, rather than wait to be called by. `None` keeps the
     /// node purely a listener, which is what it has always been.
     call_home: Option<std::net::SocketAddr>,
@@ -1134,6 +1137,7 @@ impl NodeServerConfig {
             api_listen: None,
             bridge_listen: None,
             bridge_token: None,
+            bridge_underlay: None,
             call_home: None,
             node_id,
             workspaces,
@@ -1187,6 +1191,35 @@ impl NodeServerConfig {
             return Err(NodeServerError::InvalidBridgeToken);
         }
         self.bridge_token = Some(bridge_token);
+        Ok(self)
+    }
+
+    /// Tip 6: point bridge reachability over mesh underlay (UDP+AEAD relay to
+    /// local loopback `--bridge-listen`). Requires bridge listen + bridge token
+    /// already configured. Transport key is 32 raw bytes (never logged).
+    /// Underlay auth token is distinct from BRIDGE_TOKEN (crypto ≠ auth).
+    pub fn with_bridge_underlay(
+        mut self,
+        bind: std::net::SocketAddr,
+        transport_key: [u8; 32],
+        underlay_token: impl Into<String>,
+    ) -> Result<Self, NodeServerError> {
+        if self.bridge_listen.is_none() {
+            return Err(NodeServerError::BridgeUnderlayRequiresBridgeListen);
+        }
+        if self.bridge_token.is_none() {
+            return Err(NodeServerError::BridgeUnderlayRequiresBridgeToken);
+        }
+        let underlay_token = underlay_token.into();
+        if underlay_token.is_empty() || underlay_token.len() > 4_096 {
+            return Err(NodeServerError::InvalidBridgeUnderlayToken);
+        }
+        // Port 0 is allowed (ephemeral). Role lock (no HQ accept) lives in underlay.
+        self.bridge_underlay = Some(browser_bridge::BridgeUnderlayAccept {
+            bind,
+            transport_key,
+            underlay_token,
+        });
         Ok(self)
     }
 
@@ -2419,6 +2452,7 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         let call_home = config.call_home;
         let api_listen = config.api_listen;
         let bridge_listen = config.bridge_listen;
+        let bridge_underlay = config.bridge_underlay;
         let bridge_auth = browser_bridge::BridgeAuth::from_optional(config.bridge_token)
             .map_err(|_| NodeServerError::InvalidBridgeToken)?;
         let accept_shared = Arc::clone(&shared);
@@ -2437,7 +2471,7 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
             );
             let accept_loop = accept_connections(&endpoint, call_home, accept_shared);
             let api_loop = http_api::run(api_listen, api_shared);
-            let bridge_loop = browser_bridge::run(bridge_listen, bridge_auth, bridge_shared);
+            let bridge_loop = browser_bridge::run(bridge_listen, bridge_auth, bridge_shared, bridge_underlay);
             tokio::pin!(runtime_loop);
             tokio::pin!(accept_loop);
             tokio::pin!(api_loop);
@@ -17009,6 +17043,14 @@ pub enum NodeServerError {
     InvalidBridgeListen(std::net::SocketAddr),
     #[error("node browser bridge token must contain 1..=4096 bytes")]
     InvalidBridgeToken,
+    #[error("bridge underlay requires --bridge-listen (local HTTP+WS door)")]
+    BridgeUnderlayRequiresBridgeListen,
+    #[error("bridge underlay requires GATE4AGENT_BRIDGE_TOKEN (application barrier)")]
+    BridgeUnderlayRequiresBridgeToken,
+    #[error("mesh underlay auth token must contain 1..=4096 bytes")]
+    InvalidBridgeUnderlayToken,
+    #[error("mesh underlay transport key must be 32 bytes (64 hex digits)")]
+    InvalidBridgeUnderlayKey,
     #[error("node call-home relay must be a loopback address with a nonzero port: {0}")]
     InvalidCallHome(std::net::SocketAddr),
     #[error("node could not reach its call-home relay: {0}")]

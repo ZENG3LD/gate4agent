@@ -1,4 +1,4 @@
-//! Minimal Linux-first mesh **underlay** slice (design tip 5).
+//! Minimal Linux-first mesh **underlay** slice (design tips 5–6).
 //!
 //! Not a WireGuard daemon product. Provides:
 //! - peer dial/accept role lock (C2+node DialOrAccept; HQ DialOnly)
@@ -6,24 +6,27 @@
 //! - **separate** authorization token barrier for probe actions
 //!   (transport crypto ≠ authorization)
 //! - clear refuse on Win/mac and for HQ underlay accept
+//! - tip 6: TCP bridge-reach over underlay (HTTP+WS dialect unchanged)
 //!
 //! Cite:
-//! - `mesh-connectivity-daemon-design-2026-10-02.md` §1.2 / §1.5 / tip 5
+//! - `mesh-connectivity-daemon-design-2026-10-02.md` §1.2 / §1.5 / tips 5–6
 //! - `mesh-underlay-linux-tun-wg-vs-win-mac-2026-10-02.md`
 //! - hatchery `mesh_role` DialOnly lock
 //!
 //! Feature: `mesh-underlay` (default on). Disable to omit this module from
-//! dependents that do not need tip-5 surfaces.
+//! dependents that do not need tip-5/6 surfaces.
 
 use std::fmt;
 
 #[cfg(target_os = "linux")]
 mod linux;
+mod bridge_reach;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    dial_peer, probe_tun_surface, accept_peer, LinuxUnderlayListener, LinuxUnderlaySession,
-    TunSurfaceReport,
+    accept_peer, accept_peer_on, dial_peer, probe_tun_surface, LinuxUnderlayListener,
+    LinuxUnderlaySession, TunSurfaceReport,
 };
+pub use bridge_reach::{serve_bridge_tcp_relay, underlay_to_io, BridgeUnderlayClient};
 
 /// Who participates on the underlay (mirrors hatchery `MeshParticipantRole`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -109,7 +112,7 @@ impl fmt::Display for MeshUnderlayError {
             }
             Self::Path(msg) => write!(f, "underlay path error: {msg}"),
             Self::WireGuardDaemonNotInThisTip => f.write_str(
-                "no WireGuard/kernel TUN daemon in tip 5; userspace UDP+AEAD permit path only",
+                "no WireGuard/kernel TUN daemon in tips 5–6; userspace UDP+AEAD + bridge TCP relay only",
             ),
         }
     }
@@ -215,6 +218,16 @@ pub fn accept_peer(
 ) -> Result<UnsupportedUnderlayHandle, MeshUnderlayError> {
     assert_accept_allowed(role)?;
     Err(platform_unsupported())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn accept_peer_on(
+    role: MeshUnderlayRole,
+    transport_key: &UnderlayTransportKey,
+    auth_token: &UnderlayAuthToken,
+    _bind: std::net::SocketAddr,
+) -> Result<UnsupportedUnderlayHandle, MeshUnderlayError> {
+    accept_peer(role, transport_key, auth_token)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -396,6 +409,104 @@ mod tests {
                 || report.open_attempt == "missing-device"
         );
         assert!(report.note.contains("tip 5") || report.note.contains("CAP_NET_ADMIN") || report.note.contains("userspace"));
+    }
+
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tip6_bridge_health_over_underlay_requires_token_barriers() {
+        use crate::mesh_underlay::{serve_bridge_tcp_relay, BridgeUnderlayClient};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let transport = UnderlayTransportKey::from_bytes([11u8; 32]);
+        let underlay_auth = UnderlayAuthToken::new("underlay-tip6-token").unwrap();
+
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge_addr = tcp.local_addr().unwrap();
+        let app_task = tokio::spawn(async move {
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let body = br#"{"ok":true,"door":"node-envelope-bridge","tip":6}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                std::str::from_utf8(body).unwrap()
+            );
+            stream.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        assert_eq!(
+            accept_peer(MeshUnderlayRole::HqClientAdmin, &transport, &underlay_auth)
+                .await
+                .err(),
+            Some(MeshUnderlayError::HqMustNotAcceptUnderlay)
+        );
+
+        // --- unauthorized path ---
+        let listener = accept_peer(MeshUnderlayRole::NodePeer, &transport, &underlay_auth)
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_bad = {
+            let transport = transport.clone();
+            let underlay_auth = underlay_auth.clone();
+            tokio::spawn(async move {
+                let session = dial_peer(
+                    MeshUnderlayRole::C2Peer,
+                    &transport,
+                    &underlay_auth,
+                    &addr.to_string(),
+                )
+                .await
+                .unwrap();
+                BridgeUnderlayClient::open(session, "wrong-token").await
+            })
+        };
+        let session = listener.accept().await.unwrap();
+        let server_err = serve_bridge_tcp_relay(session, &underlay_auth, bridge_addr).await;
+        assert!(matches!(server_err, Err(MeshUnderlayError::Unauthorized)));
+        let client_err = client_bad.await.unwrap();
+        assert!(matches!(client_err, Err(MeshUnderlayError::Unauthorized)));
+
+        // --- authorized path ---
+        let listener = accept_peer(MeshUnderlayRole::NodePeer, &transport, &underlay_auth)
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_ok = {
+            let transport = transport.clone();
+            let underlay_auth = underlay_auth.clone();
+            tokio::spawn(async move {
+                let session = dial_peer(
+                    MeshUnderlayRole::C2Peer,
+                    &transport,
+                    &underlay_auth,
+                    &addr.to_string(),
+                )
+                .await
+                .unwrap();
+                let mut client = BridgeUnderlayClient::open(session, "underlay-tip6-token")
+                    .await
+                    .unwrap();
+                client
+                    .write_all(b"GET /bridge/health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await
+                    .unwrap();
+                let resp = client.read_at_least(12).await.unwrap();
+                let text = String::from_utf8_lossy(&resp);
+                assert!(text.contains("200 OK"), "got {text}");
+                assert!(text.contains("node-envelope-bridge"));
+                client.close().await.unwrap();
+            })
+        };
+        let session = listener.accept().await.unwrap();
+        serve_bridge_tcp_relay(session, &underlay_auth, bridge_addr)
+            .await
+            .expect("authorized relay");
+        client_ok.await.unwrap();
+        app_task.await.unwrap();
     }
 
     #[cfg(not(target_os = "linux"))]

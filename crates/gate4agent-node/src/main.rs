@@ -15,6 +15,10 @@ use std::path::PathBuf;
 const NODE_TOKEN_ENV: &str = "GATE4AGENT_NODE_TOKEN";
 /// Optional node-local bridge secret (distinct from NODE_TOKEN). Never logged.
 const BRIDGE_TOKEN_ENV: &str = "GATE4AGENT_BRIDGE_TOKEN";
+/// Tip 6: 64 hex chars = 32-byte underlay AEAD key (never logged; ≠ BRIDGE_TOKEN).
+const MESH_UNDERLAY_KEY_ENV: &str = "GATE4AGENT_MESH_UNDERLAY_KEY";
+/// Tip 6: underlay probe/auth token barrier (never logged; ≠ BRIDGE_TOKEN).
+const MESH_UNDERLAY_TOKEN_ENV: &str = "GATE4AGENT_MESH_UNDERLAY_TOKEN";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -36,6 +40,8 @@ async fn main() {
         .expect("the built-in node API listen address must be valid");
     // Opt-in: default off. Loopback-only when set (enforced by with_bridge_listen).
     let mut bridge_listen: Option<std::net::SocketAddr> = None;
+    // Tip 6: optional underlay UDP accept (may be non-loopback); relays to bridge_listen.
+    let mut bridge_underlay_listen: Option<std::net::SocketAddr> = None;
     let mut call_home: Option<std::net::SocketAddr> = None;
     let mut node_id = None;
     let mut workspaces = Vec::new();
@@ -64,6 +70,18 @@ async fn main() {
                 });
                 if bridge_listen.replace(addr).is_some() {
                     fail("--bridge-listen may only be supplied once");
+                }
+            }
+            // Tip 6: mesh underlay UDP door → TCP relay to local --bridge-listen.
+            // Requires BRIDGE_TOKEN + MESH_UNDERLAY_KEY + MESH_UNDERLAY_TOKEN.
+            // HQ dial-only (node accepts as NodePeer). Not a WireGuard daemon.
+            "--bridge-underlay-listen" => {
+                let value = required_value("--bridge-underlay-listen", args.next());
+                let addr = value.parse().unwrap_or_else(|error| {
+                    fail(&format!("--bridge-underlay-listen is invalid: {error}"))
+                });
+                if bridge_underlay_listen.replace(addr).is_some() {
+                    fail("--bridge-underlay-listen may only be supplied once");
                 }
             }
             // Both default to `0` (disabled) via `SessionRecordRetentionConfig::default`
@@ -177,13 +195,14 @@ async fn main() {
                 }
             }
             "--help" | "-h" => {
-                println!("gate4agent-node --node-id ID --workspace ID=ABSOLUTE_PATH [--worktree-mode ID=manual|managed|off] [--managed-worktree-profile 'ID=PROFILE|REVISION|ABS_ROOT|BRANCH_PREFIX|BASE|RETENTION'] [--history-root 'ADAPTER|LAYOUT|ABS_ROOT'] [--harness-mcp-helper ABSOLUTE_REGULAR_FILE] [--network-allowlist-catalog ABSOLUTE_REGULAR_FILE] [--endpoint ABSOLUTE_LOCAL_ENDPOINT] [--api-listen 127.0.0.1:PORT] [--bridge-listen 127.0.0.1:PORT] [--c2-dial 127.0.0.1:PORT] [--session-record-retention-age-ms MILLISECONDS] [--session-record-retention-keep COUNT]");
+                println!("gate4agent-node --node-id ID --workspace ID=ABSOLUTE_PATH [--worktree-mode ID=manual|managed|off] [--managed-worktree-profile 'ID=PROFILE|REVISION|ABS_ROOT|BRANCH_PREFIX|BASE|RETENTION'] [--history-root 'ADAPTER|LAYOUT|ABS_ROOT'] [--harness-mcp-helper ABSOLUTE_REGULAR_FILE] [--network-allowlist-catalog ABSOLUTE_REGULAR_FILE] [--endpoint ABSOLUTE_LOCAL_ENDPOINT] [--api-listen 127.0.0.1:PORT] [--bridge-listen 127.0.0.1:PORT] [--bridge-underlay-listen ADDR] [--c2-dial 127.0.0.1:PORT] [--session-record-retention-age-ms MILLISECONDS] [--session-record-retention-keep COUNT]");
                 println!("RETENTION: remove-when-released or retain");
                 println!("--session-record-retention-age-ms/--session-record-retention-keep: retire dead Unavailable managed session records; both default to 0 (disabled)");
                 println!("LAYOUT: single-ndjson|single-json|json-or-ndjson|ndjson-with-optional-index|summary-json-with-sibling-ndjson|metadata-json-with-sibling-json|session-json-with-sibling-message-json|readonly-sqlite-projection|state-json-with-index-and-sibling-ndjson");
                 println!("control token: {NODE_TOKEN_ENV} environment variable");
                 println!("--bridge-listen: opt-in node-envelope HTTP+WS bridge (loopback only; separate from --api-listen)");
                 println!("optional bridge token: {BRIDGE_TOKEN_ENV} (never logged; distinct from control token)");
+                println!("--bridge-underlay-listen: tip 6 mesh underlay UDP accept → TCP relay to --bridge-listen (requires {BRIDGE_TOKEN_ENV} + {MESH_UNDERLAY_KEY_ENV} + {MESH_UNDERLAY_TOKEN_ENV}; HQ dial-only; no WG daemon)");
                 println!("network allowlist catalog: --network-allowlist-catalog or {NETWORK_ALLOWLIST_CATALOG_ENV} (opaque ids, one per line; empty default)");
                 println!("--c2-dial: dial a relay's call-home listener instead of waiting to be dialled");
                 return;
@@ -233,6 +252,28 @@ async fn main() {
                 .unwrap_or_else(|error| fail(&error.to_string()))
         }
         Err(_) => config,
+    };
+    let config = match bridge_underlay_listen {
+        Some(bind) => {
+            let key_hex = std::env::var(MESH_UNDERLAY_KEY_ENV).unwrap_or_else(|_| {
+                fail(&format!(
+                    "{MESH_UNDERLAY_KEY_ENV} is required with --bridge-underlay-listen (64 hex digits)"
+                ))
+            });
+            std::env::remove_var(MESH_UNDERLAY_KEY_ENV);
+            let underlay_token = std::env::var(MESH_UNDERLAY_TOKEN_ENV).unwrap_or_else(|_| {
+                fail(&format!(
+                    "{MESH_UNDERLAY_TOKEN_ENV} is required with --bridge-underlay-listen"
+                ))
+            });
+            std::env::remove_var(MESH_UNDERLAY_TOKEN_ENV);
+            let transport_key = parse_underlay_key_hex(&key_hex)
+                .unwrap_or_else(|error| fail(&error));
+            config
+                .with_bridge_underlay(bind, transport_key, underlay_token)
+                .unwrap_or_else(|error| fail(&error.to_string()))
+        }
+        None => config,
     };
     let config = if let Some(history) = explicit_history_config(history_roots)
         .unwrap_or_else(|error| fail(&error))
@@ -323,6 +364,32 @@ fn parse_session_record_retention_keep(value: &str) -> Result<u32, String> {
 
 fn required_value(flag: &str, value: Option<String>) -> String {
     value.unwrap_or_else(|| fail(&format!("{flag} requires a value")))
+}
+
+
+fn parse_underlay_key_hex(value: &str) -> Result<[u8; 32], String> {
+    let value = value.trim();
+    if value.len() != 64 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(
+            "GATE4AGENT_MESH_UNDERLAY_KEY must be exactly 64 hex digits (32 bytes)".into(),
+        );
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in value.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err("invalid hex digit in GATE4AGENT_MESH_UNDERLAY_KEY".into()),
+    }
 }
 
 fn fail(message: &str) -> ! {

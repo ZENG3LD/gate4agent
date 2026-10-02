@@ -88,9 +88,27 @@ pub async fn accept_peer(
     transport_key: &UnderlayTransportKey,
     auth_token: &UnderlayAuthToken,
 ) -> Result<LinuxUnderlayListener, MeshUnderlayError> {
+    accept_peer_on(
+        role,
+        transport_key,
+        auth_token,
+        "127.0.0.1:0".parse().expect("loopback ephemeral"),
+    )
+    .await
+}
+
+/// Tip 6: underlay UDP accept on an explicit bind (may be non-loopback for
+/// mesh peers). Application HTTP+WS stays on loopback `--bridge-listen`;
+/// this only accepts the encrypted underlay path. HQ DialOnly still refused.
+pub async fn accept_peer_on(
+    role: MeshUnderlayRole,
+    transport_key: &UnderlayTransportKey,
+    auth_token: &UnderlayAuthToken,
+    bind: SocketAddr,
+) -> Result<LinuxUnderlayListener, MeshUnderlayError> {
     assert_accept_allowed(role)?;
     let key = sealing_key(transport_key)?;
-    let socket = UdpSocket::bind("127.0.0.1:0")
+    let socket = UdpSocket::bind(bind)
         .await
         .map_err(|e| MeshUnderlayError::Path(e.to_string()))?;
     Ok(LinuxUnderlayListener {

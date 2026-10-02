@@ -1,10 +1,11 @@
 //! Node-envelope HTTP + WebSocket browser bridge.
 //!
 //! Separate from framed node-wire C2 and from the ops `--api-listen` HTTP
-//! observer (`http_api`). Loopback-only bind; optional `GATE4AGENT_BRIDGE_TOKEN`
-//! (never logged). Product bytes are HTTP+WS over TCP. UDP is not an
-//! application protocol here — it remains the mesh/WG-class underlay each
-//! peer will own a slice of later (see design plan connectivity doctrine).
+//! observer (`http_api`). Loopback-only TCP bind; optional `GATE4AGENT_BRIDGE_TOKEN`
+//! (never logged). Product bytes are HTTP+WS over TCP. Tip 6: optional mesh
+//! underlay UDP accept relays those same TCP bytes over tip-5 encrypted path
+//! + underlay token barrier (crypto ≠ auth). UDP is not a second observe/drive
+//! dialect — see mesh-connectivity-daemon-design tip 6.
 //!
 //! Observe projection (tip 3): slim per-session inventory over WS / HTTP
 //! snapshot — address, status, screen kind, opaque browser_profile_id when
@@ -102,6 +103,15 @@ impl BridgeAuth {
 #[derive(Debug)]
 pub(super) enum BridgeAuthError {
     Invalid,
+}
+
+/// Tip 6: accept mesh underlay peers and relay TCP to local `--bridge-listen`.
+/// Application HTTP+WS dialect unchanged. HQ never accepts (NodePeer role).
+#[derive(Clone)]
+pub(super) struct BridgeUnderlayAccept {
+    pub bind: SocketAddr,
+    pub transport_key: [u8; 32],
+    pub underlay_token: String,
 }
 
 /// Observe emit mode on `/bridge/ws` (design §5.2).
@@ -233,13 +243,105 @@ pub(super) async fn run(
     listen: Option<SocketAddr>,
     auth: BridgeAuth,
     shared: Arc<NodeShared>,
+    underlay: Option<BridgeUnderlayAccept>,
 ) -> io::Result<()> {
     let Some(listen) = listen else {
+        // Underlay without local bridge door is refused at config time.
         wait_for_shutdown(&shared).await;
         return Ok(());
     };
     let listener = TcpListener::bind(listen).await?;
-    serve_listener(listener, auth, shared).await
+    let local_bridge = listener.local_addr()?;
+    let underlay_reach = underlay.is_some();
+    if let Some(underlay) = underlay {
+        let underlay_shared = Arc::clone(&shared);
+        let underlay_task = tokio::spawn(async move {
+            run_bridge_underlay_accept(underlay, local_bridge, underlay_shared).await
+        });
+        let result = serve_listener_with_underlay_flag(
+            listener,
+            auth,
+            shared,
+            underlay_reach,
+        )
+        .await;
+        underlay_task.abort();
+        let _ = underlay_task.await;
+        result
+    } else {
+        serve_listener_with_underlay_flag(listener, auth, shared, false).await
+    }
+}
+
+async fn serve_listener_with_underlay_flag(
+    listener: TcpListener,
+    auth: BridgeAuth,
+    shared: Arc<NodeShared>,
+    underlay_reach: bool,
+) -> io::Result<()> {
+    serve_listener_with_observe_options(
+        listener,
+        auth,
+        shared,
+        DEFAULT_OBSERVE_PERIOD,
+        ObserveMode::from_env(),
+        underlay_reach,
+    )
+    .await
+}
+
+/// Tip 6 underlay accept loop: NodePeer role, token barrier, TCP relay to
+/// local loopback bridge. Re-binds after each session (tip-5 listener is
+/// single-accept). Not a WireGuard daemon. HQ DialOnly enforced in underlay.
+async fn run_bridge_underlay_accept(
+    underlay: BridgeUnderlayAccept,
+    local_bridge: SocketAddr,
+    shared: Arc<NodeShared>,
+) -> io::Result<()> {
+    use gate4agent_node_wire::mesh_underlay::{
+        accept_peer_on, serve_bridge_tcp_relay, underlay_to_io, MeshUnderlayRole,
+        UnderlayAuthToken, UnderlayTransportKey,
+    };
+
+    let transport = UnderlayTransportKey::from_bytes(underlay.transport_key);
+    let auth = UnderlayAuthToken::new(underlay.underlay_token.clone())
+        .map_err(|e| underlay_to_io(e))?;
+
+    loop {
+        if shared.shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let listener = accept_peer_on(
+            MeshUnderlayRole::NodePeer,
+            &transport,
+            &auth,
+            underlay.bind,
+        )
+        .await
+        .map_err(underlay_to_io)?;
+
+        let shutdown = shared.shutdown_notify.notified();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                if shared.shutdown.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+            }
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok(session) => {
+                        let auth = auth.clone();
+                        // One relay at a time this tip; ignore relay errors
+                        // (bad token / peer drop) and re-accept.
+                        let _ = serve_bridge_tcp_relay(session, &auth, local_bridge).await;
+                    }
+                    Err(err) => return Err(underlay_to_io(err)),
+                }
+            }
+        }
+    }
 }
 
 async fn wait_for_shutdown(shared: &NodeShared) {
@@ -264,6 +366,7 @@ async fn serve_listener(
         shared,
         DEFAULT_OBSERVE_PERIOD,
         ObserveMode::from_env(),
+        false,
     )
     .await
 }
@@ -280,6 +383,7 @@ async fn serve_listener_with_observe_period(
         shared,
         observe_period,
         ObserveMode::from_env(),
+        false,
     )
     .await
 }
@@ -290,6 +394,7 @@ async fn serve_listener_with_observe_options(
     shared: Arc<NodeShared>,
     observe_period: Duration,
     observe_mode: ObserveMode,
+    underlay_reach: bool,
 ) -> io::Result<()> {
     let permits = Arc::new(Semaphore::new(MAX_BRIDGE_CONNECTIONS));
     let mut connections = JoinSet::new();
@@ -319,6 +424,7 @@ async fn serve_listener_with_observe_options(
                 };
                 let connection_shared = Arc::clone(&shared);
                 let connection_auth = auth.clone();
+                let connection_underlay = underlay_reach;
                 connections.spawn(async move {
                     let _permit = permit;
                     let _ = serve_connection(
@@ -327,6 +433,7 @@ async fn serve_listener_with_observe_options(
                         connection_shared,
                         observe_period,
                         observe_mode,
+                        connection_underlay,
                     )
                     .await;
                 });
@@ -346,6 +453,7 @@ async fn serve_connection(
     shared: Arc<NodeShared>,
     observe_period: Duration,
     observe_mode: ObserveMode,
+    underlay_reach: bool,
 ) -> io::Result<()> {
     let request = match timeout(HEADER_READ_TIMEOUT, read_request(&mut stream)).await {
         Ok(Ok(request)) => request,
@@ -387,7 +495,7 @@ async fn serve_connection(
     }
 
     let response = match path_only {
-        "/bridge/health" | "/health" => HttpResponse::json(200, health_body(&shared)),
+        "/bridge/health" | "/health" => HttpResponse::json(200, health_body(&shared, underlay_reach)),
         "/bridge/snapshot" => HttpResponse::json(200, observe_snapshot_body(&shared)),
         _ => HttpResponse::plain(404, "Not Found"),
     };
@@ -670,7 +778,7 @@ fn is_websocket_upgrade(request: &Request) -> bool {
     upgrade && connection
 }
 
-fn health_body(shared: &NodeShared) -> Value {
+fn health_body(shared: &NodeShared, underlay_reach: bool) -> Value {
     json!({
         "ok": true,
         "service": SERVICE_NAME,
@@ -683,8 +791,13 @@ fn health_body(shared: &NodeShared) -> Value {
         "protocols": {
             "application": ["http", "websocket"],
             "transport_tcp": true,
-            // UDP is mesh/WG-class underlay — not a second app protocol here.
-            "transport_udp_underlay": "mesh-or-permit-set-later",
+            // Tip 6: UDP underlay carries TCP to local bridge; not a second app dialect.
+            "transport_udp_underlay": if underlay_reach {
+                "tip-6-bridge-reach"
+            } else {
+                "opt-in-via-bridge-underlay-listen"
+            },
+            "hq_mesh_role": "dial-only",
         },
     })
 }
@@ -735,7 +848,7 @@ fn observe_hello_frame_from(
                 "native_pty": native_pty_sessions,
             },
             "session_projections": session_projections,
-            "note": "slim session projection; drive via POST /bridge/drive (prompt|paste); WS change-driven observe.delta (snapshot-only escape hatch); mesh underlay later",
+            "note": "slim session projection; drive via POST /bridge/drive (prompt|paste); WS change-driven observe.delta (snapshot-only escape hatch); tip-6 bridge-over-underlay when --bridge-underlay-listen set",
         },
         "node_id": shared.node_id,
         "incarnation_id": shared.incarnation_id,
@@ -1529,6 +1642,44 @@ mod tests {
     }
 
     #[test]
+    fn bridge_underlay_requires_listen_and_token_barriers() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace = WorkspaceConfig::new(WorkspaceId::new("test").unwrap(), root).unwrap();
+        let config = NodeServerConfig::new(
+            test_local_endpoint("underlay-cfg"),
+            "test-token",
+            NodeId::new("test-node").unwrap(),
+            [workspace],
+        )
+        .unwrap();
+        // No bridge listen → refuse.
+        assert!(matches!(
+            config.clone().with_bridge_underlay(
+                "127.0.0.1:0".parse().unwrap(),
+                [9u8; 32],
+                "underlay-token",
+            ),
+            Err(crate::NodeServerError::BridgeUnderlayRequiresBridgeListen)
+        ));
+        let config = config
+            .with_bridge_listen("127.0.0.1:0".parse().unwrap())
+            .unwrap();
+        // Listen without application BRIDGE_TOKEN → refuse.
+        assert!(matches!(
+            config.clone().with_bridge_underlay(
+                "127.0.0.1:0".parse().unwrap(),
+                [9u8; 32],
+                "underlay-token",
+            ),
+            Err(crate::NodeServerError::BridgeUnderlayRequiresBridgeToken)
+        ));
+        let config = config.with_bridge_token("bridge-secret").unwrap();
+        assert!(config
+            .with_bridge_underlay("0.0.0.0:0".parse().unwrap(), [9u8; 32], "underlay-token")
+            .is_ok());
+    }
+
+    #[test]
     fn sec_websocket_accept_matches_rfc6455_example() {
         // RFC6455 §1.3 / §4.2.2 example key.
         assert_eq!(
@@ -1569,6 +1720,8 @@ mod tests {
         assert!(health.contains("\"service\":\"gate4agent-node-bridge\""));
         assert!(health.contains("\"door\":\"node-envelope-bridge\""));
         assert!(health.contains("\"application\":[\"http\",\"websocket\"]"));
+        assert!(health.contains("\"transport_udp_underlay\":\"opt-in-via-bridge-underlay-listen\""));
+        assert!(health.contains("\"hq_mesh_role\":\"dial-only\""));
         assert!(!health.contains("test-token"));
         assert!(!health.contains("GATE4AGENT"));
 
@@ -2023,6 +2176,7 @@ Sec-WebSocket-Version: 13\r\n\
             Arc::clone(&shared),
             Duration::from_millis(80),
             ObserveMode::SnapshotOnly,
+            false,
         ));
 
         let mut stream = TcpStream::connect(address).await.unwrap();
@@ -2305,6 +2459,7 @@ Sec-WebSocket-Version: 13\r\n\
         let task = tokio::spawn(serve_listener_with_observe_options(
             listener, auth, Arc::clone(&shared),
             Duration::from_millis(50), ObserveMode::Delta,
+            false,
         ));
 
         let mut stream = TcpStream::connect(address).await.unwrap();
@@ -2336,6 +2491,7 @@ Sec-WebSocket-Version: 13\r\n\
         let task = tokio::spawn(serve_listener_with_observe_options(
             listener, auth, Arc::clone(&shared),
             Duration::from_millis(60), ObserveMode::Delta,
+            false,
         ));
 
         let mut stream = TcpStream::connect(address).await.unwrap();

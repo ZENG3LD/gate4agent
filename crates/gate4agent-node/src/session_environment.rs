@@ -29,12 +29,17 @@ const MATERIALIZATION_ROOT_MARKER: &[u8] = b"gate4agent-node-session-environment
 const MATERIALIZATION_OWNER_MARKER: &str = ".gate4agent-materialization-owner";
 const MATERIALIZATION_ROOT_MARKER_NAME: &str = ".gate4agent-materialization-root";
 const MATERIALIZATION_LOCK_NAME: &str = ".gate4agent-materialization-lock";
-/// Exclusive ProviderHome env key for Codex bundle layout (`supports_bundle_layout`).
-/// Other provider relocation vars (`CLAUDE_CONFIG_DIR`, `KIMI_CODE_HOME`, `GROK_HOME`)
-/// are already expressible as generic `NodeSessionPathBinding` → `ProviderHome`
-/// profile data (no hard-coded gate here). Node-level multi-config = one owner
-/// contour; multi-private-Max fleet orchestration is hatchery-across-nodes.
-/// See hatchery-websession-docs research `multi-account-node-vs-hatchery-2026-10-02`.
+/// Exclusive ProviderHome env key for **Codex bundle layout only**
+/// (`supports_bundle_layout`). That gate is layout composition (Codex home must
+/// own skills paths); it is **not** the multi-config collision policy.
+///
+/// `CLAUDE_CONFIG_DIR` / `KIMI_CODE_HOME` / `GROK_HOME` are ordinary
+/// `NodeSessionPathBinding` → `ProviderHome` profile data — **no** exclusive
+/// layout constant. One-owner/org multi-config = multiple environment profiles.
+/// Same-cwd collision across different homes is spawn policy (refuse + managed
+/// worktree), not a second exclusivity key. See hatchery-websession-docs
+/// research `multi-account-node-vs-hatchery-2026-10-02` and plan
+/// `n-accounts-one-workspace-collision-2026-10-02`.
 const CODEX_HOME_ENVIRONMENT_KEY: &str = "CODEX_HOME";
 const CONTEXT_ROOT_ENVIRONMENT_KEY: &str = "GATE4AGENT_CONTEXT_ROOT";
 pub(crate) const CONTEXT_PACK_FILE_NAME: &str = "context-pack.json";

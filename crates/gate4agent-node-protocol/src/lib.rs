@@ -1456,7 +1456,8 @@ pub struct LaunchInventory {
     pub bundles: Option<Vec<ResolvedBundleReceipt>>,
     /// Station network allowlist catalog ids registered on this node (opaque).
     /// Empty/None when unset. Never cookies / OAuth / proxy credentials.
-    /// Dig2browser dig2 probe stays stubbed elsewhere.
+    /// Dig2browser station probe is optional (`dig2-station-probe`); inventory
+    /// still lists opaque allowlist ids only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_allowlists: Option<Vec<SpawnNetworkAllowlistId>>,
 }
@@ -7256,6 +7257,18 @@ pub enum NodeFailureCode {
     /// §4 — refuse unknown ids rather than silent ambient. Opaque id only;
     /// never credentials on C2.
     UnknownNetworkAllowlist,
+    /// `browser_profile_id` set while feature `dig2-station-probe` is on, but
+    /// the cheap station probe cannot run on this platform (dig2browser
+    /// named-pipe IPC is Windows-first; no unix socket path yet) or the
+    /// configured pipe suffix is invalid. Plan
+    /// `dig2browser-station-probe-and-network-permit-set-2026-10-02.md` Track A.
+    /// Never cookies / OAuth on C2.
+    BrowserStationProbeUnavailable,
+    /// `browser_profile_id` set, probe feature on, and the local
+    /// dig2browser-station named-pipe path is missing or not connectable.
+    /// Path reachability only — no session import / cookie frames. Bind/lease
+    /// remains a later tip.
+    BrowserStationUnreachable,
     BundleBindingMismatch,
     EnvironmentProfileBindingMismatch,
     BundleMaterializationFailed,

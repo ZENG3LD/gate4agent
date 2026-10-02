@@ -291,6 +291,12 @@ impl From<&NodeFailure> for C2NodeFailure {
             NodeFailureCode::UnknownNetworkAllowlist => {
                 "network allowlist unavailable"
             }
+            NodeFailureCode::BrowserStationProbeUnavailable => {
+                "dig2browser station probe unavailable on this platform"
+            }
+            NodeFailureCode::BrowserStationUnreachable => {
+                "dig2browser station unreachable"
+            }
             NodeFailureCode::BundleBindingMismatch => {
                 "session bundle binding mismatch"
             }

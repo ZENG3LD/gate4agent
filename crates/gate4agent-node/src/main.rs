@@ -154,7 +154,7 @@ async fn main() {
             "--no-default-history" => {}
             // Station network allowlist catalog file (opaque ids, one per line).
             // Empty/unset keeps the empty-default catalog (unknown ids refuse).
-            // Dig2browser dig2 probe remains stubbed — this flag is network ids only.
+            // Dig2 station probe is a separate optional feature — this flag is network ids only.
             "--network-allowlist-catalog" => {
                 let value = PathBuf::from(required_value("--network-allowlist-catalog", args.next()));
                 if network_allowlist_catalog.replace(value).is_some() {
@@ -217,7 +217,7 @@ async fn main() {
     };
     let config = config.with_session_record_retention(session_record_retention);
     // Station network allowlist catalog: CLI path wins, else env path, else empty.
-    // Dig2browser dig2 probe stays stubbed. Never print GATE4AGENT_NODE_TOKEN.
+    // Dig2 station probe is optional (`dig2-station-probe`). Never print GATE4AGENT_NODE_TOKEN.
     let allowlist_catalog = resolve_network_allowlist_catalog(network_allowlist_catalog)
         .unwrap_or_else(|error| fail(&error.to_string()));
     let config = config

@@ -29,6 +29,8 @@ mod workspace_file_windows;
 mod workspace_file_unix;
 
 mod network_allowlist_catalog;
+#[cfg(feature = "dig2-station-probe")]
+mod dig2_station_probe;
 mod platform;
 mod provider_runtime;
 mod spawn_spec;

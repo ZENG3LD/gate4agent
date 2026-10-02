@@ -3607,6 +3607,33 @@ impl NodeShared {
                 ));
             }
         }
+        // Station knobs Track A (dig2browser-station-probe-and-network-permit-set):
+        // when feature `dig2-station-probe` is on and browser_profile_id is set,
+        // cheap named-pipe path reachability must succeed (Windows
+        // `\\.\pipe\{suffix}`); platform-unsupported or unreachable → clear
+        // NodeFailureCode. Runs even without environment_profile_id (same
+        // placement spirit as allowlist catalog). Feature off keeps stub echo.
+        // Never cookies / OAuth / proxy credentials. Bind/lease still stubbed.
+        #[cfg(feature = "dig2-station-probe")]
+        if resolved.browser_profile_id.is_some() {
+            use crate::dig2_station_probe::{probe_station_reachable, StationProbeError};
+            match probe_station_reachable() {
+                Ok(()) => {}
+                Err(StationProbeError::UnsupportedPlatform)
+                | Err(StationProbeError::InvalidPipeSuffix) => {
+                    return Err(failure(
+                        NodeFailureCode::BrowserStationProbeUnavailable,
+                        "dig2browser station probe unavailable on this platform",
+                    ));
+                }
+                Err(StationProbeError::Unreachable) => {
+                    return Err(failure(
+                        NodeFailureCode::BrowserStationUnreachable,
+                        "dig2browser station named-pipe is unreachable",
+                    ));
+                }
+            }
+        }
         let Some(profile_id) = resolved.environment_profile_id.as_ref() else {
             return Ok(None);
         };
@@ -3628,15 +3655,9 @@ impl NodeShared {
                 "spawn environment profile does not match the provider and mode",
             ));
         }
-        // Station knobs (plan station-network-and-browser-profile-knobs §4.3):
-        // echo opaque network_allowlist / browser_profile_id onto the receipt
-        // after catalog enforce above. Empty/whitespace ids already refuse at
-        // Spawn*Id construction. Dig2browser-station reachability: **no cheap
-        // local probe exists in gate4agent** (station client lives in
-        // dig2browser named-pipe IPC and is not a g4a dependency). Do **not**
-        // refuse when browser_profile_id is set but station is unreachable
-        // until such a probe lands — browser_profile dig2 probe remains stub.
-        // Never put cookies / OAuth / proxy credentials on C2.
+        // Echo opaque network_allowlist / browser_profile_id onto the receipt
+        // after catalog + optional dig2 probe above. Empty/whitespace ids
+        // already refuse at Spawn*Id construction.
         Ok(Some(ResolvedEnvironmentProfileReceipt {
             profile_id: binding.id.clone(),
             profile_revision: binding.revision.clone(),
@@ -16518,6 +16539,10 @@ fn node_failure_category(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::TurnInFlight => "turn-in-flight",
         NodeFailureCode::UnknownEnvironmentProfile => "unknown-environment-profile",
         NodeFailureCode::UnknownNetworkAllowlist => "unknown-network-allowlist",
+        NodeFailureCode::BrowserStationProbeUnavailable => {
+            "browser-station-probe-unavailable"
+        }
+        NodeFailureCode::BrowserStationUnreachable => "browser-station-unreachable",
         NodeFailureCode::EnvironmentProfileBindingMismatch => {
             "environment-profile-binding-mismatch"
         }
@@ -17202,7 +17227,7 @@ mod station_knobs_resolve_tests {
     }
 
     /// Empty-default catalog refuses unknown network_allowlist ids.
-    /// Dig2browser station reachability refuse stays stubbed.
+    /// Feature-off dig2-station-probe keeps browser_profile stub echo.
     #[test]
     fn resolve_environment_profile_refuses_unknown_network_allowlist() {
         let (shared, defaults) = station_knobs_fixture();
@@ -17235,13 +17260,16 @@ mod station_knobs_resolve_tests {
         assert_eq!(failure.code, NodeFailureCode::UnknownNetworkAllowlist);
     }
 
-    /// Registered network_allowlist + browser_profile_id echo onto the
-    /// env-profile receipt. Empty catalog still allows omit (None). Empty/
-    /// whitespace refuse is type-level. Dig2browser dig2 probe remains stub.
+    /// Registered network_allowlist (+ browser_profile_id when feature off)
+    /// echo onto the env-profile receipt. Empty catalog still allows omit
+    /// (None). Empty/whitespace refuse is type-level. Feature-off
+    /// dig2-station-probe keeps stub browser echo; feature-on refuse is
+    /// covered by `…_refuses_browser_profile_when_station_probe_fails`.
     #[test]
     fn resolve_environment_profile_echoes_registered_station_network_and_browser_knobs() {
         let (shared, defaults) = station_knobs_fixture();
         let allowlist = crate::protocol::SpawnNetworkAllowlistId::new("egress-default").unwrap();
+        #[cfg(not(feature = "dig2-station-probe"))]
         let browser = crate::protocol::SpawnBrowserProfileId::new("station-profile-a").unwrap();
         shared
             .network_allowlist_catalog
@@ -17258,6 +17286,7 @@ mod station_knobs_resolve_tests {
             expected_profile_revision: defaults.revision.clone(),
             overrides: crate::protocol::SpawnOverrides {
                 network_allowlist: Some(allowlist.clone()),
+                #[cfg(not(feature = "dig2-station-probe"))]
                 browser_profile_id: Some(browser.clone()),
                 ..crate::protocol::SpawnOverrides::default()
             },
@@ -17268,13 +17297,17 @@ mod station_knobs_resolve_tests {
         };
         let resolved = spec.resolve(&defaults).unwrap();
         assert_eq!(resolved.network_allowlist.as_ref(), Some(&allowlist));
+        #[cfg(not(feature = "dig2-station-probe"))]
         assert_eq!(resolved.browser_profile_id.as_ref(), Some(&browser));
         let receipt = shared
             .resolve_environment_profile(&resolved)
             .expect("resolve ok")
             .expect("env profile present");
         assert_eq!(receipt.network_allowlist.as_ref(), Some(&allowlist));
+        #[cfg(not(feature = "dig2-station-probe"))]
         assert_eq!(receipt.browser_profile_id.as_ref(), Some(&browser));
+        #[cfg(feature = "dig2-station-probe")]
+        assert_eq!(receipt.browser_profile_id, None);
         assert_eq!(receipt.profile_id.as_str(), "local-claude");
 
         let omitted = crate::protocol::SpawnSpec {
@@ -17292,8 +17325,89 @@ mod station_knobs_resolve_tests {
         assert_eq!(bare.browser_profile_id, None);
     }
 
+    /// Feature `dig2-station-probe`: browser_profile_id set refuses when the
+    /// cheap station probe cannot succeed. On non-Windows (this CI host) that
+    /// is `BrowserStationProbeUnavailable`. Never cookies on C2. Bind still stub.
+    #[cfg(feature = "dig2-station-probe")]
+    #[test]
+    fn resolve_environment_profile_refuses_browser_profile_when_station_probe_fails() {
+        let (shared, defaults) = station_knobs_fixture();
+        let browser = crate::protocol::SpawnBrowserProfileId::new("station-profile-a").unwrap();
+        let spec = crate::protocol::SpawnSpec {
+            target: crate::protocol::SpawnTarget {
+                node_id: shared.node_id.clone(),
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: defaults.profile_id.clone(),
+            expected_profile_revision: defaults.revision.clone(),
+            overrides: crate::protocol::SpawnOverrides {
+                browser_profile_id: Some(browser),
+                ..crate::protocol::SpawnOverrides::default()
+            },
+            deadline_ms: crate::protocol::SpawnDeadlineMs::new(30_000).unwrap(),
+            idempotency_key: crate::protocol::SpawnIdempotencyKey::new(
+                "station-knobs-probe-refuse",
+            )
+            .unwrap(),
+            required_capabilities: crate::protocol::SpawnRequiredCapabilities::default(),
+        };
+        let resolved = spec.resolve(&defaults).unwrap();
+        let failure = shared
+            .resolve_environment_profile(&resolved)
+            .expect_err("browser_profile with failing probe must refuse");
+        #[cfg(windows)]
+        {
+            assert!(
+                matches!(
+                    failure.code,
+                    NodeFailureCode::BrowserStationUnreachable
+                        | NodeFailureCode::BrowserStationProbeUnavailable
+                ),
+                "unexpected code {:?}",
+                failure.code
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                failure.code,
+                NodeFailureCode::BrowserStationProbeUnavailable
+            );
+        }
+    }
+
+    /// Feature on: omitting browser_profile_id still resolves (no probe).
+    #[cfg(feature = "dig2-station-probe")]
+    #[test]
+    fn resolve_environment_profile_skips_station_probe_when_browser_profile_omitted() {
+        let (shared, defaults) = station_knobs_fixture();
+        let spec = crate::protocol::SpawnSpec {
+            target: crate::protocol::SpawnTarget {
+                node_id: shared.node_id.clone(),
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: defaults.profile_id.clone(),
+            expected_profile_revision: defaults.revision.clone(),
+            overrides: crate::protocol::SpawnOverrides::default(),
+            deadline_ms: crate::protocol::SpawnDeadlineMs::new(30_000).unwrap(),
+            idempotency_key: crate::protocol::SpawnIdempotencyKey::new(
+                "station-knobs-probe-omit",
+            )
+            .unwrap(),
+            required_capabilities: crate::protocol::SpawnRequiredCapabilities::default(),
+        };
+        let resolved = spec.resolve(&defaults).unwrap();
+        let receipt = shared
+            .resolve_environment_profile(&resolved)
+            .expect("omit browser_profile must not probe")
+            .expect("env profile present");
+        assert_eq!(receipt.browser_profile_id, None);
+    }
+
     /// Startup file loader registers ids into the empty-default catalog.
-    /// Dig2browser dig2 probe remains stub. Never secrets on C2.
+    /// Feature-off dig2 probe stays stub. Never secrets on C2.
     #[test]
     fn network_allowlist_catalog_loads_from_temp_file() {
         let unique = std::time::SystemTime::now()
@@ -17350,7 +17464,7 @@ mod station_knobs_resolve_tests {
     }
 
     /// Snapshot launch inventory echoes registered catalog ids (opaque).
-    /// Dig2browser dig2 probe remains stub. Never secrets on C2.
+    /// Dig2 station probe is orthogonal (feature `dig2-station-probe`). Never secrets on C2.
     #[test]
     fn snapshot_launch_inventory_lists_network_allowlist_catalog_ids() {
         let (shared, _defaults) = station_knobs_fixture();

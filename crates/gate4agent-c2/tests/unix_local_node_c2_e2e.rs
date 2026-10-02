@@ -604,7 +604,9 @@ async fn unix_c2_control_register_workspace_survives_durable_restart() {
 }
 
 /// Control-harden tip: UnregisterWorkspace via C2 must persist across durable
-/// restart, and fail closed for unknown / last workspace + C2-owned controller.
+/// restart, and fail closed for unknown / last workspace / InvalidWorkspaceRoot
+/// + C2-owned controller. Box docker-pair recipe (`g4a-docker-smoke`, phases
+/// `control-harden` + `control-harden-restore`) mirrors this over call-home.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unix_c2_control_unregister_workspace_survives_durable_restart_and_fail_closed() {
     let sockets = PrivateSocketDir::new();

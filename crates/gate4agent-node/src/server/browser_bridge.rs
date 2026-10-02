@@ -9,12 +9,24 @@
 //! Observe projection (tip 3): slim per-session inventory over WS / HTTP
 //! snapshot — address, status, screen kind, opaque browser_profile_id when
 //! bound. No terminal_frame contents, history messages, cookies, or tokens.
+//!
+//! Drive (tip 4): optional `POST /bridge/drive` maps a small NodeRequest
+//! subset (`prompt` / `paste`) through the node envelope
+//! (`dispatch_input_bounded` + runtime policy). Bridge token + loopback are
+//! the auth barrier (not C2 controller lease). No raw PTY bytes / TerminalBytes
+//! / cookies / OAuth as product API.
 
 use super::NodeShared;
-use crate::protocol::BUILD_STAMP;
-use gate4agent_types::{
-    PreparedInputKind, PtyScreenState, SessionSnapshot, SessionStatus, TerminalSize,
+use crate::protocol::{
+    BUILD_STAMP, MAX_NODE_TEXT_BYTES, NodeFailure, NodeFailureCode, SessionAddress, SessionKey,
+    WorkspaceId,
 };
+use crate::provider_runtime::ProviderRuntimeRequirement;
+use gate4agent_types::{
+    AgentInstanceId, InputAction, PreparedInputKind, PromptFraming, PromptPayload, PtyScreenState,
+    SessionGeneration, SessionSnapshot, SessionStatus, TerminalSize,
+};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io;
 use std::net::SocketAddr;
@@ -32,6 +44,9 @@ const HEADER_LIMIT_BYTES: usize = 16 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(3);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_BRIDGE_CONNECTIONS: usize = 8;
+/// JSON envelope overhead budget on top of `MAX_NODE_TEXT_BYTES` for drive POST.
+const BRIDGE_DRIVE_BODY_OVERHEAD: usize = 1_024;
+const MAX_BRIDGE_DRIVE_BODY_BYTES: usize = MAX_NODE_TEXT_BYTES + BRIDGE_DRIVE_BODY_OVERHEAD;
 /// RFC6455 GUID for `Sec-WebSocket-Accept`.
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -161,6 +176,10 @@ async fn serve_connection(
         return handle_websocket_upgrade(stream, request, &auth, &shared).await;
     }
 
+    if path_only == "/bridge/drive" {
+        return handle_drive(&mut stream, request, &auth, &shared).await;
+    }
+
     if request.method != "GET" {
         return write_http(
             &mut stream,
@@ -237,7 +256,7 @@ Sec-WebSocket-Accept: {accept}\r\n\
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bridge ws upgrade write timed out"))??;
 
     // Observe frame: typed hello + slim per-session projections (tip 3).
-    // Streaming push / drive API remain later tips.
+    // Drive is HTTP POST /bridge/drive (tip 4). Streaming push remains later.
     let payload = serde_json::to_vec(&observe_frame(shared)).map_err(|error| {
         io::Error::new(io::ErrorKind::InvalidData, error)
     })?;
@@ -311,7 +330,7 @@ fn observe_frame(shared: &NodeShared) -> Value {
                 "native_pty": native_pty_sessions,
             },
             "session_projections": session_projections,
-            "note": "slim session projection; drive/streaming/mesh underlay later",
+            "note": "slim session projection; drive via POST /bridge/drive (prompt|paste); streaming push/mesh later",
         },
         "node_id": shared.node_id,
         "incarnation_id": shared.incarnation_id,
@@ -440,6 +459,239 @@ fn truncate_chars(value: &str, max: usize) -> String {
     out
 }
 
+/// Tip-4 drive envelope: only prompt/paste through node request types.
+/// Never TerminalBytes / raw PTY / cookies / OAuth.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum BridgeDriveRequest {
+    Prompt {
+        workspace_id: String,
+        instance_id: u64,
+        generation: u64,
+        text: String,
+    },
+    Paste {
+        workspace_id: String,
+        instance_id: u64,
+        generation: u64,
+        text: String,
+    },
+}
+
+impl BridgeDriveRequest {
+    fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Prompt { .. } => "prompt",
+            Self::Paste { .. } => "paste",
+        }
+    }
+
+    fn parts(&self) -> (&str, u64, u64, &str) {
+        match self {
+            Self::Prompt {
+                workspace_id,
+                instance_id,
+                generation,
+                text,
+            }
+            | Self::Paste {
+                workspace_id,
+                instance_id,
+                generation,
+                text,
+            } => (workspace_id.as_str(), *instance_id, *generation, text.as_str()),
+        }
+    }
+}
+
+async fn handle_drive(
+    stream: &mut TcpStream,
+    request: Request,
+    auth: &BridgeAuth,
+    shared: &NodeShared,
+) -> io::Result<()> {
+    if request.method != "POST" {
+        return write_http(
+            stream,
+            HttpResponse::plain(405, "Method Not Allowed").with_header("Allow", "POST"),
+        )
+        .await;
+    }
+
+    let provided = extract_bridge_token(&request);
+    if !auth.authorized(provided.as_deref()) {
+        return write_http(
+            stream,
+            HttpResponse::plain(401, "Unauthorized").with_header("WWW-Authenticate", "Bearer"),
+        )
+        .await;
+    }
+
+    let body = match read_http_body(stream, &request).await {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => {
+            return write_http(stream, HttpResponse::plain(413, "Payload Too Large")).await;
+        }
+        Err(BodyReadError::Invalid) => {
+            return write_http(stream, HttpResponse::plain(400, "Bad Request")).await;
+        }
+        Err(BodyReadError::Io(error)) => return Err(error),
+        Err(BodyReadError::TimedOut) => return Ok(()),
+    };
+
+    let drive = match serde_json::from_slice::<BridgeDriveRequest>(&body) {
+        Ok(drive) => drive,
+        Err(_) => {
+            return write_http(
+                stream,
+                HttpResponse::json(
+                    400,
+                    json!({
+                        "ok": false,
+                        "type": "drive.error",
+                        "code": "invalid-request",
+                        "message": "drive body must be JSON prompt|paste with session address + text",
+                    }),
+                ),
+            )
+            .await;
+        }
+    };
+
+    let response = match execute_bridge_drive(shared, drive).await {
+        Ok(kind) => HttpResponse::json(
+            200,
+            json!({
+                "ok": true,
+                "type": "drive.accepted",
+                "kind": kind,
+                "door": "node-envelope-bridge",
+            }),
+        ),
+        Err(error) => HttpResponse::json(
+            drive_http_status(error.code),
+            json!({
+                "ok": false,
+                "type": "drive.error",
+                "code": error.code,
+                "message": error.message,
+                "door": "node-envelope-bridge",
+            }),
+        ),
+    };
+    write_http(stream, response).await
+}
+
+async fn execute_bridge_drive(
+    shared: &NodeShared,
+    drive: BridgeDriveRequest,
+) -> Result<&'static str, NodeFailure> {
+    let kind = drive.kind_label();
+    let (workspace_id_raw, instance_id, generation, text) = drive.parts();
+    if text.is_empty() {
+        return Err(super::failure(
+            NodeFailureCode::InvalidRequest,
+            "drive text must be non-empty",
+        ));
+    }
+    if text.len() > MAX_NODE_TEXT_BYTES {
+        return Err(super::failure(
+            NodeFailureCode::InvalidRequest,
+            "drive text exceeds the node text byte limit",
+        ));
+    }
+    // Mirror NodeRequest::Prompt/Paste validate_node_text without logging the text.
+    super::validate_node_text(kind, text)?;
+
+    let workspace_id = WorkspaceId::new(workspace_id_raw).map_err(|_| {
+        super::failure(
+            NodeFailureCode::InvalidRequest,
+            "workspace_id is not a valid node identifier",
+        )
+    })?;
+    let session = SessionAddress {
+        workspace_id,
+        session: SessionKey {
+            instance_id: AgentInstanceId(instance_id),
+            generation: SessionGeneration(generation),
+        },
+    };
+
+    // Bridge door auth is loopback + optional BRIDGE_TOKEN — not C2 controller.
+    let agent_id = shared.validate_address(&session)?;
+    shared.require_session_runtime_policy(
+        &session,
+        ProviderRuntimeRequirement::SemanticPrompt,
+    )?;
+
+    let action = match kind {
+        "prompt" => InputAction::SubmitPrompt(PromptPayload {
+            text: text.to_owned(),
+            framing: super::prompt_framing(&agent_id),
+        }),
+        "paste" => InputAction::InsertDraft(PromptPayload {
+            text: text.to_owned(),
+            framing: PromptFraming::BracketedPaste,
+        }),
+        _ => {
+            return Err(super::failure(
+                NodeFailureCode::InvalidRequest,
+                "unsupported drive kind",
+            ));
+        }
+    };
+    shared.dispatch_input_bounded(&session, action).await?;
+    Ok(kind)
+}
+
+fn drive_http_status(code: NodeFailureCode) -> u16 {
+    match code {
+        NodeFailureCode::UnknownSession | NodeFailureCode::UnknownWorkspace => 404,
+        NodeFailureCode::StaleGeneration
+        | NodeFailureCode::SessionWorkspaceMismatch
+        | NodeFailureCode::TurnInFlight => 409,
+        NodeFailureCode::UnsupportedCapability => 422,
+        NodeFailureCode::BackendBusy => 503,
+        NodeFailureCode::BackendOperationFailed => 502,
+        NodeFailureCode::Unauthorized | NodeFailureCode::ControllerRequired => 401,
+        _ => 400,
+    }
+}
+
+enum BodyReadError {
+    TooLarge,
+    Invalid,
+    TimedOut,
+    Io(io::Error),
+}
+
+async fn read_http_body(stream: &mut TcpStream, request: &Request) -> Result<Vec<u8>, BodyReadError> {
+    let Some(content_length) = request.content_length else {
+        return Err(BodyReadError::Invalid);
+    };
+    if content_length > MAX_BRIDGE_DRIVE_BODY_BYTES {
+        return Err(BodyReadError::TooLarge);
+    }
+    let mut body = Vec::with_capacity(content_length);
+    body.extend_from_slice(&request.body_prefix);
+    if body.len() > content_length {
+        return Err(BodyReadError::Invalid);
+    }
+    while body.len() < content_length {
+        let mut chunk = vec![0u8; (content_length - body.len()).min(4_096)];
+        match timeout(HEADER_READ_TIMEOUT, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => return Err(BodyReadError::Invalid),
+            Ok(Ok(read)) => body.extend_from_slice(&chunk[..read]),
+            Ok(Err(error)) => return Err(BodyReadError::Io(error)),
+            Err(_) => return Err(BodyReadError::TimedOut),
+        }
+        if body.len() > content_length {
+            return Err(BodyReadError::Invalid);
+        }
+    }
+    Ok(body)
+}
+
 fn extract_bridge_token(request: &Request) -> Option<String> {
     if let Some(header) = request.authorization.as_deref() {
         let bearer = header
@@ -555,6 +807,9 @@ struct Request {
     connection: Option<String>,
     sec_websocket_key: Option<String>,
     sec_websocket_version: Option<String>,
+    content_length: Option<usize>,
+    /// Bytes already read past the header terminator (may be empty).
+    body_prefix: Vec<u8>,
 }
 
 enum ReadRequestError {
@@ -585,7 +840,8 @@ async fn read_request(stream: &mut TcpStream) -> Result<Request, ReadRequestErro
         if let Some(header_end) = find_header_end(&buffer) {
             let header = std::str::from_utf8(&buffer[..header_end])
                 .map_err(|_| ReadRequestError::Invalid)?;
-            return parse_request(header);
+            let body_prefix = buffer[header_end..].to_vec();
+            return parse_request(header, body_prefix);
         }
     }
 }
@@ -594,7 +850,7 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n").map(|index| index + 4)
 }
 
-fn parse_request(header: &str) -> Result<Request, ReadRequestError> {
+fn parse_request(header: &str, body_prefix: Vec<u8>) -> Result<Request, ReadRequestError> {
     let mut lines = header.split("\r\n");
     let request_line = lines.next().ok_or(ReadRequestError::Invalid)?;
     let mut parts = request_line.split_whitespace();
@@ -610,6 +866,7 @@ fn parse_request(header: &str) -> Result<Request, ReadRequestError> {
     let mut connection = None;
     let mut sec_websocket_key = None;
     let mut sec_websocket_version = None;
+    let mut content_length = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -631,6 +888,14 @@ fn parse_request(header: &str) -> Result<Request, ReadRequestError> {
             sec_websocket_key = Some(value);
         } else if name.eq_ignore_ascii_case("Sec-WebSocket-Version") {
             sec_websocket_version = Some(value);
+        } else if name.eq_ignore_ascii_case("Content-Length") {
+            let parsed = value
+                .parse::<usize>()
+                .map_err(|_| ReadRequestError::Invalid)?;
+            if parsed > MAX_BRIDGE_DRIVE_BODY_BYTES {
+                return Err(ReadRequestError::TooLarge);
+            }
+            content_length = Some(parsed);
         }
     }
     Ok(Request {
@@ -642,6 +907,8 @@ fn parse_request(header: &str) -> Result<Request, ReadRequestError> {
         connection,
         sec_websocket_key,
         sec_websocket_version,
+        content_length,
+        body_prefix,
     })
 }
 
@@ -687,8 +954,11 @@ fn reason_phrase(status: u16) -> &'static str {
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         413 => "Payload Too Large",
+        422 => "Unprocessable Entity",
         426 => "Upgrade Required",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Error",
     }
@@ -1011,6 +1281,7 @@ Sec-WebSocket-Version: 13\r\n\
         assert!(body.contains("\"type\":\"bridge.hello\""));
         assert!(body.contains("\"session_projections\":[]"));
         assert!(body.contains("slim session projection"));
+        assert!(body.contains("POST /bridge/drive"));
         assert!(!body.contains("test-token"));
         assert!(!body.contains("terminal_frame"));
 
@@ -1020,5 +1291,172 @@ Sec-WebSocket-Version: 13\r\n\
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    fn drive_post(body: &str) -> String {
+        format!(
+            "POST /bridge/drive HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    #[test]
+    fn bridge_drive_request_parses_prompt_and_paste_only() {
+        let prompt: BridgeDriveRequest = serde_json::from_str(
+            r#"{"kind":"prompt","workspace_id":"ws","instance_id":1,"generation":2,"text":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!(prompt.kind_label(), "prompt");
+        let paste: BridgeDriveRequest = serde_json::from_str(
+            r#"{"kind":"paste","workspace_id":"ws","instance_id":1,"generation":2,"text":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!(paste.kind_label(), "paste");
+        // Refuse raw terminal / unknown kinds — not a product drive surface.
+        assert!(serde_json::from_str::<BridgeDriveRequest>(
+            r#"{"kind":"terminal-bytes","workspace_id":"ws","instance_id":1,"generation":2,"text":"x"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<BridgeDriveRequest>(
+            r#"{"kind":"input","workspace_id":"ws","instance_id":1,"generation":2,"text":"x"}"#
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn bridge_drive_get_is_method_not_allowed() {
+        let server = node_server();
+        let shared = Arc::clone(&server.shared);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = BridgeAuth::from_optional(None).unwrap();
+        let task = tokio::spawn(serve_listener(listener, auth, Arc::clone(&shared)));
+
+        let body = http_text(
+            address,
+            "GET /bridge/drive HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(
+            body.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+            "unexpected: {body}"
+        );
+        assert!(body.contains("Allow: POST"));
+
+        server.shutdown_handle().request_shutdown().await.unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bridge_drive_rejects_malformed_and_unknown_session() {
+        let server = node_server();
+        let shared = Arc::clone(&server.shared);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = BridgeAuth::from_optional(None).unwrap();
+        let task = tokio::spawn(serve_listener(listener, auth, Arc::clone(&shared)));
+
+        let bad = http_text(address, &drive_post(r#"{"not":"a-drive"}"#)).await;
+        assert!(
+            bad.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "unexpected malformed: {bad}"
+        );
+        assert!(bad.contains("\"type\":\"drive.error\""));
+        assert!(!bad.contains("test-token"));
+
+        let missing = http_text(
+            address,
+            &drive_post(
+                r#"{"kind":"prompt","workspace_id":"test","instance_id":99,"generation":1,"text":"hello"}"#,
+            ),
+        )
+        .await;
+        assert!(
+            missing.starts_with("HTTP/1.1 404 Not Found\r\n")
+                || missing.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "unexpected unknown-session: {missing}"
+        );
+        assert!(missing.contains("\"type\":\"drive.error\""));
+        assert!(
+            missing.contains("unknown-session") || missing.contains("unknown-workspace"),
+            "expected session/workspace failure code: {missing}"
+        );
+        assert!(!missing.contains("GATE4AGENT"));
+
+        let empty = http_text(
+            address,
+            &drive_post(
+                r#"{"kind":"paste","workspace_id":"test","instance_id":1,"generation":1,"text":""}"#,
+            ),
+        )
+        .await;
+        assert!(
+            empty.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "unexpected empty text: {empty}"
+        );
+
+        server.shutdown_handle().request_shutdown().await.unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bridge_drive_token_gate_rejects_missing_secret() {
+        let server = node_server();
+        let shared = Arc::clone(&server.shared);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = BridgeAuth::from_optional(Some("bridge-secret".into())).unwrap();
+        let task = tokio::spawn(serve_listener(listener, auth, Arc::clone(&shared)));
+
+        let denied = http_text(
+            address,
+            &drive_post(
+                r#"{"kind":"prompt","workspace_id":"test","instance_id":1,"generation":1,"text":"x"}"#,
+            ),
+        )
+        .await;
+        assert!(
+            denied.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+            "unexpected: {denied}"
+        );
+        assert!(!denied.contains("bridge-secret"));
+
+        let drive_body =
+            r#"{"kind":"prompt","workspace_id":"test","instance_id":1,"generation":1,"text":"x"}"#;
+        let authorized = format!(
+            "POST /bridge/drive HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer bridge-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            drive_body.len(),
+            drive_body
+        );
+        let okish = http_text(address, &authorized).await;
+        // Auth passed; session still missing → drive.error, never leaks token.
+        assert!(!okish.starts_with("HTTP/1.1 401 "), "auth should pass: {okish}");
+        assert!(okish.contains("\"type\":\"drive.error\""));
+        assert!(!okish.contains("bridge-secret"));
+
+        server.shutdown_handle().request_shutdown().await.unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn drive_http_status_maps_node_failure_codes() {
+        assert_eq!(drive_http_status(NodeFailureCode::UnknownSession), 404);
+        assert_eq!(drive_http_status(NodeFailureCode::StaleGeneration), 409);
+        assert_eq!(drive_http_status(NodeFailureCode::UnsupportedCapability), 422);
+        assert_eq!(drive_http_status(NodeFailureCode::BackendBusy), 503);
+        assert_eq!(drive_http_status(NodeFailureCode::InvalidRequest), 400);
     }
 }

@@ -2204,15 +2204,27 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         let (delivery_store, delivered_bundles) = match config.state_path.as_ref() {
             Some(state_path) => {
                 let delivery_root = delivery_store_root_for_state_path(state_path)
-                    .ok_or(NodeServerError::DeliveryStore)?;
-                let (store, bundles) = DeliveryStore::open(delivery_root)
-                    .map_err(|_| NodeServerError::DeliveryStore)?;
+                    .ok_or_else(|| {
+                        NodeServerError::DeliveryStore(
+                            "delivery store root could not be derived from state path".to_owned(),
+                        )
+                    })?;
+                let (store, bundles) = DeliveryStore::open(delivery_root).map_err(|error| {
+                    let detail = match &error {
+                        DeliveryStoreError::Storage(io_error) => {
+                            format!("{error}: {io_error}")
+                        }
+                        _ => error.to_string(),
+                    };
+                    NodeServerError::DeliveryStore(detail)
+                })?;
                 (Some(store), bundles)
             }
             None => (None, Vec::new()),
         };
-        let delivered_catalog = BundleCatalog::new(delivered_bundles)
-            .map_err(|_| NodeServerError::DeliveryStore)?;
+        let delivered_catalog = BundleCatalog::new(delivered_bundles).map_err(|error| {
+            NodeServerError::DeliveryStore(format!("bundle catalog: {error}"))
+        })?;
         let (context_pack_store, durable_context_packs) = match config.state_path.as_ref() {
             Some(state_path) => {
                 let context_pack_root = context_pack_store_root_for_state_path(state_path)
@@ -2539,6 +2551,18 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
                 }
             }
         };
+        // Persistence gap fix: durable DeliveryStore / ContextPackStore hold
+        // exclusive flock (Unix) / share-mode locks (Windows) inside NodeShared.
+        // NodeShutdownHandle also clones that Arc, so without an explicit release
+        // here a supervisor that keeps the shutdown handle cannot reopen the same
+        // state path after run() returns (EAGAIN / Resource temporarily unavailable).
+        // StatePathLock already drops with this stack frame (`_state_path_lock`).
+        if let Ok(mut guard) = shared.delivery_store.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = shared.context_pack_store.lock() {
+            *guard = None;
+        }
         result
     }
 }
@@ -17129,8 +17153,8 @@ pub enum NodeServerError {
     SessionEnvironmentMaterializer,
     #[error("node bundle catalog is invalid: {0}")]
     BundleCatalog(String),
-    #[error("node delivery store failed to initialize")]
-    DeliveryStore,
+    #[error("node delivery store failed to initialize: {0}")]
+    DeliveryStore(String),
     #[error("node context pack store failed to initialize")]
     ContextPackStore,
     #[error("active agent registry failed: {0}")]

@@ -425,3 +425,180 @@ async fn unix_real_two_node_c2_routes_control_survives_restart_and_releases_node
     assert!(!Path::new(&endpoint_a).exists());
     assert!(!Path::new(&endpoint_b).exists());
 }
+
+/// Persistence gap tip: RegisterWorkspace via C2 control must survive a node
+/// durable-state restart on Linux (Windows already covers session-record
+/// resume; the prior unix restart e2e used `new_fixture` without a state
+/// path, so registered workspaces were never claimed to persist).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unix_c2_control_register_workspace_survives_durable_restart() {
+    let sockets = PrivateSocketDir::new();
+    let endpoint = sockets.endpoint("node.sock");
+    let control_endpoint = sockets.endpoint("c2.sock");
+    let added_workspace = sockets.directory("relay-added");
+    let state_dir = sockets.directory("durable-state");
+    // DeliveryStore + durable-state lock require owner-only 0700 parents.
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let state_path = state_dir.join("state-v1.json");
+    let id = NodeId::new("fixture-durable-01").unwrap();
+    let token = "node-durable-token";
+    let c2_token = "c2-durable-token";
+
+    let config = node_config(&id, &endpoint, token)
+        .with_state_path(&state_path)
+        .unwrap();
+    let server = NodeServer::new_fixture(config).expect("initial durable fixture");
+    let mut shutdown = server.shutdown_handle();
+    let mut task = tokio::spawn(server.run());
+
+    let timings = C2Timings {
+        poll_interval: Duration::from_millis(20),
+        fresh_for: Duration::from_secs(1),
+        attempt_deadline: Duration::from_millis(500),
+        transient_backoffs: [Duration::from_millis(20); 5],
+        parked_backoff: Duration::from_millis(100),
+        http_io_deadline: Duration::from_secs(1),
+    };
+    let c2_config = C2Config::new(
+        "127.0.0.1:0".parse().unwrap(),
+        c2_token,
+        vec![C2NodeConfig::new(id.clone(), endpoint.clone(), token).unwrap()],
+    )
+    .unwrap()
+    .with_control_endpoint(control_endpoint.clone())
+    .unwrap()
+    .with_timings(timings);
+    let running = C2Running::start(c2_config).await.unwrap();
+    let http = C2Client::new(running.api_addr(), c2_token)
+        .unwrap()
+        .with_deadline(Duration::from_secs(1));
+    let initial = wait_status(&http, |status| {
+        status.ready
+            && status
+                .nodes
+                .get(&id)
+                .is_some_and(|node| node.transport == NodeTransportState::Online)
+    })
+    .await;
+
+    let (control, _events) = timeout(
+        Duration::from_secs(5),
+        connect_local(&control_endpoint, c2_token),
+    )
+    .await
+    .expect("C2 control UDS became available")
+    .unwrap();
+
+    let stale_route = route(&initial, &id);
+    let added_id = WorkspaceId::new("relay-added").unwrap();
+    let registered = control
+        .request(
+            stale_route.clone(),
+            NodeRequest::RegisterWorkspace {
+                workspace_id: added_id.clone(),
+                root: OpaqueHostPath::utf8(added_workspace.to_string_lossy().into_owned())
+                    .unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        registered.response,
+        Ok(C2NodeResponse::WorkspaceRegistered { .. })
+    ));
+    wait_status(&http, |status| {
+        status.nodes[&id]
+            .inventory
+            .as_ref()
+            .is_some_and(|inventory| inventory.workspaces.contains_key(&added_id))
+    })
+    .await;
+
+    // Durable file must exist before restart (commit after RegisterWorkspace).
+    assert!(
+        state_path.is_file(),
+        "durable state-v1.json missing after RegisterWorkspace"
+    );
+
+    shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), &mut task)
+        .await
+        .expect("node shutdown timed out")
+        .expect("node task panicked")
+        .expect("node shutdown failed");
+    wait_status(&http, |status| {
+        status.nodes[&id].transport != NodeTransportState::Online
+    })
+    .await;
+
+    // Keep `shutdown` alive across restart on purpose: supervisors retain the
+    // handle. run() must release delivery/context-pack flock before return so
+    // the same state path can reopen (persistence gap fix).
+    let restarted = NodeServer::new_fixture(
+        node_config(&id, &endpoint, token)
+            .with_state_path(&state_path)
+            .unwrap(),
+    )
+    .expect("durable reopen after shutdown must succeed while shutdown handle lives");
+    shutdown = restarted.shutdown_handle();
+    task = tokio::spawn(restarted.run());
+
+    let recovered = wait_status(&http, |status| {
+        status.nodes[&id].transport == NodeTransportState::Online
+            && status.nodes[&id].cursor.is_some_and(|cursor| {
+                cursor.incarnation_id != stale_route.expected_incarnation_id
+            })
+            && status.nodes[&id]
+                .inventory
+                .as_ref()
+                .is_some_and(|inventory| inventory.workspaces.contains_key(&added_id))
+    })
+    .await;
+
+    let stale = control
+        .request(stale_route, NodeRequest::Snapshot)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        C2ControlError::Relay(ref failure)
+            if failure.code == C2RelayFailureCode::StaleNodeIncarnation
+    ));
+
+    let recovered_route = route(&recovered, &id);
+    let snapshot = control
+        .request(recovered_route, NodeRequest::Snapshot)
+        .await
+        .unwrap();
+    match snapshot.response {
+        Ok(C2NodeResponse::Snapshot { snapshot, .. }) => {
+            assert!(
+                snapshot
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.workspace_id == added_id),
+                "durable RegisterWorkspace missing from Snapshot after restart: {:?}",
+                snapshot
+                    .workspaces
+                    .iter()
+                    .map(|workspace| workspace.workspace_id.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                snapshot
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.workspace_id.as_str() == "primary"),
+                "CLI primary workspace missing after durable restart"
+            );
+        }
+        other => panic!("unexpected snapshot after durable restart: {other:?}"),
+    }
+
+    running.shutdown_handle().shutdown();
+    timeout(Duration::from_secs(5), running.wait())
+        .await
+        .expect("C2 shutdown timed out")
+        .expect("C2 shutdown failed");
+    stop_node(shutdown, task).await;
+}

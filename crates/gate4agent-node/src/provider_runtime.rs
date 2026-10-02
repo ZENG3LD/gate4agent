@@ -621,11 +621,13 @@ mod tests {
             std::env::consts::EXE_SUFFIX,
         ));
         std::fs::write(&launcher, b"fixture launcher identity").unwrap();
-        let mut spec = builtin_registry().get_by_id("grok").unwrap().clone();
+        // Use a PTY fleet provider: grok is ACP-native (`pty: false`), so
+        // `raw_pty_lifecycle` stays false even when the launcher exists.
+        let mut spec = builtin_registry().get_by_id("claude").unwrap().clone();
         spec.launch.program = launcher.to_string_lossy().into_owned();
         let catalog = AgentRegistry::new([spec]).unwrap();
         let monitor = ProviderRuntimeMonitor::new(&catalog);
-        let provider = AgentId::new("grok").unwrap();
+        let provider = AgentId::new("claude").unwrap();
 
         let (available, admitted) = monitor.evaluate(&provider);
         let available = available.unwrap();

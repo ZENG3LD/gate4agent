@@ -122,10 +122,13 @@ fn read_child_directories(
             Err(_) => continue,
         };
         let is_link = file_type.is_symlink();
+        // Directory symlinks: `DirEntry::metadata()` may not follow (lstat /
+        // AT_SYMLINK_NOFOLLOW on some Unix targets), so `is_dir()` stays false
+        // for the link itself. Follow via `fs::metadata(path)` instead.
         let is_directory = if file_type.is_dir() {
             true
         } else if is_link {
-            match entry.metadata() {
+            match fs::metadata(entry.path()) {
                 Ok(metadata) => metadata.is_dir(),
                 Err(_) => false,
             }
@@ -378,9 +381,11 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = temporary_directory("link");
-        let target = root.join("target");
-        fs::create_dir(&target).unwrap();
-        symlink(&target, root.join("alias")).unwrap();
+        // Target must live *outside* the browsed directory: sibling
+        // alias+target share one canonical path and dedupe (see
+        // host_directory_page_boundary_deduplicates_canonical_aliases).
+        let outside = temporary_directory("link-outside-target");
+        symlink(&outside, root.join("alias")).unwrap();
         let root_path = OpaqueHostPath::utf8(root.to_string_lossy().into_owned()).unwrap();
 
         let listing = browse_host_directories(Some(root_path), None).unwrap();
@@ -388,5 +393,6 @@ mod tests {
             entry.display_name == "alias" && entry.is_link
         }));
         fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }

@@ -480,11 +480,30 @@ mod tests {
     use crate::{NodeServer, NodeServerConfig, WorkspaceConfig};
     use std::path::PathBuf;
 
+    /// Local endpoint for unit fixtures. Windows named-pipe paths are
+    /// Windows-only (`validate_endpoint`); Unix needs an absolute socket path.
+    fn test_local_endpoint(label: &str) -> String {
+        #[cfg(windows)]
+        {
+            format!(r"\\.\pipe\gate4agent-http-api-{label}")
+        }
+        #[cfg(unix)]
+        {
+            let dir = std::env::temp_dir().join(format!(
+                "g4a-http-api-{}-{}",
+                label,
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join("n.sock").to_string_lossy().into_owned()
+        }
+    }
+
     fn node_server() -> NodeServer {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let workspace = WorkspaceConfig::new(WorkspaceId::new("test").unwrap(), root).unwrap();
         let config = NodeServerConfig::new(
-            r"\\.\pipe\gate4agent-http-api-unit",
+            test_local_endpoint("unit"),
             "test-token",
             NodeId::new("test-node").unwrap(),
             [workspace],
@@ -492,6 +511,7 @@ mod tests {
         .unwrap();
         NodeServer::new(config).unwrap()
     }
+
 
     fn node_server_with_verified_runtime_status() -> NodeServer {
         let mut server = node_server();
@@ -537,7 +557,7 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let workspace = WorkspaceConfig::new(WorkspaceId::new("test").unwrap(), root).unwrap();
         let config = NodeServerConfig::new(
-            r"\\.\pipe\gate4agent-http-api-config",
+            test_local_endpoint("config"),
             "test-token",
             NodeId::new("test-node").unwrap(),
             [workspace],

@@ -6,8 +6,8 @@ use gate4agent_c2::protocol::{
 use gate4agent_c2::{C2Config, C2NodeConfig, C2Running, C2Timings};
 use gate4agent_c2_client::{connect_local, C2Client, C2ControlError};
 use gate4agent_node::protocol::{
-    AgentId, ClientRole, NodeRequest, NodeResponse, OpaqueHostPath, SessionMode,
-    WorkspaceId,
+    AgentId, ClientRole, NodeFailureCode, NodeRequest, NodeResponse, OpaqueHostPath,
+    SessionMode, WorkspaceId,
 };
 use gate4agent_node::{NodeServer, NodeServerConfig, WorkspaceConfig};
 use gate4agent_node_wire::LocalNodeClient;
@@ -593,6 +593,281 @@ async fn unix_c2_control_register_workspace_survives_durable_restart() {
             );
         }
         other => panic!("unexpected snapshot after durable restart: {other:?}"),
+    }
+
+    running.shutdown_handle().shutdown();
+    timeout(Duration::from_secs(5), running.wait())
+        .await
+        .expect("C2 shutdown timed out")
+        .expect("C2 shutdown failed");
+    stop_node(shutdown, task).await;
+}
+
+/// Control-harden tip: UnregisterWorkspace via C2 must persist across durable
+/// restart, and fail closed for unknown / last workspace + C2-owned controller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unix_c2_control_unregister_workspace_survives_durable_restart_and_fail_closed() {
+    let sockets = PrivateSocketDir::new();
+    let endpoint = sockets.endpoint("node.sock");
+    let control_endpoint = sockets.endpoint("c2.sock");
+    let added_workspace = sockets.directory("relay-added");
+    let state_dir = sockets.directory("durable-state");
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let state_path = state_dir.join("state-v1.json");
+    let id = NodeId::new("fixture-control-harden-01").unwrap();
+    let token = "node-control-harden-token";
+    let c2_token = "c2-control-harden-token";
+
+    let config = node_config(&id, &endpoint, token)
+        .with_state_path(&state_path)
+        .unwrap();
+    let server = NodeServer::new_fixture(config).expect("initial durable fixture");
+    let mut shutdown = server.shutdown_handle();
+    let mut task = tokio::spawn(server.run());
+
+    let timings = C2Timings {
+        poll_interval: Duration::from_millis(20),
+        fresh_for: Duration::from_secs(1),
+        attempt_deadline: Duration::from_millis(500),
+        transient_backoffs: [Duration::from_millis(20); 5],
+        parked_backoff: Duration::from_millis(100),
+        http_io_deadline: Duration::from_secs(1),
+    };
+    let c2_config = C2Config::new(
+        "127.0.0.1:0".parse().unwrap(),
+        c2_token,
+        vec![C2NodeConfig::new(id.clone(), endpoint.clone(), token).unwrap()],
+    )
+    .unwrap()
+    .with_control_endpoint(control_endpoint.clone())
+    .unwrap()
+    .with_timings(timings);
+    let running = C2Running::start(c2_config).await.unwrap();
+    let http = C2Client::new(running.api_addr(), c2_token)
+        .unwrap()
+        .with_deadline(Duration::from_secs(1));
+    let initial = wait_status(&http, |status| {
+        status.ready
+            && status
+                .nodes
+                .get(&id)
+                .is_some_and(|node| node.transport == NodeTransportState::Online)
+    })
+    .await;
+
+    let (control, _events) = timeout(
+        Duration::from_secs(5),
+        connect_local(&control_endpoint, c2_token),
+    )
+    .await
+    .expect("C2 control UDS became available")
+    .unwrap();
+
+    let route0 = route(&initial, &id);
+    let added_id = WorkspaceId::new("relay-added").unwrap();
+    let primary_id = WorkspaceId::new("primary").unwrap();
+
+    // Fail closed: operators must not steal node controller leases through C2.
+    let forbidden = control
+        .request(
+            route0.clone(),
+            NodeRequest::AcquireController { lease_ms: 5_000 },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            forbidden,
+            C2ControlError::Relay(ref failure)
+                if failure.code == C2RelayFailureCode::RequestForbidden
+        ),
+        "AcquireController must be RequestForbidden via C2, got {forbidden:?}"
+    );
+
+    let registered = control
+        .request(
+            route0.clone(),
+            NodeRequest::RegisterWorkspace {
+                workspace_id: added_id.clone(),
+                root: OpaqueHostPath::utf8(added_workspace.to_string_lossy().into_owned())
+                    .unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        registered.response,
+        Ok(C2NodeResponse::WorkspaceRegistered { .. })
+    ));
+    wait_status(&http, |status| {
+        status.nodes[&id]
+            .inventory
+            .as_ref()
+            .is_some_and(|inventory| inventory.workspaces.contains_key(&added_id))
+    })
+    .await;
+
+    let unregistered = control
+        .request(
+            route0.clone(),
+            NodeRequest::UnregisterWorkspace {
+                workspace_id: added_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        unregistered.response,
+        Ok(C2NodeResponse::WorkspaceUnregistered { .. })
+    ));
+    wait_status(&http, |status| {
+        status.nodes[&id].inventory.as_ref().is_some_and(|inventory| {
+            !inventory.workspaces.contains_key(&added_id)
+                && inventory.workspaces.contains_key(&primary_id)
+        })
+    })
+    .await;
+
+    // Fail closed: unknown id after unregister.
+    let unknown = control
+        .request(
+            route0.clone(),
+            NodeRequest::UnregisterWorkspace {
+                workspace_id: added_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    match unknown.response {
+        Err(failure) => assert_eq!(
+            failure.code,
+            NodeFailureCode::UnknownWorkspace,
+            "expected UnknownWorkspace, got {failure:?}"
+        ),
+        other => panic!("expected UnknownWorkspace after double unregister: {other:?}"),
+    }
+
+    // Fail closed: cannot drop the last (CLI primary) workspace.
+    let last = control
+        .request(
+            route0.clone(),
+            NodeRequest::UnregisterWorkspace {
+                workspace_id: primary_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    match last.response {
+        Err(failure) => assert_eq!(
+            failure.code,
+            NodeFailureCode::LastWorkspace,
+            "expected LastWorkspace, got {failure:?}"
+        ),
+        other => panic!("expected LastWorkspace for primary: {other:?}"),
+    }
+
+    // Fail closed: control-character workspace root via RegisterWorkspace
+    // (empty paths are refused earlier by OpaqueHostPath construction).
+    let bad_root = control
+        .request(
+            route0.clone(),
+            NodeRequest::RegisterWorkspace {
+                workspace_id: WorkspaceId::new("bad-root").unwrap(),
+                root: OpaqueHostPath::utf8("bad\nroot".into()).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    match bad_root.response {
+        Err(failure) => assert_eq!(
+            failure.code,
+            NodeFailureCode::InvalidWorkspaceRoot,
+            "expected InvalidWorkspaceRoot, got {failure:?}"
+        ),
+        other => panic!("expected InvalidWorkspaceRoot for control-char root: {other:?}"),
+    }
+
+    assert!(
+        state_path.is_file(),
+        "durable state-v1.json missing after unregister commit"
+    );
+
+    let stale_route = route0;
+    shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), &mut task)
+        .await
+        .expect("node shutdown timed out")
+        .expect("node task panicked")
+        .expect("node shutdown failed");
+    wait_status(&http, |status| {
+        status.nodes[&id].transport != NodeTransportState::Online
+    })
+    .await;
+
+    // Keep shutdown handle alive (persistence gap invariant).
+    let restarted = NodeServer::new_fixture(
+        node_config(&id, &endpoint, token)
+            .with_state_path(&state_path)
+            .unwrap(),
+    )
+    .expect("durable reopen after unregister must succeed while shutdown handle lives");
+    shutdown = restarted.shutdown_handle();
+    task = tokio::spawn(restarted.run());
+
+    let recovered = wait_status(&http, |status| {
+        status.nodes[&id].transport == NodeTransportState::Online
+            && status.nodes[&id].cursor.is_some_and(|cursor| {
+                cursor.incarnation_id != stale_route.expected_incarnation_id
+            })
+            && status.nodes[&id].inventory.as_ref().is_some_and(|inventory| {
+                !inventory.workspaces.contains_key(&added_id)
+                    && inventory.workspaces.contains_key(&primary_id)
+            })
+    })
+    .await;
+
+    let recovered_route = route(&recovered, &id);
+    let snapshot = control
+        .request(recovered_route.clone(), NodeRequest::Snapshot)
+        .await
+        .unwrap();
+    match snapshot.response {
+        Ok(C2NodeResponse::Snapshot { snapshot, .. }) => {
+            let ids: Vec<_> = snapshot
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.workspace_id.as_str())
+                .collect();
+            assert!(
+                ids.contains(&"primary"),
+                "CLI primary missing after unregister durable restart: {ids:?}"
+            );
+            assert!(
+                !ids.contains(&"relay-added"),
+                "UnregisterWorkspace did not persist across restart: {ids:?}"
+            );
+            assert_eq!(
+                snapshot.workspaces.len(),
+                1,
+                "expected only primary after unregister restart: {ids:?}"
+            );
+        }
+        other => panic!("unexpected snapshot after unregister durable restart: {other:?}"),
+    }
+
+    // Fail closed still holds on the new incarnation.
+    let last_again = control
+        .request(
+            recovered_route,
+            NodeRequest::UnregisterWorkspace {
+                workspace_id: primary_id,
+            },
+        )
+        .await
+        .unwrap();
+    match last_again.response {
+        Err(failure) => assert_eq!(failure.code, NodeFailureCode::LastWorkspace),
+        other => panic!("expected LastWorkspace after restart: {other:?}"),
     }
 
     running.shutdown_handle().shutdown();

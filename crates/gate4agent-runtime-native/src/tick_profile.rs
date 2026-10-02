@@ -9,7 +9,7 @@
 //! This module gives each of those six phases its own always-on reading.
 //!
 //! Two contracts every series here honours, mirrored from
-//! `gate4agent-tui`'s `profile.rs` (that crate is a different workspace and
+//! `hatchery-tui`'s `profile.rs` (that crate is a different workspace and
 //! is not a dependency of this one, so the types are re-derived here rather
 //! than imported -- see that module's own doc comment for the same
 //! reasoning spelled out for the TUI's redraw loop):

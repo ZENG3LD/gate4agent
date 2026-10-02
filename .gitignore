@@ -6,7 +6,6 @@
 # (crates/gate4agent-node/src/server.rs) in intent, not just by name.
 target*/
 Cargo.lock
-!crates/gate4agent-tui/Cargo.lock
 
 # Local planning and research — not part of the crate release
 /docs/plans/
@@ -14,15 +13,3 @@ Cargo.lock
 
 # Live-stack run directories (logs, per-run sqlite, tokens, screenshots)
 /.run/
-
-# gate4agent-tui's icon bake tool's own downloaded-SVG scratch cache --
-# reproducible from tools/bake_icons.py against upstream codicons, not a
-# source of truth (the checked-in src/icons/*.rgba baked assets are).
-crates/gate4agent-tui/tools/.codicon-cache/
-# Same, for the upstream Lucide source SVGs (alongside codicons -- see
-# `app::IconFamily`'s own doc comment).
-crates/gate4agent-tui/tools/.lucide-cache/
-
-# Python bytecode from the icon-baking tool
-__pycache__/
-*.pyc

@@ -106,7 +106,7 @@ impl DriveLoopProfiler {
     /// being flushed.
     ///
     /// Bounded to `SAMPLE_WINDOW` catch-up rolls for the same reason as
-    /// `gate4agent-tui`'s `tick_second`: a long idle gap (e.g. the process
+    /// `hatchery-tui`'s `tick_second`: a long idle gap (e.g. the process
     /// paused under a debugger) must resync rather than spin backfilling a
     /// zero-sample per elapsed second.
     pub(super) fn note_iteration(&mut self, now: Instant) {

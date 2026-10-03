@@ -329,8 +329,7 @@ impl PtyWrapper {
                 CliTool::ClaudeCode => "claude",
                 CliTool::Codex => "codex",
                 CliTool::KimiCode => "kimi",
-                // Grok's supported transport is ACP, not PTY — unreachable
-                // via this legacy `CliTool` PTY path in practice.
+                // Grok TUI is a valid PTY attach target (catalog `pty: true`).
                 CliTool::Grok => "grok",
             };
             let mut c = CommandBuilder::new("cmd");
@@ -342,8 +341,7 @@ impl PtyWrapper {
                 CliTool::ClaudeCode => CommandBuilder::new("claude"),
                 CliTool::Codex => CommandBuilder::new("codex"),
                 CliTool::KimiCode => CommandBuilder::new("kimi"),
-                // Grok's supported transport is ACP, not PTY — unreachable
-                // via this legacy `CliTool` PTY path in practice.
+                // Grok TUI is a valid PTY attach target (catalog `pty: true`).
                 CliTool::Grok => CommandBuilder::new("grok"),
             }
         };

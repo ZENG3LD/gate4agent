@@ -185,11 +185,11 @@ fn capabilities(id: &str) -> AgentCapabilities {
     AgentCapabilities {
         agent_commands: matches!(id, "claude" | "codex").then_some(AgentCommandMode::SlashLine),
         transports: AgentTransportCapabilities {
-            // Grok is ACP-native (`grok agent stdio`); catalog forbids
-            // TransportKind::Pty as a control driver. PTY remains an
-            // operator attach/replay concern outside this flag — see
-            // hatchery research agent-harness-isolation-and-vendor-cli-recon-2026-10-02.
-            pty: id != "grok",
+            // All four fleet providers advertise PTY for operator attach
+            // (owner order 2026-10-04). ACP and PTY are different surfaces;
+            // Grok still has no PtySemantic adapter, so prompt submit stays
+            // unsupported — PTY is attach-only.
+            pty: true,
             pty_adapter: transport_adapter_id
                 .and_then(|adapter| binding(AdapterFamily::PtySemantic, adapter)),
             pipe,
@@ -356,13 +356,20 @@ mod tests {
                 "missing ACP transport for {id}"
             );
         }
-        // Grok is ACP-native: no raw PTY driver flag, no PTY semantic /
-        // pipe adapters. PTY attach/replay is outside this catalog surface.
+        // Grok advertises PTY like Claude/Codex/Kimi for operator attach.
+        // No PtySemantic / pipe adapters — prompt submission stays unsupported.
         let grok_t = &registry.get_by_id("grok").unwrap().capabilities.transports;
-        assert!(!grok_t.pty, "grok must not advertise TransportKind::Pty");
+        assert!(grok_t.pty, "grok must advertise TransportKind::Pty");
         assert!(grok_t.pty_adapter.is_none());
         assert!(grok_t.pipe.is_none());
         assert!(grok_t.acp.is_some());
+
+        for id in ["claude", "codex", "grok", "kimi"] {
+            assert!(
+                registry.get_by_id(id).unwrap().capabilities.transports.pty,
+                "missing PTY transport advertise for {id}"
+            );
+        }
 
         for id in ["claude", "codex", "grok", "kimi"] {
             let adapters = &registry.get_by_id(id).unwrap().capabilities.adapters;

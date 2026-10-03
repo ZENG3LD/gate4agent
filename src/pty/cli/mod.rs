@@ -113,8 +113,8 @@ pub fn create_parser(tool: CliTool) -> Box<dyn OutputParser> {
         CliTool::ClaudeCode => Box::new(ClaudeOutputParser::new()),
         CliTool::Codex => Box::new(CodexOutputParser::new()),
         CliTool::KimiCode => Box::new(RawOutputParser::new(CliTool::KimiCode)),
-        // Grok's supported transport is ACP, not PTY — unreachable via this
-        // legacy `CliTool` PTY path in practice.
+        // Grok PTY is attach-only (catalog `pty: true`, no PtySemantic).
+        // Raw parser matches Kimi; no semantic prompt path.
         CliTool::Grok => Box::new(RawOutputParser::new(CliTool::Grok)),
     }
 }
@@ -125,8 +125,8 @@ pub fn create_submitter(tool: CliTool) -> Box<dyn PromptSubmitter> {
         CliTool::ClaudeCode => Box::new(ClaudePromptSubmitter::new()),
         CliTool::Codex => Box::new(CodexPromptSubmitter::new()),
         CliTool::KimiCode => Box::new(UnsupportedPromptSubmitter::new(CliTool::KimiCode)),
-        // Grok's supported transport is ACP, not PTY — unreachable via this
-        // legacy `CliTool` PTY path in practice.
+        // Grok PTY attach is allowed; semantic prompt submit is not fixture-
+        // verified (same UnsupportedPromptSubmitter path as Kimi).
         CliTool::Grok => Box::new(UnsupportedPromptSubmitter::new(CliTool::Grok)),
     }
 }

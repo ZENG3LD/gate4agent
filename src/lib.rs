@@ -3,7 +3,8 @@
 //! Three transport modes:
 //! - Pipe mode: NDJSON-streaming pipe sessions (Claude, Codex, Kimi)
 //! - PTY mirror: spawns agent in real PTY, captures raw output, vt100 parsing
-//! - ACP mode: bidirectional JSON-RPC 2.0 over stdio (Claude, Codex, Grok, Kimi)
+//! - ACP mode: bidirectional JSON-RPC 2.0 over stdio (Grok, Kimi native; Claude and Codex legacy adapters)
+//! - Deep cores (`cores`): Codex `app-server` JSON-RPC and Claude Agent SDK `query()` stream-json. Not a UI.
 //!
 //! All modes produce `AgentEvent` values on a `tokio::sync::broadcast` channel.
 //!
@@ -32,6 +33,7 @@ pub use transport::{SpawnOptions, TransportSession};
 pub use pipe::{PipeSession, PipeProcessOptions, ClaudeOptions};
 
 pub mod acp;
+pub mod cores;
 pub mod agent;
 pub mod context;
 pub mod core;
@@ -48,6 +50,7 @@ pub use acp::{
     AcpError, AcpSession, AcpSessionOptions, DangerousCommandGate, HostPolicy,
     OperatorPermissionChoice,
 };
+pub use cores::{ClaudeQueryClient, ClaudeQueryEvent, CodexAppServer, CodexMessage, CoreError};
 pub use rpc::{
     HostHandler, RejectAllHandler, MethodRouter,
     RpcId, RpcRequest, RpcResponse, RpcError, RpcNotification,

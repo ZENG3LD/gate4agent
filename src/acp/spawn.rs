@@ -66,6 +66,9 @@ pub(crate) fn acp_command(tool: CliTool) -> Result<AcpSpawnSpec, std::io::Error>
         // acp@1.10.0` (current latest at pin time). A version bump is a
         // deliberate edit to this literal, never an automatic `npx`
         // resolution.
+        // Legacy ACP-adapter spawn still used by `AcpSession`. The deep
+        // connector core does not come through here: Claude speaks the
+        // Agent SDK query() protocol in `crate::cores::claude_query`.
         CliTool::ClaudeCode => AcpSpawnSpec {
             program: "npx",
             prefix_args: &[],
@@ -80,6 +83,9 @@ pub(crate) fn acp_command(tool: CliTool) -> Result<AcpSpawnSpec, std::io::Error>
         // (hatchery research codex-app-server-vs-acp-adapter-2026-10-02);
         // registry latest for this package may be ahead of the pin — bump
         // only with a deliberate literal edit + live session/new remeasure.
+        // Legacy ACP-adapter spawn still used by `AcpSession`. The deep
+        // connector core does not come through here: Codex speaks
+        // `codex app-server` JSON-RPC in `crate::cores::codex_app_server`.
         CliTool::Codex => AcpSpawnSpec {
             program: "npx",
             prefix_args: &[],

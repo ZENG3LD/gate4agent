@@ -17,7 +17,6 @@ The node/c2/harness/TUI stack that used to live in this repository is now
 | **Codex CLI** | first tier | full workbench; transport core verified on 0.144.6 |
 | **Kimi Code** | first tier | full workbench via the adapter registry; current transport-core PTY canary is failing (see the matrix below) |
 | **Grok CLI** | first tier | full workbench via the adapter registry (`gate4agent-adapters`): PTY sessions, native history (`~/.grok/sessions`), hooks; a resume gap is tracked |
-| Gemini, OpenCode | legacy | transport-core paths last live-verified in the 0.2.5–0.2.6 era; outside the product target |
 
 ## Repository layout
 
@@ -159,7 +158,7 @@ src/
 ├── context/    — ContextTracker, TurnCompleteData
 ├── cure/       — runtime model discovery (OpenCode cache → OpenRouter → hardcoded)
 ├── daemon/     — DaemonSession, per-daemon adapters [skeleton, not functional]
-└── history/    — per-CLI session history readers (Claude, Codex, Gemini, OpenCode)
+└── history/    — per-CLI session history readers (Claude, Codex; Gemini/OpenCode cut in 0.4.0)
 ```
 
 ### Windows spawn strategy

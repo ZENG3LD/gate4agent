@@ -17,7 +17,6 @@ The node/c2/harness/TUI stack that used to live in this repository is now
 | **Codex CLI** | first tier | full workbench; transport core verified on 0.144.6 |
 | **Kimi Code** | first tier | full workbench via the adapter registry; current transport-core PTY canary is failing (see the matrix below) |
 | **Grok CLI** | first tier | full workbench via the adapter registry (`gate4agent-adapters`): PTY sessions, native history (`~/.grok/sessions`), hooks; a resume gap is tracked |
-| qwen-code | wired, unverified | adapter registry entry exists; no verification claim |
 | Gemini, OpenCode | legacy | transport-core paths last live-verified in the 0.2.5–0.2.6 era; outside the product target |
 
 ## Repository layout
@@ -33,7 +32,7 @@ transport core, plus the in-house PTY backend:
 - `gate4agent-pty` — the in-house PTY backend (std-only, zero external PTY
   dependencies: Windows ConPTY + a unix macOS/Linux backend).
 - `gate4agent-types` — shared wire/data types.
-- `gate4agent-adapters` — the adapter registry (Grok, qwen-code, and other
+- `gate4agent-adapters` — the adapter registry (Grok and other
   CLIs wired outside the transport core's own pipe/PTY clients).
 - `gate4agent-catalog` — the CLI interop reference registry.
 - `gate4agent-engine`, `gate4agent-kernel`, `gate4agent-handle` — the
@@ -86,16 +85,16 @@ API — usable on its own, with no node/c2/harness in the loop.
 | **Kimi Code** | Structured inline + raw PTY | current `stream-json` | unsupported | active adapter `--session <id>`; legacy `PipeSession` `-r <id>` | Version 0.31.1 exposes `--session`; the latest PTY canary exited before readiness with a local provider `EPERM`, so current PTY lifecycle is not claimed |
 | **Grok CLI** | PTY via the adapter registry (workbench path) | — (no transport-core pipe client) | not active | resume gap tracked | First-tier through `gate4agent-adapters`, not this table's transport-core clients: PTY sessions, native history, hooks |
 
-The table above is the transport core's own verified matrix. Grok and
-qwen-code ride the modern adapter registry (`gate4agent-adapters`) used by the
-node stack: Grok is a first-tier provider (a known resume gap is tracked);
-qwen-code is wired but unverified. The separate `agent` module also carries a
-33-entry reference registry of CLI interop metadata derived from the Orca
-project's public tool descriptions (pinned by revision in
-`gate4agent-catalog`; credit to Orca for the original grounding); those
-entries are transitional code debt, not support claims. Gemini,
-OpenCode, and the other reference entries were last live-verified in the
-0.2.5–0.2.6 era and are outside the current product target.
+The table above is the transport core's own verified matrix. Grok rides
+the modern adapter registry (`gate4agent-adapters`) used by the node stack and
+is a first-tier provider (a known resume gap is tracked). Qwen Code is not in
+the current fleet — its parsers and registry entries were removed in 0.4.0.
+The separate `agent` module also carries a 33-entry reference registry of CLI
+interop metadata derived from the Orca project's public tool descriptions
+(pinned by revision in `gate4agent-catalog`; credit to Orca for the original
+grounding); those entries are transitional code debt, not support claims.
+Gemini, OpenCode, and the other reference entries were last live-verified in
+the 0.2.5–0.2.6 era and are outside the current product target.
 
 ### Quick start
 
@@ -193,7 +192,7 @@ install them.
 | Claude Code | `npm install -g @anthropic-ai/claude-code` |
 | Codex | `npm install -g @openai/codex` |
 | Kimi Code | `npm install -g @moonshot-ai/kimi-code` |
-| Grok CLI / qwen-code | per their vendors' instructions |
+| Grok CLI | per the vendor's instructions |
 
 ## Versioning
 

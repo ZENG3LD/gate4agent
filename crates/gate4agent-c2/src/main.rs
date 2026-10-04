@@ -26,6 +26,7 @@ async fn main() {
     let mut control_endpoint = default_c2_control_endpoint()
         .unwrap_or_else(|error| fail(&error.to_string()));
     let mut node_listen: Option<std::net::SocketAddr> = None;
+    let mut control_tunnel: Option<std::net::SocketAddr> = None;
     let mut node_args = Vec::new();
     let mut seen = BTreeSet::new();
     let mut args = std::env::args().skip(1);
@@ -36,6 +37,12 @@ async fn main() {
                     .unwrap_or_else(|error| fail(&format!("--api-listen is invalid: {error}")));
             }
             "--control-endpoint" => control_endpoint = required_value("--control-endpoint", args.next()),
+            "--control-tunnel" => {
+                let value = required_value("--control-tunnel", args.next());
+                control_tunnel = Some(value.parse().unwrap_or_else(|error| {
+                    fail(&format!("--control-tunnel is invalid: {error}"))
+                }));
+            }
             // Where nodes that cannot be dialled call in. Required by, and
             // only by, a `--node ID=accept` assignment.
             "--node-listen" => {
@@ -75,6 +82,10 @@ async fn main() {
         .and_then(|config| config.with_control_endpoint(control_endpoint))
         .and_then(|config| match node_listen {
             Some(listen) => config.with_node_listen(listen),
+            None => Ok(config),
+        })
+        .and_then(|config| match control_tunnel {
+            Some(listen) => config.with_control_tunnel_listen(listen),
             None => Ok(config),
         })
         .and_then(|config| config.validate_call_home().map(|()| config))
@@ -166,9 +177,10 @@ fn print_help() {
     println!(
         "gate4agent-c2 --node NODE_ID={endpoint}|tcp://127.0.0.1:PORT|tcp://[::1]:PORT|accept \
 [--node ...] [--api-listen 127.0.0.1:PORT] [--node-listen 127.0.0.1:PORT] \
-[--control-endpoint {endpoint}]",
+[--control-endpoint {endpoint}] [--control-tunnel TUNNEL_IP:PORT]",
         endpoint = LOCAL_ENDPOINT_SPELLING,
     );
+    println!("  --control-tunnel: HQ WireGuard client control TCP, bound to the C2 tunnel address only (not 0.0.0.0). Unix --control-endpoint stays.");
     println!("  accept: this node dials in instead of being dialled; requires --node-listen");
 }
 

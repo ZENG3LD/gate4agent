@@ -42,7 +42,6 @@ use gate4agent_node_protocol::{
 };
 use gate4agent_node_wire::{
     connect_local_stream, local_hmac_sha256, proofs_match, random_nonce,
-    LocalClientStream,
 };
 use std::collections::BTreeMap;
 use std::io;
@@ -392,7 +391,33 @@ pub async fn connect_local(
 ) -> Result<(C2ControlHandle, C2EventReceiver), C2ControlError> {
     validate_endpoint(endpoint)?;
     validate_token(token)?;
-    let mut pipe = connect_local_stream(endpoint).await?;
+    let pipe = connect_local_stream(endpoint).await?;
+    connect_control_stream(pipe, token).await
+}
+
+/// Dials the C2 control frame protocol over TCP.
+///
+/// This is the HQ path after the kernel WireGuard tunnel is up: `address`
+/// is `c2_tunnel_ip:control_port`, not a public endpoint and not a node.
+/// The unix validator ([`validate_endpoint`]) does not accept this form.
+pub async fn connect_tunnel_tcp(
+    address: std::net::SocketAddr,
+    token: &str,
+) -> Result<(C2ControlHandle, C2EventReceiver), C2ControlError> {
+    validate_tunnel_control_target(address)?;
+    validate_token(token)?;
+    let stream = tokio::net::TcpStream::connect(address).await?;
+    let _ = stream.set_nodelay(true);
+    connect_control_stream(stream, token).await
+}
+
+async fn connect_control_stream<S>(
+    mut pipe: S,
+    token: &str,
+) -> Result<(C2ControlHandle, C2EventReceiver), C2ControlError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let client_nonce = random_nonce().map_err(C2ControlError::Authentication)?;
     let compatibility_offer = client_compatibility_offer()?;
     timeout(AUTH_DEADLINE, write_json_frame_limited(
@@ -2223,10 +2248,13 @@ fn routed_response_has_open_provider_id(response: &RoutedNodeResponse) -> bool {
     response.response.as_ref().is_ok_and(c2_node_response_has_open_provider_id)
 }
 
-async fn read_server_frame(
-    pipe: &mut LocalClientStream,
+async fn read_server_frame<S>(
+    pipe: &mut S,
     limit: usize,
-) -> Result<C2ServerFrame, C2ControlError> {
+) -> Result<C2ServerFrame, C2ControlError>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     Ok(read_json_frame_limited_body_timeout(pipe, limit, FRAME_BODY_DEADLINE).await?)
 }
 
@@ -2987,6 +3015,15 @@ fn validate_endpoint(endpoint: &str) -> Result<(), C2ControlError> {
     Ok(())
 }
 
+/// Tunnel control target for HQ. Not a substitute for [`validate_endpoint`]:
+/// a raw `host:port` string is still [`C2ControlError::InvalidEndpoint`] there.
+fn validate_tunnel_control_target(address: std::net::SocketAddr) -> Result<(), C2ControlError> {
+    if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+        return Err(C2ControlError::InvalidTunnelControl);
+    }
+    Ok(())
+}
+
 fn validate_token(token: &str) -> Result<(), C2ControlError> {
     if token.is_empty() || token.len() > 4096 || !token.bytes().all(|byte| matches!(byte, 0x21..=0x7e)) {
         return Err(C2ControlError::InvalidToken);
@@ -2999,6 +3036,8 @@ pub enum C2ControlError {
     #[cfg_attr(windows, error("C2 control endpoint is not a bounded local named pipe"))]
     #[cfg_attr(unix, error("C2 control endpoint is not a bounded absolute local endpoint"))]
     InvalidEndpoint,
+    #[error("C2 tunnel control address must be a concrete host and a nonzero port")]
+    InvalidTunnelControl,
     #[error("C2 token must contain 1..=4096 visible ASCII bytes without whitespace")]
     InvalidToken,
     #[error("C2 control I/O failed: {0}")]
@@ -6145,5 +6184,25 @@ mod tests {
                 if message.contains("route or node incarnation")
         ));
         timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn unix_endpoint_remains_valid() {
+        assert!(validate_endpoint("/tmp/gate4agent-c2.sock").is_ok());
+    }
+
+    #[test]
+    fn raw_public_tcp_endpoint_is_still_rejected_by_the_unix_validator() {
+        for endpoint in ["203.0.113.8:51820", "10.88.1.2:27441", "tcp://10.88.1.2:27441"] {
+            assert!(
+                matches!(validate_endpoint(endpoint), Err(C2ControlError::InvalidEndpoint)),
+                "{endpoint} must stay InvalidEndpoint",
+            );
+        }
     }
 }

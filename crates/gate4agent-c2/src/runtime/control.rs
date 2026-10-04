@@ -40,11 +40,13 @@ use gate4agent_node_protocol::{
     read_json_frame_limited_body_timeout, write_json_frame_limited, FrameError,
 };
 use gate4agent_node_wire::{
-    local_hmac_sha256, proofs_match, random_nonce, LocalServerStream,
+    local_hmac_sha256, proofs_match, random_nonce,
     OwnerOnlyLocalListener,
 };
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -135,22 +137,49 @@ impl fmt::Display for ControlCloseReason {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct ControlSlots {
+    preauth: Arc<Semaphore>,
+    authenticated: Arc<Semaphore>,
+    next_connection_id: Arc<AtomicU64>,
+}
+
+impl ControlSlots {
+    pub(super) fn new() -> Self {
+        Self {
+            preauth: Arc::new(Semaphore::new(MAX_PREAUTH_CONNECTIONS)),
+            authenticated: Arc::new(Semaphore::new(1)),
+            next_connection_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+}
+
 pub(super) async fn run(
     endpoint: String,
     token: String,
     relays: Arc<BTreeMap<NodeId, RelayEndpoint>>,
     status: watch::Receiver<Arc<StatusResponse>>,
     hub: OperatorHub,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
+    slots: ControlSlots,
 ) -> io::Result<()> {
-    let mut listener = OwnerOnlyLocalListener::bind(&endpoint).await?;
-    let preauth = Arc::new(Semaphore::new(MAX_PREAUTH_CONNECTIONS));
-    let authenticated = Arc::new(Semaphore::new(1));
-    let next_connection_id = Arc::new(AtomicU64::new(1));
+    let listener = OwnerOnlyLocalListener::bind(&endpoint).await?;
+    accept_local(listener, token, relays, status, hub, shutdown, slots).await
+}
+
+async fn accept_local(
+    mut listener: OwnerOnlyLocalListener,
+    token: String,
+    relays: Arc<BTreeMap<NodeId, RelayEndpoint>>,
+    status: watch::Receiver<Arc<StatusResponse>>,
+    hub: OperatorHub,
+    mut shutdown: watch::Receiver<bool>,
+    slots: ControlSlots,
+) -> io::Result<()> {
     let mut connections = JoinSet::new();
     loop {
         let permit = tokio::select! {
-            permit = Arc::clone(&preauth).acquire_owned() => permit.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "C2 preauth slots closed"))?,
+            permit = Arc::clone(&slots.preauth).acquire_owned() => permit.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "C2 preauth slots closed"))?,
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() { break; }
                 continue;
@@ -163,27 +192,106 @@ pub(super) async fn run(
                 continue;
             }
         };
-        let token = token.clone();
-        let authenticated = Arc::clone(&authenticated);
-        let connection_ids = Arc::clone(&next_connection_id);
-        let relays = Arc::clone(&relays);
-        let status = status.clone();
-        let hub = hub.clone();
-        let connection_shutdown = shutdown.clone();
-        connections.spawn(async move {
-            let _ = serve_connection(
-                server, permit, authenticated, connection_ids, &token,
-                relays, status, hub, connection_shutdown,
-            ).await;
-        });
+        spawn_control(
+            &mut connections,
+            server,
+            permit,
+            &slots,
+            &token,
+            &relays,
+            &status,
+            &hub,
+            &shutdown,
+        );
         while connections.try_join_next().is_some() {}
     }
     connections.shutdown().await;
     Ok(())
 }
 
-async fn serve_connection(
-    mut pipe: LocalServerStream,
+/// TCP control accept bound to one concrete address (the C2 tunnel address).
+/// The unix listener in [`run`] is unchanged. `0.0.0.0` is refused.
+pub(super) async fn run_tcp(
+    listen: SocketAddr,
+    token: String,
+    relays: Arc<BTreeMap<NodeId, RelayEndpoint>>,
+    status: watch::Receiver<Arc<StatusResponse>>,
+    hub: OperatorHub,
+    mut shutdown: watch::Receiver<bool>,
+    slots: ControlSlots,
+) -> io::Result<()> {
+    if listen.ip().is_unspecified() || listen.port() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "C2 control tunnel listen must be a concrete address, not 0.0.0.0",
+        ));
+    }
+    let listener = TcpListener::bind(listen).await?;
+    tracing::info!(%listen, "C2 control tunnel listener bound");
+    let mut connections = JoinSet::new();
+    loop {
+        let permit = tokio::select! {
+            permit = Arc::clone(&slots.preauth).acquire_owned() => permit.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "C2 preauth slots closed"))?,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
+                continue;
+            }
+        };
+        let (stream, _peer) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
+                continue;
+            }
+        };
+        let _ = stream.set_nodelay(true);
+        spawn_control(
+            &mut connections,
+            stream,
+            permit,
+            &slots,
+            &token,
+            &relays,
+            &status,
+            &hub,
+            &shutdown,
+        );
+        while connections.try_join_next().is_some() {}
+    }
+    connections.shutdown().await;
+    Ok(())
+}
+
+fn spawn_control<S>(
+    connections: &mut JoinSet<()>,
+    stream: S,
+    permit: OwnedSemaphorePermit,
+    slots: &ControlSlots,
+    token: &str,
+    relays: &Arc<BTreeMap<NodeId, RelayEndpoint>>,
+    status: &watch::Receiver<Arc<StatusResponse>>,
+    hub: &OperatorHub,
+    shutdown: &watch::Receiver<bool>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let token = token.to_owned();
+    let authenticated = Arc::clone(&slots.authenticated);
+    let connection_ids = Arc::clone(&slots.next_connection_id);
+    let relays = Arc::clone(relays);
+    let status = status.clone();
+    let hub = hub.clone();
+    let connection_shutdown = shutdown.clone();
+    connections.spawn(async move {
+        let _ = serve_connection(
+            stream, permit, authenticated, connection_ids, &token,
+            relays, status, hub, connection_shutdown,
+        ).await;
+    });
+}
+
+async fn serve_connection<S>(
+    mut pipe: S,
     preauth_permit: OwnedSemaphorePermit,
     authenticated: Arc<Semaphore>,
     connection_ids: Arc<AtomicU64>,
@@ -192,7 +300,10 @@ async fn serve_connection(
     mut status: watch::Receiver<Arc<StatusResponse>>,
     hub: OperatorHub,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<(), FrameError> {
+) -> Result<(), FrameError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let hello = timeout(AUTH_DEADLINE, read_client_frame(&mut pipe, MAX_C2_AUTH_FRAME_BYTES))
         .await.map_err(|_| FrameError::PrefixTimedOut)??;
     let C2ClientFrame::Hello(hello) = hello else {
@@ -608,10 +719,13 @@ fn prune_pre_hello_events(
     true
 }
 
-async fn read_client_frame(
-    pipe: &mut LocalServerStream,
+async fn read_client_frame<S>(
+    pipe: &mut S,
     limit: usize,
-) -> Result<C2ClientFrame, FrameError> {
+) -> Result<C2ClientFrame, FrameError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     read_json_frame_limited_body_timeout(pipe, limit, FRAME_BODY_DEADLINE).await
 }
 

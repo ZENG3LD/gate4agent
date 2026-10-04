@@ -14,6 +14,8 @@ use tokio::time::timeout;
 mod runtime;
 #[cfg(any(windows, unix))]
 mod reconnect;
+#[cfg(unix)]
+mod hq_wg;
 
 #[cfg(any(windows, unix))]
 pub use runtime::{
@@ -22,8 +24,15 @@ pub use runtime::{
 };
 #[cfg(any(windows, unix))]
 pub use reconnect::{
-    connect_local_reconnecting, C2LinkState, C2ReconnectingEventReceiver, C2ReconnectingHandle,
+    connect_local_reconnecting, connect_tunnel_reconnecting, C2LinkState,
+    C2ReconnectingEventReceiver, C2ReconnectingHandle,
 };
+#[cfg(unix)]
+pub use hq_wg::{
+    bring_up_hq_wireguard, HqWgAllowedIp, HqWgClientConfig, HqWgClientError, HqWgPeer,
+};
+#[cfg(any(windows, unix))]
+pub use runtime::connect_tunnel_tcp;
 
 const MAX_RESPONSE_HEADERS: usize = 16 * 1024;
 

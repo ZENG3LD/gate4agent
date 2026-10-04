@@ -26,9 +26,10 @@
 //! whichever physical connection is live underneath.
 
 use crate::runtime::{
-    connect_local, C2ControlError, C2ControlHandle, C2EventReceiver, C2PendingRequest,
-    EVENT_CAPACITY, HARNESS_MCP_EVENT_CAPACITY,
+    connect_local, connect_tunnel_tcp, C2ControlError, C2ControlHandle, C2EventReceiver,
+    C2PendingRequest, EVENT_CAPACITY, HARNESS_MCP_EVENT_CAPACITY,
 };
+use std::net::SocketAddr;
 use gate4agent_c2_protocol::{C2Topology, NodeRequest, NodeRoute, RoutedNodeEvent, RoutedNodeResponse};
 use std::fmt;
 use std::sync::Arc;
@@ -68,6 +69,7 @@ fn is_hard_reconnect_failure(error: &C2ControlError) -> bool {
     matches!(
         error,
         C2ControlError::InvalidEndpoint
+            | C2ControlError::InvalidTunnelControl
             | C2ControlError::InvalidToken
             | C2ControlError::Authentication(_)
             | C2ControlError::Protocol(_)
@@ -393,19 +395,20 @@ async fn pump_one_connection(
 /// Reconnects with an escalating backoff until a connection succeeds or
 /// shutdown is signaled. Returns `None` only on shutdown.
 async fn reconnect_with_backoff(
-    endpoint: &str,
+    dial: &ControlDial,
     token: &ReconnectToken,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Option<(C2ControlHandle, C2EventReceiver)> {
+    let endpoint = dial.label();
     let mut failures: usize = 0;
     loop {
-        match connect_local(endpoint, &token.0).await {
+        match dial.connect(&token.0).await {
             Ok(connection) => return Some(connection),
             Err(error) => {
                 failures = failures.saturating_add(1);
                 let hard = is_hard_reconnect_failure(&error);
                 tracing::debug!(
-                    endpoint,
+                    endpoint = %endpoint,
                     failures,
                     hard,
                     error = %error,
@@ -426,18 +429,19 @@ async fn reconnect_with_backoff(
 /// pump it until it dies (or shutdown), publish it as gone, then reconnect
 /// with backoff and repeat.
 async fn reconnect_supervisor(
-    endpoint: String,
+    dial: ControlDial,
     token: ReconnectToken,
     mut channels: SupervisorChannels,
     first_control: C2ControlHandle,
     first_events: C2EventReceiver,
 ) {
+    let endpoint = dial.label();
     let mut pending = Some((first_control, first_events));
     let mut was_reconnecting = false;
     loop {
         let (control, mut events) = match pending.take() {
             Some(connection) => connection,
-            None => match reconnect_with_backoff(&endpoint, &token, &mut channels.shutdown).await {
+            None => match reconnect_with_backoff(&dial, &token, &mut channels.shutdown).await {
                 Some(connection) => connection,
                 None => return,
             },
@@ -486,9 +490,48 @@ pub async fn connect_local_reconnecting(
     endpoint: impl Into<String>,
     token: impl Into<String>,
 ) -> Result<(C2ReconnectingHandle, C2ReconnectingEventReceiver), C2ControlError> {
-    let endpoint = endpoint.into();
-    let token = ReconnectToken(token.into());
-    let (control, events) = connect_local(&endpoint, &token.0).await?;
+    connect_reconnecting(ControlDial::Local(endpoint.into()), ReconnectToken(token.into())).await
+}
+
+/// Same supervisor as [`connect_local_reconnecting`], dialing the tunnel TCP
+/// control port instead of the unix socket. Unix reconnect is unchanged.
+pub async fn connect_tunnel_reconnecting(
+    address: SocketAddr,
+    token: impl Into<String>,
+) -> Result<(C2ReconnectingHandle, C2ReconnectingEventReceiver), C2ControlError> {
+    connect_reconnecting(ControlDial::Tunnel(address), ReconnectToken(token.into())).await
+}
+
+#[derive(Clone)]
+enum ControlDial {
+    Local(String),
+    Tunnel(SocketAddr),
+}
+
+impl ControlDial {
+    fn label(&self) -> String {
+        match self {
+            Self::Local(endpoint) => endpoint.clone(),
+            Self::Tunnel(address) => address.to_string(),
+        }
+    }
+
+    async fn connect(
+        &self,
+        token: &str,
+    ) -> Result<(C2ControlHandle, C2EventReceiver), C2ControlError> {
+        match self {
+            Self::Local(endpoint) => connect_local(endpoint, token).await,
+            Self::Tunnel(address) => connect_tunnel_tcp(*address, token).await,
+        }
+    }
+}
+
+async fn connect_reconnecting(
+    dial: ControlDial,
+    token: ReconnectToken,
+) -> Result<(C2ReconnectingHandle, C2ReconnectingEventReceiver), C2ControlError> {
+    let (control, events) = dial.connect(&token.0).await?;
 
     let initial_topology = control.current_topology();
     let seed_control = control.clone();
@@ -500,7 +543,7 @@ pub async fn connect_local_reconnecting(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     tokio::spawn(reconnect_supervisor(
-        endpoint,
+        dial,
         token,
         SupervisorChannels {
             live: live_tx,

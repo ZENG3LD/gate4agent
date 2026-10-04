@@ -154,6 +154,9 @@ impl Default for C2Timings {
 pub struct C2Config {
     pub api_listen: SocketAddr,
     pub control_endpoint: String,
+    /// Optional TCP control accept bound to the C2 tunnel address.
+    /// The unix `control_endpoint` listener is always started as well.
+    pub control_tunnel_listen: Option<SocketAddr>,
     api_token: String,
     pub nodes: Vec<C2NodeConfig>,
     /// Where nodes that cannot be dialled come to announce themselves.
@@ -190,6 +193,7 @@ impl C2Config {
         Ok(Self {
             api_listen,
             control_endpoint,
+            control_tunnel_listen: None,
             api_token,
             nodes,
             node_listen: None,
@@ -242,6 +246,20 @@ impl C2Config {
             return Err(C2ConfigError::ControlEndpointConflict);
         }
         self.control_endpoint = endpoint;
+        Ok(self)
+    }
+
+    /// TCP door for an HQ WireGuard client. Bound to one concrete address
+    /// (the address on the C2 tunnel), never `0.0.0.0` or port 0. Does not
+    /// replace the unix control listener.
+    pub fn with_control_tunnel_listen(mut self, listen: SocketAddr) -> Result<Self, C2ConfigError> {
+        if listen.port() == 0 || listen.ip().is_unspecified() {
+            return Err(C2ConfigError::InvalidControlTunnel(listen));
+        }
+        if listen == self.api_listen || self.node_listen == Some(listen) {
+            return Err(C2ConfigError::InvalidControlTunnel(listen));
+        }
+        self.control_tunnel_listen = Some(listen);
         Ok(self)
     }
 }
@@ -340,6 +358,8 @@ pub enum C2ConfigError {
     InvalidControlEndpoint,
     #[error("C2 control endpoint must not equal a configured node endpoint")]
     ControlEndpointConflict,
+    #[error("C2 control tunnel listen must be a concrete non-unspecified address with a nonzero port, not shared with another listener: {0}")]
+    InvalidControlTunnel(SocketAddr),
     #[error("C2 node call-home listen address must be loopback with a nonzero port: {0}")]
     NonLoopbackNodeListen(SocketAddr),
     #[error("C2 node call-home listen address must not equal the API listen address")]
@@ -530,14 +550,29 @@ async fn run_bound(config: C2Config, listener: TcpListener, mut shutdown: watch:
     }
     drop(ingress_tx);
     tasks.spawn(http_server(listener, config.api_token.clone(), config.timings.http_io_deadline, status_rx.clone(), shutdown.clone()));
+    let slots = control::ControlSlots::new();
+    let tunnel_listen = config.control_tunnel_listen;
+    let tunnel_token = config.api_token.clone();
     tasks.spawn(control::run(
         config.control_endpoint,
         config.api_token,
-        relay_senders,
-        status_rx,
-        hub,
+        Arc::clone(&relay_senders),
+        status_rx.clone(),
+        hub.clone(),
         shutdown.clone(),
+        slots.clone(),
     ));
+    if let Some(listen) = tunnel_listen {
+        tasks.spawn(control::run_tcp(
+            listen,
+            tunnel_token,
+            relay_senders,
+            status_rx,
+            hub,
+            shutdown.clone(),
+            slots,
+        ));
+    }
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -4289,5 +4324,32 @@ mod relay_deadline_tests {
             WORKSPACE_INSPECTION_RELAY_DEADLINE,
             NODE_INSPECTION_MAX,
         );
+    }
+}
+
+#[cfg(test)]
+mod control_tunnel_listen_tests {
+    use super::*;
+
+    fn config() -> C2Config {
+        let node = C2NodeConfig::new(
+            NodeId::new("node-a").unwrap(),
+            if cfg!(unix) { "/tmp/gate4agent-node-a.sock" } else { r"\\.\pipe\gate4agent-node-a" },
+            "token-token",
+        ).unwrap();
+        C2Config::new("127.0.0.1:18321".parse().unwrap(), "api-token", vec![node]).unwrap()
+    }
+
+    #[test]
+    fn control_tunnel_rejects_unspecified_and_accepts_tunnel_address() {
+        let bad: SocketAddr = "0.0.0.0:27441".parse().unwrap();
+        assert!(matches!(
+            config().with_control_tunnel_listen(bad),
+            Err(C2ConfigError::InvalidControlTunnel(_))
+        ));
+        let ok: SocketAddr = "10.88.1.2:27441".parse().unwrap();
+        let config = config().with_control_tunnel_listen(ok).unwrap();
+        assert_eq!(config.control_tunnel_listen, Some(ok));
+        assert!(!config.control_endpoint.is_empty());
     }
 }

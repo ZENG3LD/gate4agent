@@ -502,8 +502,8 @@ if [ "$ACCEL" = kvm ]; then
     sleep 1
     : > "$CONSOLE_LOG"
     echo "KVM_FAILED no guest console; accel=tcg" >> "$CONSOLE_LOG"
-    launch tcg qemu64
+    launch tcg max
   fi
 else
-  launch "$ACCEL" qemu64
+  launch "$ACCEL" max
 fi

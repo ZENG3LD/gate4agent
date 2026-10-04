@@ -172,3 +172,74 @@ mod kit_manifest {
             .collect()
     }
 }
+
+
+#[cfg(test)]
+mod deploy_artifacts {
+    //! Static checks for the three kit deploy modes. No Docker build, no
+    //! QEMU boot, no network. Lives in `--lib` so the ordinary node test
+    //! cycle refuses missing or gutted deploy entry points.
+
+    #[test]
+    fn service_unit_is_mode1_kit_entry() {
+        let unit = include_str!("../deploy/node/gate4agent-node.service");
+        assert!(unit.contains("ExecStart=/usr/local/bin/gate4agent-node"));
+        assert!(unit.contains("gate4agent node (standard kit)"));
+        assert!(
+            !unit.contains("INSTALL_PROVIDER_CLIS"),
+            "mode 1 unit must not install provider CLIs"
+        );
+        assert!(
+            unit.contains("GATE4AGENT_WG_INTERFACE") || unit.contains("WireGuard"),
+            "unit must document optional WG env"
+        );
+    }
+
+    #[test]
+    fn dockerfile_and_build_script_are_mode2() {
+        let dockerfile = include_str!("../deploy/node/Dockerfile");
+        assert!(dockerfile.contains("cargo build --locked --release -p gate4agent-node"));
+        assert!(dockerfile.contains("ENTRYPOINT [\"gate4agent-node\"]"));
+        assert!(dockerfile.contains("COPY dig2browser"));
+        assert!(dockerfile.contains("COPY mail4agent"));
+        assert!(dockerfile.contains("COPY session-restore"));
+        assert!(
+            !dockerfile.contains("GATE4AGENT_NODE_TOKEN"),
+            "image must not bake a node token"
+        );
+        let build = include_str!("../deploy/node/docker-build.sh");
+        assert!(build.contains("docker build"));
+        assert!(build.contains("gate4agent-node:kit"));
+        assert!(build.contains("copy_tree \"$WS/dig2browser\""));
+        assert!(build.contains("copy_tree \"$WS/mail4agent\""));
+        assert!(build.contains("copy_tree \"$WS/session-restore\""));
+    }
+
+    #[test]
+    fn qemu_guest_script_is_mode3_underlay_only() {
+        let script = include_str!("../deploy/node/qemu-guest.sh");
+        assert!(script.contains("Mode 3"));
+        assert!(script.contains("QEMU_NET"));
+        assert!(script.contains("tap") && script.contains("user"));
+        assert!(
+            script.contains("Kernel WireGuard is not a QEMU network"),
+            "script must keep WG out of the QEMU NIC story"
+        );
+        assert!(script.contains("GATE4AGENT_WG_"));
+        assert!(script.contains("gate4agent-node"));
+        // Guest boot stays opt-in: this test only reads the script text.
+        assert!(
+            !script.contains("cargo test"),
+            "qemu guest script must not be wired into cargo test"
+        );
+    }
+
+    #[test]
+    fn deploy_readme_names_three_modes() {
+        let readme = include_str!("../deploy/node/README.md");
+        assert!(readme.contains("Mode 1 — service"));
+        assert!(readme.contains("Mode 2 — container"));
+        assert!(readme.contains("Mode 3 — QEMU guest"));
+        assert!(readme.contains("--no-default-features --features bare"));
+    }
+}

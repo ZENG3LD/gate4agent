@@ -338,9 +338,16 @@ async fn main() {
     }
     #[cfg(feature = "kit")]
     {
-        // Link the four cores into this process. Does not start them and does not read secrets.
+        // Link the four cores into this process. Does not start a browser,
+        // provider CLI, or tunnel, and does not read secrets.
         let _linked = gate4agent_node::force_link();
         tracing::info!(cores = ?gate4agent_node::linked_core_names(), "node kit");
+        // Automatic mailbox: same daemon as the standalone mail4agent binary.
+        // Bare builds do not compile this path.
+        let _mailbox = gate4agent_node::start_mailbox().unwrap_or_else(|error| {
+            fail(&format!("mail4agent mailbox: {error}"))
+        });
+        tracing::info!("node kit mailbox started");
     }
     #[cfg(feature = "wireguard")]
     if let Some(wg) = gate4agent_node::node_wg_from_env().unwrap_or_else(|error| fail(&error)) {

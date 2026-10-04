@@ -10,11 +10,11 @@ pub fn linked_core_names() -> &'static [&'static str] {
 }
 
 /// Touches a real symbol in each core so the default node binary links them.
-/// Does not start a browser, a mailbox, a provider CLI, or a tunnel, and
-/// does not read a secret.
+/// Does not start a browser, a provider CLI, or a tunnel, and does not read
+/// a secret. The mailbox is started separately by [`start_mailbox`].
 pub fn force_link() -> usize {
     let dig2 = dig2browser::browser_stream::LOCAL_PAGE_HTML.len();
-    let mail: fn() -> Result<(), mail4agent::MainError> = mail4agent::main;
+    let mail: fn() -> Result<mail4agent::MailboxJoinHandle, mail4agent::MainError> = mail4agent::spawn;
     let claude = std::mem::size_of::<claude_session_restore::transcript::SessionEvent>();
     let codex = codex_session_restore::MAX_HEAD_BYTES;
     let grok: fn() = grok_session_restore::main;
@@ -32,6 +32,13 @@ pub fn force_link() -> usize {
         .wrapping_add(crate::kit_wireguard::LINK_TAG.len())
 }
 
+/// Start the mail4agent mailbox on a background thread (kit only).
+/// Same daemon the standalone `mail4agent` binary runs; no node is required
+/// for that binary path. Bare builds do not compile this function.
+pub fn start_mailbox() -> Result<mail4agent::MailboxJoinHandle, mail4agent::MainError> {
+    mail4agent::spawn()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,5 +50,12 @@ mod tests {
             ["dig2browser", "mail4agent", "session-restore", "wireguard"]
         );
         assert!(force_link() > 0);
+    }
+
+    #[test]
+    fn kit_exposes_mailbox_automaton_entry() {
+        let start: fn() -> Result<mail4agent::MailboxJoinHandle, mail4agent::MainError> =
+            start_mailbox;
+        assert!(start as usize != 0);
     }
 }

@@ -28,7 +28,7 @@ not pass the flag.
 
 Entry point: the `gate4agent-node` binary from a default-feature build, installed as `deploy/node/gate4agent-node.service`.
 
-The process links the four cores at startup (`force_link`). It does not start Chrome, the mailbox, or a tunnel unless the operator sets `GATE4AGENT_WG_*`. Those variables name a key *path* and the peer; the unit file does not contain secrets. If `ip link add type wireguard` fails, the process exits. It does not fall back to the mesh stub.
+The process links the four cores at startup (`force_link`) and starts the mail4agent mailbox on a background thread. It does not start Chrome or a tunnel unless the operator sets `GATE4AGENT_WG_*`. Those variables name a key *path* and the peer; the unit file does not contain secrets. If `ip link add type wireguard` fails, the process exits. It does not fall back to the mesh stub.
 
 ## Mode 2 — container (image build)
 

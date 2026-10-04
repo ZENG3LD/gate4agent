@@ -39,7 +39,7 @@ mod kit_wireguard;
 mod network_allowlist_catalog;
 mod platform;
 #[cfg(feature = "kit")]
-pub use kit::{force_link, linked_core_names};
+pub use kit::{force_link, linked_core_names, start_mailbox};
 #[cfg(feature = "wireguard")]
 pub use kit_wireguard::{
     bring_up_node_wireguard, node_wg_from_env, NodeWgPeerConfig, NodeWgPeerError,

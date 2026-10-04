@@ -1,0 +1,16 @@
+[package]
+name = "gate4agent-bidi-relay"
+version = "0.4.8"
+edition = "2021"
+description = "C2 byte relay: HTTP opens a session, WebSocket forwards opaque frame bytes one way and opaque input bytes the other. Does not parse, render, or apply them."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "gate4agent-bidi-relay"
+path = "src/main.rs"
+
+[dependencies]
+futures-util = "0.3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = "0.26"

@@ -1,0 +1,29 @@
+[Unit]
+Description=gate4agent node (standard kit)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Mode 1 entry point: the kit binary built with default features (not `bare`).
+# Provider CLIs are not installed for this mode.
+ExecStart=/usr/local/bin/gate4agent-node --node-id NODE --workspace WS=/var/lib/gate4agent/workspace
+# Secrets stay outside this unit. Point EnvironmentFile at a file the operator
+# provisions (token, WireGuard key *path*, peer public key). Do not put key
+# material in this file.
+EnvironmentFile=-/etc/gate4agent/node.env
+# Optional kernel WireGuard peer (node and C2; either side may dial). Unset
+# GATE4AGENT_WG_INTERFACE leaves the tunnel down. There is no UDP-mesh fallback
+# and HQ is not started.
+# GATE4AGENT_WG_INTERFACE=g4a-node
+# GATE4AGENT_WG_PRIVATE_KEY=/etc/gate4agent/node.key
+# GATE4AGENT_WG_ADDRESS=10.88.0.2
+# GATE4AGENT_WG_PEER_ADDRESS=10.88.0.1
+# GATE4AGENT_WG_PEER_KEY=<c2 public key>
+# GATE4AGENT_WG_LISTEN_PORT=51820
+# GATE4AGENT_WG_PEER_ENDPOINT=203.0.113.10:51820
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

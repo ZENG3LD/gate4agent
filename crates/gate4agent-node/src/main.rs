@@ -1,18 +1,17 @@
-use gate4agent_node::{
-    default_node_endpoint, default_state_path, ManagedWorktreeProfile, NodeServer,
-    HistorySourceLayout, NativeHistoryConfig, NativeHistoryRoot, NodeSecretReference,
-    NodeSecretResolveError, NodeSecretResolver, NodeSecretValue, NodeServerConfig,
-    WorkspaceConfig, WorktreeServiceMode, NETWORK_ALLOWLIST_CATALOG_ENV,
-    resolve_network_allowlist_catalog,
-};
-use std::sync::Arc;
 use gate4agent_node::protocol::{
-    ManagedWorktreeRetention, NodeId, SessionRecordRetentionConfig, WorktreeProfileId,
-    WorktreeProfileRevision, WorkspaceId,
+    ManagedWorktreeRetention, NodeId, SessionRecordRetentionConfig, WorkspaceId, WorktreeProfileId,
+    WorktreeProfileRevision,
+};
+use gate4agent_node::{
+    default_node_endpoint, default_state_path, resolve_network_allowlist_catalog,
+    HistorySourceLayout, ManagedWorktreeProfile, NativeHistoryConfig, NativeHistoryRoot,
+    NodeSecretReference, NodeSecretResolveError, NodeSecretResolver, NodeSecretValue, NodeServer,
+    NodeServerConfig, WorkspaceConfig, WorktreeServiceMode, NETWORK_ALLOWLIST_CATALOG_ENV,
 };
 use gate4agent_types::AdapterId;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const NODE_TOKEN_ENV: &str = "GATE4AGENT_NODE_TOKEN";
 /// Optional node-local bridge secret (distinct from NODE_TOKEN). Never logged.
@@ -32,9 +31,9 @@ async fn main() {
         .init();
     let mut endpoint = default_node_endpoint()
         .and_then(|path| {
-            path.into_os_string().into_string().map_err(|_| {
-                gate4agent_node::NodeServerError::InvalidEndpoint
-            })
+            path.into_os_string()
+                .into_string()
+                .map_err(|_| gate4agent_node::NodeServerError::InvalidEndpoint)
         })
         .unwrap_or_else(|error| fail(&error.to_string()));
     let mut api_listen = "127.0.0.1:18310"
@@ -67,9 +66,9 @@ async fn main() {
             // Loopback only. Off unless supplied. Optional GATE4AGENT_BRIDGE_TOKEN.
             "--bridge-listen" => {
                 let value = required_value("--bridge-listen", args.next());
-                let addr = value.parse().unwrap_or_else(|error| {
-                    fail(&format!("--bridge-listen is invalid: {error}"))
-                });
+                let addr = value
+                    .parse()
+                    .unwrap_or_else(|error| fail(&format!("--bridge-listen is invalid: {error}")));
                 if bridge_listen.replace(addr).is_some() {
                     fail("--bridge-listen may only be supplied once");
                 }
@@ -105,25 +104,26 @@ async fn main() {
             // wire's server either way; only who places the call changes.
             "--c2-dial" => {
                 let value = required_value("--c2-dial", args.next());
-                call_home = Some(value.parse().unwrap_or_else(|error| {
-                    fail(&format!("--c2-dial is invalid: {error}"))
-                }));
+                call_home = Some(
+                    value
+                        .parse()
+                        .unwrap_or_else(|error| fail(&format!("--c2-dial is invalid: {error}"))),
+                );
             }
             "--node-id" => {
                 let value = required_value("--node-id", args.next());
-                let parsed = NodeId::new(value)
-                    .unwrap_or_else(|error| fail(&error.to_string()));
+                let parsed = NodeId::new(value).unwrap_or_else(|error| fail(&error.to_string()));
                 if node_id.replace(parsed).is_some() {
                     fail("--node-id may only be supplied once");
                 }
             }
             "--workspace" => {
                 let value = required_value("--workspace", args.next());
-                let (id, root) = value.split_once('=').unwrap_or_else(|| {
-                    fail("--workspace requires ID=ABSOLUTE_PATH")
-                });
-                let workspace_id = WorkspaceId::new(id)
-                    .unwrap_or_else(|error| fail(&error.to_string()));
+                let (id, root) = value
+                    .split_once('=')
+                    .unwrap_or_else(|| fail("--workspace requires ID=ABSOLUTE_PATH"));
+                let workspace_id =
+                    WorkspaceId::new(id).unwrap_or_else(|error| fail(&error.to_string()));
                 workspaces.push(
                     WorkspaceConfig::new(workspace_id, root)
                         .unwrap_or_else(|error| fail(&error.to_string())),
@@ -134,8 +134,8 @@ async fn main() {
                 let (id, mode) = value.split_once('=').unwrap_or_else(|| {
                     fail("--worktree-mode requires WORKSPACE_ID=manual|managed|off")
                 });
-                let workspace_id = WorkspaceId::new(id)
-                    .unwrap_or_else(|error| fail(&error.to_string()));
+                let workspace_id =
+                    WorkspaceId::new(id).unwrap_or_else(|error| fail(&error.to_string()));
                 let mode = match mode {
                     "manual" => WorktreeServiceMode::Manual,
                     "managed" => WorktreeServiceMode::Managed,
@@ -151,8 +151,8 @@ async fn main() {
                 let (workspace, fields) = value.split_once('=').unwrap_or_else(|| {
                     fail("--managed-worktree-profile requires WORKSPACE_ID=PROFILE|REVISION|ABS_ROOT|BRANCH_PREFIX|BASE|RETENTION")
                 });
-                let workspace_id = WorkspaceId::new(workspace)
-                    .unwrap_or_else(|error| fail(&error.to_string()));
+                let workspace_id =
+                    WorkspaceId::new(workspace).unwrap_or_else(|error| fail(&error.to_string()));
                 let fields = fields.split('|').collect::<Vec<_>>();
                 if fields.len() != 6 {
                     fail("--managed-worktree-profile requires exactly six pipe-separated profile fields");
@@ -171,7 +171,8 @@ async fn main() {
                     fields[3],
                     fields[4],
                     retention,
-                ).unwrap_or_else(|error| fail(&error));
+                )
+                .unwrap_or_else(|error| fail(&error));
                 managed_profiles.push((workspace_id, profile));
             }
             "--history-root" => {
@@ -191,7 +192,8 @@ async fn main() {
             // Empty/unset keeps the empty-default catalog (unknown ids refuse).
             // Dig2 station probe is a separate optional feature — this flag is network ids only.
             "--network-allowlist-catalog" => {
-                let value = PathBuf::from(required_value("--network-allowlist-catalog", args.next()));
+                let value =
+                    PathBuf::from(required_value("--network-allowlist-catalog", args.next()));
                 if network_allowlist_catalog.replace(value).is_some() {
                     fail("--network-allowlist-catalog may only be supplied once");
                 }
@@ -207,7 +209,20 @@ async fn main() {
                 println!("--bridge-underlay-listen: tip 6 mesh underlay UDP accept → TCP relay to --bridge-listen (requires {BRIDGE_TOKEN_ENV} + {MESH_UNDERLAY_KEY_ENV} + {MESH_UNDERLAY_TOKEN_ENV}; HQ dial-only; no WG daemon)");
                 println!("network allowlist catalog: --network-allowlist-catalog or {NETWORK_ALLOWLIST_CATALOG_ENV} (opaque ids, one per line; empty default)");
                 println!("session environment: materialized beside the state file (<state-file>.session-environments); secret references fail closed");
-                println!("--c2-dial: dial a relay's call-home listener instead of waiting to be dialled");
+                println!(
+                    "--c2-dial: dial a relay's call-home listener instead of waiting to be dialled"
+                );
+                println!("node kit (default): dig2browser, mail4agent, session-restore, kernel WireGuard. Strip with --no-default-features --features bare");
+                #[cfg(feature = "wireguard")]
+                println!("kernel WireGuard peer (either side may dial): set {wg_iface} to a name plus {wg_key} (path only), {wg_addr}, {wg_peer_addr}, {wg_peer_key}; optional {wg_listen} (default 51820), {wg_endpoint} (omit so C2 dials this node). Not HQ. Not the UDP mesh stub.",
+                    wg_iface = gate4agent_node::WG_INTERFACE_ENV,
+                    wg_key = gate4agent_node::WG_PRIVATE_KEY_ENV,
+                    wg_addr = gate4agent_node::WG_ADDRESS_ENV,
+                    wg_peer_addr = gate4agent_node::WG_PEER_ADDRESS_ENV,
+                    wg_peer_key = gate4agent_node::WG_PEER_KEY_ENV,
+                    wg_listen = gate4agent_node::WG_LISTEN_PORT_ENV,
+                    wg_endpoint = gate4agent_node::WG_PEER_ENDPOINT_ENV,
+                );
                 return;
             }
             unknown => fail(&format!("unknown argument: {unknown}")),
@@ -226,10 +241,13 @@ async fn main() {
         fail("--worktree-mode references an unknown workspace");
     }
     for (workspace_id, profile) in managed_profiles {
-        let workspace = workspaces.iter_mut()
+        let workspace = workspaces
+            .iter_mut()
             .find(|workspace| workspace.workspace_id() == &workspace_id)
             .unwrap_or_else(|| fail("--managed-worktree-profile references an unknown workspace"));
-        *workspace = workspace.clone().with_managed_worktree_profile(profile)
+        *workspace = workspace
+            .clone()
+            .with_managed_worktree_profile(profile)
             .unwrap_or_else(|error| fail(&error.to_string()));
     }
     let state_path = default_state_path(&node_id).unwrap_or_else(|error| fail(&error.to_string()));
@@ -270,23 +288,24 @@ async fn main() {
                 ))
             });
             std::env::remove_var(MESH_UNDERLAY_TOKEN_ENV);
-            let transport_key = parse_underlay_key_hex(&key_hex)
-                .unwrap_or_else(|error| fail(&error));
+            let transport_key =
+                parse_underlay_key_hex(&key_hex).unwrap_or_else(|error| fail(&error));
             config
                 .with_bridge_underlay(bind, transport_key, underlay_token)
                 .unwrap_or_else(|error| fail(&error.to_string()))
         }
         None => config,
     };
-    let config = if let Some(history) = explicit_history_config(history_roots)
-        .unwrap_or_else(|error| fail(&error))
+    let config = if let Some(history) =
+        explicit_history_config(history_roots).unwrap_or_else(|error| fail(&error))
     {
         config.with_history(history)
     } else {
         config
     };
     let config = if let Some(helper) = harness_mcp_helper {
-        config.with_harness_mcp_helper(helper)
+        config
+            .with_harness_mcp_helper(helper)
             .unwrap_or_else(|error| fail(&error.to_string()))
     } else {
         config
@@ -305,6 +324,23 @@ async fn main() {
     // a session environment before the child exists.
     let config = with_cli_session_environment_materialization(config, &state_path)
         .unwrap_or_else(|error| fail(&error));
+    #[cfg(feature = "kit")]
+    {
+        // Link the four cores into this process. Does not start them and does not read secrets.
+        let _linked = gate4agent_node::force_link();
+        tracing::info!(cores = ?gate4agent_node::linked_core_names(), "node kit");
+    }
+    #[cfg(feature = "wireguard")]
+    if let Some(wg) = gate4agent_node::node_wg_from_env().unwrap_or_else(|error| fail(&error)) {
+        tracing::info!(
+            interface = %wg.interface_name,
+            listen_port = wg.listen_port,
+            dials_peer = wg.peer_endpoint.is_some(),
+            "bringing up kernel wireguard node<->c2 peer"
+        );
+        gate4agent_node::bring_up_node_wireguard(&wg)
+            .unwrap_or_else(|error| fail(&error.to_string()));
+    }
     let server = NodeServer::new(config).unwrap_or_else(|error| fail(&error.to_string()));
     if let Err(error) = server.run_until_ctrl_signal().await {
         fail(&error.to_string());
@@ -327,14 +363,16 @@ impl NodeSecretResolver for CliUnavailableSecretResolver {
 
 /// Sibling of the state file, same shape as the delivery store root
 /// (`<file>.delivery-store` → `<file>.session-environments`).
-fn session_environment_root_for_state_path(state_path: &std::path::Path) -> Result<PathBuf, String> {
+fn session_environment_root_for_state_path(
+    state_path: &std::path::Path,
+) -> Result<PathBuf, String> {
     let parent = state_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or_else(|| "state path has no parent for the session-environment root".to_owned())?;
-    let file_name = state_path.file_name().ok_or_else(|| {
-        "state path has no file name for the session-environment root".to_owned()
-    })?;
+    let file_name = state_path
+        .file_name()
+        .ok_or_else(|| "state path has no file name for the session-environment root".to_owned())?;
     let mut name = file_name.to_os_string();
     name.push(".session-environments");
     Ok(parent.join(name))
@@ -370,11 +408,9 @@ fn parse_history_root(value: &str) -> NativeHistoryRoot {
     if adapter.is_empty() || layout.is_empty() || root.is_empty() {
         fail("--history-root requires ADAPTER|LAYOUT|ABS_ROOT");
     }
-    let adapter = AdapterId::new(adapter)
-        .unwrap_or_else(|error| fail(&error.to_string()));
+    let adapter = AdapterId::new(adapter).unwrap_or_else(|error| fail(&error.to_string()));
     let layout = parse_history_layout(layout);
-    NativeHistoryRoot::new(adapter, layout, root)
-        .unwrap_or_else(|error| fail(&error.to_string()))
+    NativeHistoryRoot::new(adapter, layout, root).unwrap_or_else(|error| fail(&error.to_string()))
 }
 
 fn parse_history_layout(value: &str) -> HistorySourceLayout {
@@ -383,12 +419,8 @@ fn parse_history_layout(value: &str) -> HistorySourceLayout {
         "single-json" => HistorySourceLayout::SingleJson,
         "json-or-ndjson" => HistorySourceLayout::JsonOrNdjson,
         "ndjson-with-optional-index" => HistorySourceLayout::NdjsonWithOptionalIndex,
-        "summary-json-with-sibling-ndjson" => {
-            HistorySourceLayout::SummaryJsonWithSiblingNdjson
-        }
-        "metadata-json-with-sibling-json" => {
-            HistorySourceLayout::MetadataJsonWithSiblingJson
-        }
+        "summary-json-with-sibling-ndjson" => HistorySourceLayout::SummaryJsonWithSiblingNdjson,
+        "metadata-json-with-sibling-json" => HistorySourceLayout::MetadataJsonWithSiblingJson,
         "session-json-with-sibling-message-json" => {
             HistorySourceLayout::SessionJsonWithSiblingMessageJson
         }
@@ -401,12 +433,14 @@ fn parse_history_layout(value: &str) -> HistorySourceLayout {
 }
 
 fn parse_session_record_retention_age_ms(value: &str) -> Result<u64, String> {
-    value.parse()
+    value
+        .parse()
         .map_err(|error| format!("--session-record-retention-age-ms is invalid: {error}"))
 }
 
 fn parse_session_record_retention_keep(value: &str) -> Result<u32, String> {
-    value.parse()
+    value
+        .parse()
         .map_err(|error| format!("--session-record-retention-keep is invalid: {error}"))
 }
 
@@ -414,13 +448,10 @@ fn required_value(flag: &str, value: Option<String>) -> String {
     value.unwrap_or_else(|| fail(&format!("{flag} requires a value")))
 }
 
-
 fn parse_underlay_key_hex(value: &str) -> Result<[u8; 32], String> {
     let value = value.trim();
     if value.len() != 64 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(
-            "GATE4AGENT_MESH_UNDERLAY_KEY must be exactly 64 hex digits (32 bytes)".into(),
-        );
+        return Err("GATE4AGENT_MESH_UNDERLAY_KEY must be exactly 64 hex digits (32 bytes)".into());
     }
     let mut out = [0u8; 32];
     for (i, chunk) in value.as_bytes().chunks(2).enumerate() {
@@ -457,9 +488,8 @@ mod tests {
 
     #[test]
     fn explicit_history_root_remains_the_only_history_authority() {
-        let root = parse_history_root(
-            r"codex|ndjson-with-optional-index|C:\operator-approved-history",
-        );
+        let root =
+            parse_history_root(r"codex|ndjson-with-optional-index|C:\operator-approved-history");
         let config = explicit_history_config(vec![root]).unwrap().unwrap();
         assert_eq!(config.roots().len(), 1);
     }
@@ -544,7 +574,10 @@ mod tests {
         let marker = session_environment_root_for_state_path(&state_path)
             .unwrap()
             .join(".gate4agent-materialization-root");
-        assert!(marker.is_file(), "materializer did not initialize beside the state file");
+        assert!(
+            marker.is_file(),
+            "materializer did not initialize beside the state file"
+        );
         match bare.with_session_environment_materialization(
             PathBuf::from("relative-root"),
             Arc::new(CliUnavailableSecretResolver),

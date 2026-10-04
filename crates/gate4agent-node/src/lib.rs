@@ -28,45 +28,60 @@ mod workspace_file_windows;
 #[cfg(unix)]
 mod workspace_file_unix;
 
-mod network_allowlist_catalog;
-#[cfg(feature = "dig2-station-probe")]
-mod dig2_station_probe;
 #[cfg(feature = "dig2-station-probe")]
 mod dig2_station_lease;
+#[cfg(feature = "dig2-station-probe")]
+mod dig2_station_probe;
+#[cfg(feature = "kit")]
+mod kit;
+#[cfg(feature = "wireguard")]
+mod kit_wireguard;
+mod network_allowlist_catalog;
 mod platform;
+#[cfg(feature = "kit")]
+pub use kit::{force_link, linked_core_names};
+#[cfg(feature = "wireguard")]
+pub use kit_wireguard::{
+    bring_up_node_wireguard, node_wg_from_env, NodeWgPeerConfig, NodeWgPeerError,
+    LINK_TAG as WIREGUARD_LINK_TAG, WG_ADDRESS_ENV, WG_INTERFACE_ENV, WG_KEEPALIVE_ENV,
+    WG_LISTEN_PORT_ENV, WG_PEER_ADDRESS_ENV, WG_PEER_ENDPOINT_ENV, WG_PEER_KEY_ENV,
+    WG_PRIVATE_KEY_ENV,
+};
 mod provider_runtime;
-mod spawn_spec;
 mod server;
+mod spawn_spec;
 
+#[cfg(feature = "fixture")]
+pub use bundle_catalog::protect_bundle_source_tree_fixture;
+pub use bundle_catalog::{
+    BundleCatalog, BundleCatalogError, NodeBundle, NodeBundleError, NodeBundleFile,
+    MAX_BUNDLE_CATALOG_ENTRIES, MAX_BUNDLE_FILES, MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_PATH_BYTES,
+    MAX_BUNDLE_TOTAL_BYTES,
+};
+pub use environment_profiles::{
+    NodeEnvironmentProfile, NodeEnvironmentProfileError, MAX_NODE_ENVIRONMENT_PROFILES,
+};
+pub use gate4agent_node_protocol::WorktreeServiceMode;
+pub use gate4agent_runtime_native::{
+    orca_home_roots, HistorySourceLayout, NativeHistoryConfig, NativeHistoryRoot,
+};
 pub use network_allowlist_catalog::{
-    load_network_allowlist_catalog_file, parse_network_allowlist_catalog_text,
     claude_allowed_domains_from_permits, claude_bash_sandbox_network_os_supported,
     claude_settings_network_overlay_args, claude_station_network_settings_json,
-    codex_network_access_config_overlay, permit_peer_to_allowed_domain,
+    codex_network_access_config_overlay, load_network_allowlist_catalog_file,
+    parse_network_allowlist_catalog_text, permit_peer_to_allowed_domain,
     provider_native_mapping_supported, resolve_network_allowlist_catalog,
-    resolve_provider_native_launch_overlay, NetworkAllowlistCatalog,
-    NetworkAllowlistCatalogError, NetworkAllowlistEntry, NetworkPermitProtocol,
-    NetworkPermitSketch, ProviderNativeNetworkSketch,
+    resolve_provider_native_launch_overlay, NetworkAllowlistCatalog, NetworkAllowlistCatalogError,
+    NetworkAllowlistEntry, NetworkPermitProtocol, NetworkPermitSketch, ProviderNativeNetworkSketch,
     CLAUDE_STATION_NETWORK_SETTINGS_FILE, MAX_NETWORK_ALLOWLIST_CATALOG_ENTRIES,
     MAX_NETWORK_PERMITS_PER_ENTRY, NETWORK_ALLOWLIST_CATALOG_ENV,
     NETWORK_ALLOWLIST_CATALOG_SCHEMA_VERSION,
 };
+#[cfg(feature = "fixture")]
+pub use server::SpawnManagedWorktreeV2FailureProbe;
 pub use server::{
     default_node_endpoint, default_state_path, NodeServer, NodeServerConfig, NodeServerError,
     NodeShutdownHandle, WorkspaceConfig,
-};
-#[cfg(feature = "fixture")]
-pub use server::SpawnManagedWorktreeV2FailureProbe;
-pub use gate4agent_node_protocol::WorktreeServiceMode;
-pub use bundle_catalog::{
-    BundleCatalog, BundleCatalogError, NodeBundle, NodeBundleError, NodeBundleFile,
-    MAX_BUNDLE_CATALOG_ENTRIES, MAX_BUNDLE_FILES, MAX_BUNDLE_FILE_BYTES,
-    MAX_BUNDLE_PATH_BYTES, MAX_BUNDLE_TOTAL_BYTES,
-};
-#[cfg(feature = "fixture")]
-pub use bundle_catalog::protect_bundle_source_tree_fixture;
-pub use environment_profiles::{
-    NodeEnvironmentProfile, NodeEnvironmentProfileError, MAX_NODE_ENVIRONMENT_PROFILES,
 };
 pub use session_environment::{
     NodeSecretReference, NodeSecretResolveError, NodeSecretResolver, NodeSecretValue,
@@ -77,16 +92,83 @@ pub use session_environment::{
     MAX_SESSION_MATERIALIZATION_FILES, MAX_SESSION_MATERIALIZATION_FILE_BYTES,
     MAX_SESSION_MATERIALIZATION_RELATIVE_PATH_BYTES,
 };
-pub use worktree_service::ManagedWorktreeProfile;
 pub use spawn_spec::{
-    SpawnProfileRegistry, SpawnProfileRegistryError, DEFAULT_SPAWN_PROFILE_ID,
-    MAX_SPAWN_PROFILES,
+    SpawnProfileRegistry, SpawnProfileRegistryError, DEFAULT_SPAWN_PROFILE_ID, MAX_SPAWN_PROFILES,
 };
-pub use gate4agent_runtime_native::{
-    orca_home_roots, HistorySourceLayout, NativeHistoryConfig, NativeHistoryRoot,
-};
+pub use worktree_service::ManagedWorktreeProfile;
 
 #[cfg(windows)]
 pub use server::DEFAULT_NODE_ENDPOINT;
 
 pub use gate4agent_node_protocol as protocol;
+
+#[cfg(test)]
+mod kit_manifest {
+    #[test]
+    fn default_features_mention_four_cores_and_bare_excludes_them() {
+        let manifest = include_str!("../Cargo.toml");
+        let features = manifest
+            .split("[features]")
+            .nth(1)
+            .expect("features section")
+            .split("\n[")
+            .next()
+            .expect("features body");
+        assert!(
+            features.contains("default = [\"kit\"]"),
+            "default build must include the kit"
+        );
+        let kit = feature_array(features, "kit");
+        for core in [
+            "dep:dig2browser",
+            "dep:mail4agent",
+            "dep:claude-session-restore",
+            "dep:codex-session-restore",
+            "dep:grok-session-restore",
+            "dep:kimi-session-restore",
+            "wireguard",
+        ] {
+            assert!(
+                kit.iter().any(|item| item == core),
+                "kit feature missing {core}: {kit:?}"
+            );
+        }
+        let bare = feature_array(features, "bare");
+        assert!(
+            bare.is_empty(),
+            "bare must not enable kit cores, got {bare:?}"
+        );
+        let code = manifest
+            .lines()
+            .map(|line| line.split('#').next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("hatchery-tui") && !code.contains("hatchery_tui"),
+            "node kit must not depend on the hatchery TUI"
+        );
+        assert!(manifest.contains("path = \"../../../dig2browser\""));
+        assert!(manifest.contains("path = \"../../../mail4agent\""));
+        assert!(manifest.contains("claude-session-restore = { version = \"0.1.3\""));
+        assert!(manifest.contains("codex-session-restore = { version = \"0.1.3\""));
+        assert!(manifest.contains("grok-session-restore"));
+        assert!(manifest.contains("kimi-session-restore"));
+    }
+
+    fn feature_array(features: &str, name: &str) -> Vec<String> {
+        let line_start = features
+            .find(&format!("{name} = "))
+            .unwrap_or_else(|| panic!("missing feature {name}"));
+        let rest = &features[line_start + name.len() + 3..];
+        if rest.starts_with("[]") {
+            return Vec::new();
+        }
+        assert!(rest.starts_with("["), "{name} must be an array");
+        let end = rest.find(']').unwrap_or_else(|| panic!("{name} array"));
+        rest[1..end]
+            .split(',')
+            .map(|item| item.trim().trim_matches('"').to_owned())
+            .filter(|item| !item.is_empty())
+            .collect()
+    }
+}

@@ -34,6 +34,6 @@ The process links the four cores at startup (`force_link`). It does not start Ch
 
 Entry point: `deploy/node/Dockerfile`, invoked by `deploy/node/docker-build.sh`. The image runs the same kit binary. `ENTRYPOINT` is `gate4agent-node`. No secret is copied into the image. Provider CLIs stay uninstalled unless `INSTALL_PROVIDER_CLIS=1` and `PROVIDER_CLI_INSTALL` is set at build time (`install-provider-clis.sh`).
 
-## Mode 3 — QEMU guest (stub)
+## Mode 3 — QEMU guest
 
-Entry point: `deploy/node/qemu-guest.sh`. It prints the guest flow and exits. It uses the same kit binary as mode 1. Provider CLIs are the same package script as mode 2. The stub does not boot QEMU and does not provision secrets.
+Entry point: `deploy/node/qemu-guest.sh`. It builds a minimal Alpine initramfs and boots it under QEMU with the same kit binary as mode 1. A virtio-9p mount (`kit`) carries the binary, its libraries, `ip`, and `wg`. The QEMU NIC is user-mode or a tap and is only the underlay. Kernel WireGuard is not a QEMU network. When `GATE4AGENT_WG_*` is set in the guest environment file, the node process creates the tunnel and dials C2 over it, the same as mode 1. The script does not provision secrets; it copies an operator-supplied environment file and the private-key file that file names.

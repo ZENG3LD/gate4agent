@@ -44,6 +44,9 @@ async fn main() {
     // Tip 6: optional underlay UDP accept (may be non-loopback); relays to bridge_listen.
     let mut bridge_underlay_listen: Option<std::net::SocketAddr> = None;
     let mut call_home: Option<std::net::SocketAddr> = None;
+    // Off by default. When set, check for claude/codex/kimi/grok and download
+    // only missing binaries. Never runs provider logins.
+    let mut install_provider_clis = false;
     let mut node_id = None;
     let mut workspaces = Vec::new();
     let mut worktree_modes = BTreeMap::new();
@@ -198,8 +201,11 @@ async fn main() {
                     fail("--network-allowlist-catalog may only be supplied once");
                 }
             }
+            "--install-provider-clis" => {
+                install_provider_clis = true;
+            }
             "--help" | "-h" => {
-                println!("gate4agent-node --node-id ID --workspace ID=ABSOLUTE_PATH [--worktree-mode ID=manual|managed|off] [--managed-worktree-profile 'ID=PROFILE|REVISION|ABS_ROOT|BRANCH_PREFIX|BASE|RETENTION'] [--history-root 'ADAPTER|LAYOUT|ABS_ROOT'] [--harness-mcp-helper ABSOLUTE_REGULAR_FILE] [--network-allowlist-catalog ABSOLUTE_REGULAR_FILE] [--endpoint ABSOLUTE_LOCAL_ENDPOINT] [--api-listen 127.0.0.1:PORT] [--bridge-listen 127.0.0.1:PORT] [--bridge-underlay-listen ADDR] [--c2-dial 127.0.0.1:PORT] [--session-record-retention-age-ms MILLISECONDS] [--session-record-retention-keep COUNT]");
+                println!("gate4agent-node --node-id ID --workspace ID=ABSOLUTE_PATH [--worktree-mode ID=manual|managed|off] [--managed-worktree-profile 'ID=PROFILE|REVISION|ABS_ROOT|BRANCH_PREFIX|BASE|RETENTION'] [--history-root 'ADAPTER|LAYOUT|ABS_ROOT'] [--harness-mcp-helper ABSOLUTE_REGULAR_FILE] [--network-allowlist-catalog ABSOLUTE_REGULAR_FILE] [--endpoint ABSOLUTE_LOCAL_ENDPOINT] [--api-listen 127.0.0.1:PORT] [--bridge-listen 127.0.0.1:PORT] [--bridge-underlay-listen ADDR] [--c2-dial 127.0.0.1:PORT] [--install-provider-clis] [--session-record-retention-age-ms MILLISECONDS] [--session-record-retention-keep COUNT]");
                 println!("RETENTION: remove-when-released or retain");
                 println!("--session-record-retention-age-ms/--session-record-retention-keep: retire dead Unavailable managed session records; both default to 0 (disabled)");
                 println!("LAYOUT: single-ndjson|single-json|json-or-ndjson|ndjson-with-optional-index|summary-json-with-sibling-ndjson|metadata-json-with-sibling-json|session-json-with-sibling-message-json|readonly-sqlite-projection|state-json-with-index-and-sibling-ndjson");
@@ -211,6 +217,9 @@ async fn main() {
                 println!("session environment: materialized beside the state file (<state-file>.session-environments); secret references fail closed");
                 println!(
                     "--c2-dial: dial a relay's call-home listener instead of waiting to be dialled"
+                );
+                println!(
+                    "--install-provider-clis: off by default; when set, download missing claude/codex/kimi/grok packages only (no logins)"
                 );
                 println!("node kit (default): dig2browser, mail4agent, session-restore, kernel WireGuard. Strip with --no-default-features --features bare");
                 #[cfg(feature = "wireguard")]
@@ -324,6 +333,9 @@ async fn main() {
     // a session environment before the child exists.
     let config = with_cli_session_environment_materialization(config, &state_path)
         .unwrap_or_else(|error| fail(&error));
+    if install_provider_clis {
+        install_missing_provider_clis().unwrap_or_else(|error| fail(&error));
+    }
     #[cfg(feature = "kit")]
     {
         // Link the four cores into this process. Does not start them and does not read secrets.
@@ -442,6 +454,63 @@ fn parse_session_record_retention_keep(value: &str) -> Result<u32, String> {
     value
         .parse()
         .map_err(|error| format!("--session-record-retention-keep is invalid: {error}"))
+}
+
+
+/// Check PATH for claude/codex/kimi/grok. Download only missing packages.
+/// Never runs provider login or auth flows. Off unless `--install-provider-clis`.
+fn install_missing_provider_clis() -> Result<(), String> {
+    use std::process::Command;
+    // Prefer the deploy script when present (Docker image copies it to sbin).
+    let script_candidates = [
+        PathBuf::from("/usr/local/sbin/install-provider-clis"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("deploy/node/install-provider-clis.sh"),
+    ];
+    for script in &script_candidates {
+        if script.is_file() {
+            let status = Command::new(script)
+                .env("INSTALL_PROVIDER_CLIS", "1")
+                .status()
+                .map_err(|error| format!("install-provider-clis: {error}"))?;
+            if status.success() {
+                return Ok(());
+            }
+            return Err(format!(
+                "install-provider-clis exited with {status}"
+            ));
+        }
+    }
+    // Fallback: inline check + npm for claude/codex only.
+    for (name, npm_pkg) in [
+        ("claude", Some("@anthropic-ai/claude-code")),
+        ("codex", Some("@openai/codex")),
+        ("kimi", None),
+        ("grok", None),
+    ] {
+        let present = Command::new("sh")
+            .args(["-c", &format!("command -v {name}")])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if present {
+            tracing::info!(provider = name, "provider CLI already present");
+            continue;
+        }
+        let Some(pkg) = npm_pkg else {
+            return Err(format!(
+                "install-provider-clis: {name} is missing and has no default package download; set PROVIDER_CLI_INSTALL"
+            ));
+        };
+        tracing::info!(provider = name, package = pkg, "downloading missing provider CLI");
+        let status = Command::new("npm")
+            .args(["install", "-g", pkg])
+            .status()
+            .map_err(|error| format!("npm install -g {pkg}: {error}"))?;
+        if !status.success() {
+            return Err(format!("npm install -g {pkg} failed: {status}"));
+        }
+    }
+    Ok(())
 }
 
 fn required_value(flag: &str, value: Option<String>) -> String {

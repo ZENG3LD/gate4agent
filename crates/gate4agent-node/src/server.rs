@@ -1247,7 +1247,9 @@ impl NodeServerConfig {
         mut self,
         relay: std::net::SocketAddr,
     ) -> Result<Self, NodeServerError> {
-        if !relay.ip().is_loopback() || relay.port() == 0 {
+        // Loopback, or the concrete C2 WireGuard tunnel address. Unspecified
+        // and port 0 refused — plaintext wire must not dial every interface.
+        if relay.port() == 0 || relay.ip().is_unspecified() {
             return Err(NodeServerError::InvalidCallHome(relay));
         }
         self.call_home = Some(relay);
@@ -17071,7 +17073,7 @@ pub enum NodeServerError {
     InvalidBridgeUnderlayToken,
     #[error("mesh underlay transport key must be 32 bytes (64 hex digits)")]
     InvalidBridgeUnderlayKey,
-    #[error("node call-home relay must be a loopback address with a nonzero port: {0}")]
+    #[error("node call-home relay must be loopback or a concrete C2 tunnel address with a nonzero port: {0}")]
     InvalidCallHome(std::net::SocketAddr),
     #[error("node could not reach its call-home relay: {0}")]
     CallHomeTransport(#[source] std::io::Error),

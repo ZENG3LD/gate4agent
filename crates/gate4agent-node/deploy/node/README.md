@@ -17,7 +17,12 @@ cargo build -p gate4agent-node --no-default-features --features bare
 
 `hatchery-git` is an optional extra and is not default. It does not depend on hatchery-tui or any hatchery crate. Hatchery git helpers are not part of the core kit.
 
-Provider CLIs (`claude`, `codex`, `kimi`, `grok`) are packages for modes 2 and 3 only. They are not copied credentials and they are not installed by the mode 1 unit.
+Provider CLIs (`claude`, `codex`, `kimi`, `grok`) are packages. They are not copied credentials.
+The node flag `--install-provider-clis` is **off by default**. When set (or when
+`INSTALL_PROVIDER_CLIS=1` for the Docker/QEMU install script), the install path
+checks PATH for each binary and downloads only the missing ones. It does not run
+provider logins. Without the flag, nothing is downloaded. Mode 1's unit file does
+not pass the flag.
 
 ## Mode 1 — service (implemented)
 

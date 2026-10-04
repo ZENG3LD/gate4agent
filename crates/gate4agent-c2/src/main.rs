@@ -182,6 +182,7 @@ fn print_help() {
     );
     println!("  --control-tunnel: HQ WireGuard client control TCP, bound to the C2 tunnel address only (not 0.0.0.0). Unix --control-endpoint stays.");
     println!("  accept: this node dials in instead of being dialled; requires --node-listen");
+    println!("  --node-listen: loopback or the C2 WireGuard tunnel address (not 0.0.0.0); kit peers dial over WG");
 }
 
 #[cfg(not(any(windows, unix)))]

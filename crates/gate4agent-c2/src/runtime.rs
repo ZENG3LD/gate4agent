@@ -203,19 +203,23 @@ impl C2Config {
 
     /// Binds the address nodes call in on.
     ///
-    /// Loopback only, deliberately, and for the same reason every other
-    /// listener in this stack is: the node wire authenticates both ends
-    /// with a mutual challenge-response but encrypts nothing, so its
-    /// frames -- terminal contents, keystrokes, file bytes -- are
-    /// plaintext JSON. Accepting node connections from off-box would put
-    /// all of that on the network. Direction and distance are separate
-    /// problems and this change only solves direction.
+    /// Loopback, or one concrete C2 WireGuard tunnel address (same rule as
+    /// [`Self::with_control_tunnel_listen`]). The node wire authenticates both
+    /// ends but encrypts nothing, so `0.0.0.0` and other unspecified binds are
+    /// refused: off-tunnel plaintext would expose terminal contents. When the
+    /// listen address is the C2 tunnel IP, kernel WireGuard encrypts the path
+    /// and either side may dial.
     pub fn with_node_listen(mut self, node_listen: SocketAddr) -> Result<Self, C2ConfigError> {
-        if !node_listen.ip().is_loopback() || node_listen.port() == 0 {
+        // Concrete non-unspecified + nonzero port. Loopback stays valid; WG
+        // tunnel addresses (e.g. 10.88.1.2:PORT) are valid for kit peers.
+        if node_listen.port() == 0 || node_listen.ip().is_unspecified() {
             return Err(C2ConfigError::NonLoopbackNodeListen(node_listen));
         }
         if node_listen == self.api_listen {
             return Err(C2ConfigError::NodeListenConflict);
+        }
+        if self.control_tunnel_listen == Some(node_listen) {
+            return Err(C2ConfigError::NonLoopbackNodeListen(node_listen));
         }
         self.node_listen = Some(node_listen);
         Ok(self)
@@ -360,7 +364,7 @@ pub enum C2ConfigError {
     ControlEndpointConflict,
     #[error("C2 control tunnel listen must be a concrete non-unspecified address with a nonzero port, not shared with another listener: {0}")]
     InvalidControlTunnel(SocketAddr),
-    #[error("C2 node call-home listen address must be loopback with a nonzero port: {0}")]
+    #[error("C2 node call-home listen must be loopback or a concrete C2 tunnel address with a nonzero port (not 0.0.0.0, not shared with another listener): {0}")]
     NonLoopbackNodeListen(SocketAddr),
     #[error("C2 node call-home listen address must not equal the API listen address")]
     NodeListenConflict,
@@ -2638,16 +2642,15 @@ mod endpoint_tests {
         assert!(config.validate_call_home().is_ok());
     }
 
-    /// The call-home listener holds the same line every other listener in
-    /// this stack holds. The wire authenticates both ends and encrypts
-    /// nothing, so accepting node connections from off-box would put
-    /// terminal contents and keystrokes on the network in the clear.
+    /// Call-home may bind loopback or a concrete C2 WireGuard tunnel address.
+    /// Unspecified (`0.0.0.0`) and port 0 stay refused so plaintext frames do
+    /// not land on every interface.
     #[test]
-    fn the_call_home_listener_refuses_to_leave_loopback() {
+    fn the_call_home_listener_refuses_unspecified_and_accepts_tunnel() {
         let waiting = node("accept").unwrap();
         let config =
             C2Config::new("127.0.0.1:9000".parse().unwrap(), "safe-token", vec![waiting]).unwrap();
-        for refused in ["0.0.0.0:48200", "192.168.1.10:48200", "127.0.0.1:0"] {
+        for refused in ["0.0.0.0:48200", "127.0.0.1:0", "[::]:48200"] {
             assert!(
                 matches!(
                     config.clone().with_node_listen(refused.parse().unwrap()),
@@ -2656,6 +2659,9 @@ mod endpoint_tests {
                 "accepted {refused}",
             );
         }
+        let tunnel: SocketAddr = "10.88.1.2:27442".parse().unwrap();
+        let accepted = config.clone().with_node_listen(tunnel).unwrap();
+        assert_eq!(accepted.node_listen, Some(tunnel));
         // Sharing the API's own address would mean HTTP and node frames
         // arriving on one socket; neither parser would survive the other.
         assert!(matches!(

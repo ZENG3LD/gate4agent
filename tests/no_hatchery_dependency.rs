@@ -71,21 +71,18 @@ node = { package = "hatchery-node", path = "../x" }
     assert_eq!(hatchery_dependency_lines(manifest).len(), 2);
 }
 
-/// The node and C2 belong to gate4agent, so the scan above must actually see
+/// The node core and wire belong to gate4agent, so the scan above must actually see
 /// them: a boundary test that silently skipped a crate would prove nothing.
 #[test]
-fn the_scan_covers_the_node_and_c2_crates() {
+fn the_scan_covers_the_node_core_and_wire_crates() {
     let scanned: Vec<String> = manifests()
         .iter()
         .filter_map(|path| path.parent()?.file_name()?.to_str().map(str::to_owned))
         .collect();
     for required in [
-        "gate4agent-node",
+        "gate4agent-node-core",
         "gate4agent-node-protocol",
         "gate4agent-node-wire",
-        "gate4agent-c2",
-        "gate4agent-c2-protocol",
-        "gate4agent-c2-client",
         "gate4agent-build-stamp",
     ] {
         assert!(

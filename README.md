@@ -9,6 +9,12 @@ kernel, the native runtime, and per-CLI process hooks and history readers.
 The node/c2/harness/TUI stack that used to live in this repository is now
 `hatchery`, built on this library.
 
+> **0.5.0 split.** `gate4agent-node`, `gate4agent-c2`, `gate4agent-c2-client` and
+> `gate4agent-c2-protocol` are frozen at 0.4.8 on crates.io (not yanked) and are no
+> longer in this repository. Their successors are `hatchery-node`, `hatchery-c2`,
+> `hatchery-c2-client` and `hatchery-c2-protocol` in the hatchery repository. The
+> transport part of the node lives on here as `gate4agent-node-core`.
+
 ## Provider tiers
 
 | Provider | Tier | Support path |

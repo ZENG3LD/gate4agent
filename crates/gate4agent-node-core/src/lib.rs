@@ -2,6 +2,7 @@
 
 pub mod managed_worktree;
 pub mod materialization;
+pub mod drive_loop_profile;
 pub mod platform;
 pub mod session_registry;
 pub mod spawn_spec;

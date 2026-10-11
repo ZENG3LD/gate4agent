@@ -22,18 +22,18 @@ use std::time::{Duration, Instant};
 /// `GET /metrics` reports alongside `NativeRuntime`'s own
 /// [`gate4agent_runtime_native::tick_profile::TickProfileSnapshot`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct DriveLoopProfileSnapshot {
-    pub(super) runtime_tick_us: Distribution,
-    pub(super) event_drain_us: Distribution,
-    pub(super) publish_terminal_frames_us: Distribution,
-    pub(super) remainder_us: Distribution,
+pub struct DriveLoopProfileSnapshot {
+    pub runtime_tick_us: Distribution,
+    pub event_drain_us: Distribution,
+    pub publish_terminal_frames_us: Distribution,
+    pub remainder_us: Distribution,
     /// Actual iterations completed per wall-clock second, windowed over the
     /// last [`SAMPLE_WINDOW`] seconds -- the number the ~100/sec figure
     /// implied by the loop's `sleep(Duration::from_millis(10))` needs
     /// checked against, since that sleep only bounds the loop from below;
     /// it says nothing about how many iterations the phases above actually
     /// leave room for.
-    pub(super) iterations_per_sec: Distribution,
+    pub iterations_per_sec: Distribution,
 }
 
 /// Owns every drive-loop phase/rate ring `drive_runtime_until_shutdown`
@@ -42,7 +42,7 @@ pub(super) struct DriveLoopProfileSnapshot {
 /// before the next `.await` -- never held across one, so it does not need
 /// `tokio::sync::Mutex`.
 #[derive(Clone, Debug)]
-pub(super) struct DriveLoopProfiler {
+pub struct DriveLoopProfiler {
     runtime_tick_us: RingStats<SAMPLE_WINDOW>,
     event_drain_us: RingStats<SAMPLE_WINDOW>,
     publish_terminal_frames_us: RingStats<SAMPLE_WINDOW>,
@@ -72,20 +72,20 @@ impl DriveLoopProfiler {
     /// `runtime.tick().await` -- the whole native-runtime tick, whose own
     /// six internal phases are separately timed by
     /// `gate4agent_runtime_native::tick_profile`.
-    pub(super) fn record_runtime_tick(&mut self, elapsed: Duration) {
+    pub fn record_runtime_tick(&mut self, elapsed: Duration) {
         self.runtime_tick_us.push(duration_micros(elapsed));
     }
 
     /// Draining `events.try_recv()` in a loop and republishing each control
     /// event -- includes the per-event managed-record export lookup, but
     /// not the detached `tokio::spawn`'d export task itself.
-    pub(super) fn record_event_drain(&mut self, elapsed: Duration) {
+    pub fn record_event_drain(&mut self, elapsed: Duration) {
         self.event_drain_us.push(duration_micros(elapsed));
     }
 
     /// `shared.publish_terminal_frames()` -- snapshotting sessions, then
     /// diffing and broadcasting any advanced terminal frame.
-    pub(super) fn record_publish_terminal_frames(&mut self, elapsed: Duration) {
+    pub fn record_publish_terminal_frames(&mut self, elapsed: Duration) {
         self.publish_terminal_frames_us.push(duration_micros(elapsed));
     }
 
@@ -93,7 +93,7 @@ impl DriveLoopProfiler {
     /// before the trailing `sleep` -- today that is the shutdown-progress
     /// check (a no-op outside shutdown) plus this profiler's own
     /// bookkeeping.
-    pub(super) fn record_remainder(&mut self, elapsed: Duration) {
+    pub fn record_remainder(&mut self, elapsed: Duration) {
         self.remainder_us.push(duration_micros(elapsed));
     }
 
@@ -109,7 +109,7 @@ impl DriveLoopProfiler {
     /// `hatchery-tui`'s `tick_second`: a long idle gap (e.g. the process
     /// paused under a debugger) must resync rather than spin backfilling a
     /// zero-sample per elapsed second.
-    pub(super) fn note_iteration(&mut self, now: Instant) {
+    pub fn note_iteration(&mut self, now: Instant) {
         let mut rolled = 0;
         while now.saturating_duration_since(self.second_start) >= Duration::from_secs(1)
             && rolled < SAMPLE_WINDOW
@@ -125,7 +125,7 @@ impl DriveLoopProfiler {
         self.iterations_this_second = self.iterations_this_second.saturating_add(1);
     }
 
-    pub(super) fn snapshot(&self) -> DriveLoopProfileSnapshot {
+    pub fn snapshot(&self) -> DriveLoopProfileSnapshot {
         DriveLoopProfileSnapshot {
             runtime_tick_us: self.runtime_tick_us.stats(),
             event_drain_us: self.event_drain_us.stats(),

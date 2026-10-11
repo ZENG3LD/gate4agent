@@ -1099,12 +1099,12 @@ name = "gate4agent-node-core"
 version = "0.4.8"
 dependencies = [
  "gate4agent-node-protocol",
+ "gate4agent-runtime-native",
  "gate4agent-types",
  "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -210,7 +210,7 @@ mod http_api;
 
 mod browser_bridge;
 
-mod drive_loop_profile;
+use gate4agent_node_core::drive_loop_profile;
 
 #[path = "bundle_delivery.rs"]
 mod bundle_delivery;

@@ -210,3 +210,10 @@ Status: branch `migrate/node-core-extract`. Heuristic classification (name + bod
 | 12373 | 80 | `remove_session` | transport | 6 |
 | 12453 | 34 | `wait_until_removed` | transport | 0 |
 | 12487 | 2094 | `resync` | mixed | 299 |
+
+## Port status
+
+- `SpawnPreparer` (in gate4agent-node `server.rs`): done for the preparation block of `spawn_session_with_deadline` (station lease, harness MCP overlay, materialization, environment selection, network overlays, launch overlay). Not yet routed: `resume_session_record`, `spawn_managed_worktree*`, `reconcile_*`.
+- `SessionLifecycleHook`: `on_binding_removed` done. Not yet: session start/exit/retire hooks, `cleanup_session_owned_materialization`, record retire.
+- `ProductRoutes`, `StateExtension`: not started.
+- Note: the large legacy `mod tests` in server.rs is `cfg(all(test, windows))`; Linux coverage lives in `spawn_characterization_tests` and sibling modules.

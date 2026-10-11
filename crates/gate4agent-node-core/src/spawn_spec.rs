@@ -1,4 +1,4 @@
-use crate::protocol::{
+use gate4agent_node_protocol::{
     AgentId, SessionMode, SpawnProfileDefaults, SpawnProfileId, SpawnProfileRevision,
 };
 use gate4agent_types::TerminalSize;
@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub const DEFAULT_SPAWN_PROFILE_ID: &str = "default";
-pub use crate::protocol::MAX_SPAWN_PROFILES;
+pub use gate4agent_node_protocol::MAX_SPAWN_PROFILES;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpawnProfileRegistry {

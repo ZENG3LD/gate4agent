@@ -35,9 +35,9 @@ mod dig2_station_probe;
 #[cfg(feature = "kit")]
 mod kit;
 #[cfg(feature = "wireguard")]
-mod kit_wireguard;
+pub(crate) use gate4agent_node_core::kit_wireguard;
 mod network_allowlist_catalog;
-mod platform;
+pub(crate) use gate4agent_node_core::platform;
 #[cfg(feature = "kit")]
 pub use kit::{force_link, linked_core_names, start_mailbox};
 #[cfg(feature = "wireguard")]
@@ -49,7 +49,7 @@ pub use kit_wireguard::{
 };
 mod provider_runtime;
 mod server;
-mod spawn_spec;
+pub(crate) use gate4agent_node_core::spawn_spec;
 
 #[cfg(feature = "fixture")]
 pub use bundle_catalog::protect_bundle_source_tree_fixture;

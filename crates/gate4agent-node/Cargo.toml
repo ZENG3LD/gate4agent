@@ -28,6 +28,7 @@ kimi-session-restore = { path = "../../../session-restore/crates/kimi-session-re
 gate4agent-adapters = { path = "../gate4agent-adapters", version = "0.4.8" }
 gate4agent-catalog = { path = "../gate4agent-catalog", version = "0.4.8" }
 gate4agent-handle = { path = "../gate4agent-handle", version = "0.4.8" }
+gate4agent-node-core = { path = "../gate4agent-node-core", version = "0.4.8" }
 gate4agent-node-protocol = { path = "../gate4agent-node-protocol", version = "0.4.8" }
 gate4agent-node-wire = { path = "../gate4agent-node-wire", version = "0.4.8" }
 gate4agent-runtime-native = { path = "../gate4agent-runtime-native", version = "0.4.8" }
@@ -73,7 +74,7 @@ kit = [
 # Kernel WireGuard for node↔C2. Either peer may dial. Not the UDP+ChaCha mesh
 # underlay and not open_wireguard_daemon_stub. HQ is not part of this kit.
 # The driver may be replaced later; this build calls `ip link` / `wg`.
-wireguard = []
+wireguard = ["gate4agent-node-core/wireguard"]
 # Node with dig2browser, mail4agent, session-restore, and WireGuard OFF.
 bare = []
 # Optional extra, not core, not default. Hatchery git helpers may be wired

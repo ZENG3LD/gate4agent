@@ -1,0 +1,8 @@
+//! Transport core of the gate4agent node. Product code lives above this crate.
+
+pub mod platform;
+pub mod spawn_spec;
+#[cfg(feature = "wireguard")]
+pub mod kit_wireguard;
+
+pub use gate4agent_node_protocol as protocol;

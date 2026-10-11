@@ -1,4 +1,4 @@
-use crate::protocol::{
+use gate4agent_node_protocol::{
     ArchitectureId, HostDescriptor, LocalTransportKind, OperatingSystemId, PathEncoding,
     PathSemantics, PathStyle,
 };
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 pub const DEFAULT_NODE_ENDPOINT: &str = r"\\.\pipe\gate4agent-node";
 
-pub(crate) fn default_node_endpoint() -> Option<PathBuf> {
+pub fn default_node_endpoint() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         return Some(PathBuf::from(DEFAULT_NODE_ENDPOINT));
@@ -25,7 +25,7 @@ pub(crate) fn default_node_endpoint() -> Option<PathBuf> {
     }
 }
 
-pub(crate) fn default_state_path(node_id: &str) -> Option<PathBuf> {
+pub fn default_state_path(node_id: &str) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         return std::env::var_os("LOCALAPPDATA")
@@ -87,7 +87,7 @@ fn secure_fallback_runtime_dir() -> Option<PathBuf> {
     Some(root)
 }
 
-pub(crate) fn validate_endpoint(endpoint: &str) -> bool {
+pub fn validate_endpoint(endpoint: &str) -> bool {
     #[cfg(windows)]
     {
         return endpoint.starts_with(r"\\.\pipe\")
@@ -105,7 +105,7 @@ pub(crate) fn validate_endpoint(endpoint: &str) -> bool {
     }
 }
 
-pub(crate) fn root_identity(value: &str) -> String {
+pub fn root_identity(value: &str) -> String {
     #[cfg(windows)]
     {
         return value.to_lowercase();
@@ -116,7 +116,7 @@ pub(crate) fn root_identity(value: &str) -> String {
     }
 }
 
-pub(crate) fn roots_equal(left: &str, right: &str) -> bool {
+pub fn roots_equal(left: &str, right: &str) -> bool {
     #[cfg(windows)]
     {
         return left.eq_ignore_ascii_case(right);
@@ -127,7 +127,7 @@ pub(crate) fn roots_equal(left: &str, right: &str) -> bool {
     }
 }
 
-pub(crate) fn normalize_canonical_root(value: String) -> String {
+pub fn normalize_canonical_root(value: String) -> String {
     #[cfg(windows)]
     {
         if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
@@ -140,7 +140,7 @@ pub(crate) fn normalize_canonical_root(value: String) -> String {
     value
 }
 
-pub(crate) fn host_descriptor() -> Result<HostDescriptor, String> {
+pub fn host_descriptor() -> Result<HostDescriptor, String> {
     Ok(HostDescriptor {
         operating_system: OperatingSystemId::new(std::env::consts::OS)
             .map_err(|error| error.to_string())?,
@@ -149,7 +149,7 @@ pub(crate) fn host_descriptor() -> Result<HostDescriptor, String> {
     })
 }
 
-pub(crate) fn path_semantics() -> PathSemantics {
+pub fn path_semantics() -> PathSemantics {
     #[cfg(windows)]
     {
         return PathSemantics {
@@ -166,7 +166,7 @@ pub(crate) fn path_semantics() -> PathSemantics {
     }
 }
 
-pub(crate) fn local_transport() -> LocalTransportKind {
+pub fn local_transport() -> LocalTransportKind {
     #[cfg(windows)]
     {
         return LocalTransportKind::WindowsNamedPipe;
@@ -177,7 +177,7 @@ pub(crate) fn local_transport() -> LocalTransportKind {
     }
 }
 
-pub(crate) fn workspace_root_supported(value: &str) -> bool {
+pub fn workspace_root_supported(value: &str) -> bool {
     #[cfg(windows)]
     if value.starts_with(r"\\") {
         return false;

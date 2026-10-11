@@ -3316,6 +3316,290 @@ impl Drop for SessionMaterializationGuard<'_> {
     }
 }
 
+
+struct SpawnPrepareRequest<'r> {
+    instance_id: AgentInstanceId,
+    address: &'r SessionAddress,
+    provider: &'r AgentId,
+    mode: SessionMode,
+    environment_profile: Option<&'r ResolvedEnvironmentProfileReceipt>,
+    bundle: Option<&'r ResolvedBundleReceipt>,
+    context: Option<&'r ResolvedContextPackReceipt>,
+    managed_authority: Option<&'r ManagedWorktreeLeaseId>,
+    harness_mcp: Option<&'r PreparedHarnessMcpSpawn>,
+    approval_level: ApprovalLevel,
+    network_allowlist: Option<&'r crate::protocol::SpawnNetworkAllowlistId>,
+    browser_profile_id: Option<crate::protocol::SpawnBrowserProfileId>,
+}
+
+/// Guards held between "session identity minted" and "launch committed".
+/// Field order is the drop order and matches the pre-refactor local order
+/// (instance overlay, environment selection, materialization, harness, station lease).
+struct PreparedSpawn<'a> {
+    instance_overlay: Option<NativeInstanceOverlayGuard>,
+    environment_selection: Option<NativeEnvironmentSelectionGuard>,
+    materialization_guard: Option<SessionMaterializationGuard<'a>>,
+    harness_mcp_overlay: Option<NativeHarnessMcpOverlayGuard>,
+    #[cfg(feature = "dig2-station-probe")]
+    browser_station_lease_guard: Option<crate::dig2_station_lease::BrowserStationLeaseGuard>,
+    materialization_id: Option<MaterializationId>,
+}
+
+impl PreparedSpawn<'_> {
+    /// Session-owned launch state now belongs to the binding.
+    fn retain_session_guards(&mut self) {
+        if let Some(selection) = self.environment_selection.take() {
+            selection.retain();
+        }
+        if let Some(overlay) = self.instance_overlay.take() {
+            overlay.retain();
+        }
+        if let Some(guard) = self.materialization_guard.take() {
+            guard.retain();
+        }
+    }
+
+    /// Launch committed: keep harness overlay and station lease for the session lifetime.
+    fn retain_launch_guards(&mut self) {
+        if let Some(overlay) = self.harness_mcp_overlay.take() {
+            overlay.retain();
+        }
+        #[cfg(feature = "dig2-station-probe")]
+        if let Some(guard) = self.browser_station_lease_guard.take() {
+            guard.retain();
+        }
+    }
+}
+
+/// Port: everything product-side that must be prepared before a session is
+/// bound and started (station lease, harness MCP overlay, materialization,
+/// environment selection, network overlays, launch overlay).
+trait SpawnPreparer {
+    fn prepare<'a>(&'a self, request: SpawnPrepareRequest<'_>) -> Result<PreparedSpawn<'a>, NodeFailure>;
+}
+
+impl SpawnPreparer for NodeShared {
+    fn prepare<'a>(&'a self, request: SpawnPrepareRequest<'_>) -> Result<PreparedSpawn<'a>, NodeFailure> {
+        let SpawnPrepareRequest {
+            instance_id,
+            address,
+            provider,
+            mode,
+            environment_profile,
+            bundle,
+            context,
+            managed_authority,
+            harness_mcp,
+            approval_level,
+            network_allowlist,
+            browser_profile_id,
+        } = request;
+        // Track A follow-on: exclusive node-local BrowserStationLease after
+        // dig2 probe (feature dig2-station-probe). Opaque profile id only —
+        // never ImportSession / cookies on C2. Linux/feature-off: probe
+        // already refused or stub; this block is cfg'd out when feature off.
+        #[cfg(feature = "dig2-station-probe")]
+        let mut browser_station_lease_guard = if let Some(profile_id) = browser_profile_id {
+            use crate::dig2_station_lease::{acquire_lease, BrowserStationLeaseError};
+            match acquire_lease(
+                &self.browser_station_leases,
+                profile_id,
+                instance_id,
+                unix_time_ms(),
+            ) {
+                Ok(guard) => Some(guard),
+                Err(BrowserStationLeaseError::ProfileBusy { .. }) => {
+                    return Err(failure(
+                        NodeFailureCode::BrowserStationProfileBusy,
+                        "dig2browser station profile is already leased by another session",
+                    ));
+                }
+                Err(BrowserStationLeaseError::CapacityExceeded) => {
+                    return Err(failure(
+                        NodeFailureCode::BrowserStationProfileBusy,
+                        "dig2browser station profile lease capacity exhausted",
+                    ));
+                }
+                Err(BrowserStationLeaseError::HolderAlreadyLeased) => {
+                    return Err(failure(
+                        NodeFailureCode::BrowserStationProfileBusy,
+                        "session already holds a dig2browser station profile lease",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "dig2-station-probe"))]
+        let _ = browser_profile_id;
+        let mut harness_mcp_overlay = if let Some(prepared) = harness_mcp {
+            // Slice A(ii) of gate4agent-arc-mailbox-and-task-layer: the door
+            // exists for PTY (env vars) and ACP (`session/new.mcpServers`,
+            // `gate4agent-shell-native`'s `mcp_server_acp_entry`) alike --
+            // both read the identical overlay resolved below, one as child
+            // environment, the other translated into one stdio MCP server
+            // entry. `Inline`/`Pipe` stays refused: this arc's proof is ACP
+            // only, and nothing downstream reads a harness-MCP overlay for
+            // that transport yet.
+            if !matches!(mode, SessionMode::Pty | SessionMode::Acp) || prepared.provider != *provider
+            {
+                return Err(failure(
+                    NodeFailureCode::BindingMismatch,
+                    "harness MCP reservation does not match the exact PTY/ACP provider",
+                ));
+            }
+            prepared.verify_helper_program().map_err(harness_mcp_failure)?;
+            let control = self.native_launch_profile_control.clone().ok_or_else(|| {
+                failure(NodeFailureCode::HarnessMcpUnavailable, "harness MCP launch control is unavailable")
+            })?;
+            // Every name below is the caller's, carried in the reservation's
+            // launch description: which environment variables receive the
+            // endpoint, token and helper program, what the MCP server is called,
+            // which argv it gets and which stale variables are erased.
+            let launch = prepared.launch();
+            let mut env_entries = vec![
+                (
+                    OsString::from(launch.endpoint_env.as_str()),
+                    prepared.endpoint().as_os_str().to_os_string(),
+                ),
+                (
+                    OsString::from(launch.token_env.as_str()),
+                    prepared.token().expose().into(),
+                ),
+                (
+                    OsString::from(launch.program_env.as_str()),
+                    prepared.helper_program().as_os_str().to_os_string(),
+                ),
+            ];
+            if let Some(trace_entry) = harness_mcp_trace_env_entry(launch) {
+                env_entries.push(trace_entry);
+            }
+            let overlay = NativeMcpServerLaunchOverlay::new(
+                provider.clone(),
+                launch.server_name.as_str(),
+                prepared.helper_program().as_os_str().to_os_string(),
+                launch.args.iter().map(OsString::from).collect(),
+                env_entries,
+                launch.scrub_env.iter().map(OsString::from).collect(),
+            ).map_err(|_| failure(
+                NodeFailureCode::HarnessMcpUnavailable,
+                "harness MCP launch overlay is unavailable",
+            ))?;
+            control
+                .install_native_mcp_server_launch_overlay(instance_id, overlay)
+                .map_err(|_| failure(
+                    NodeFailureCode::HarnessMcpUnavailable,
+                    "harness MCP launch overlay could not be installed",
+                ))?;
+            // State-change line: the overlay is installed and will be read
+            // back by the PTY child's environment or, for ACP,
+            // `gate4agent-shell-native`'s `mcp_server_acp_entry` at spawn
+            // time -- no secrets here, only which instance/provider/mode
+            // now carries a harness-MCP door.
+            tracing::info!(
+                node_id = %self.node_id,
+                instance_id = ?instance_id,
+                provider = %provider,
+                mode = ?mode,
+                "harness MCP overlay installed for spawn",
+            );
+            Some(NativeHarnessMcpOverlayGuard { control, instance_id })
+        } else {
+            None
+        };
+        let prepared_materialization = self.prepare_session_materialization(
+            &address,
+            &provider,
+            mode,
+            environment_profile,
+            bundle,
+            context,
+            managed_authority.cloned(),
+        )?;
+        let (environment_overlay, mut materialization_guard) = match prepared_materialization {
+            Some((overlay, guard)) => (Some(overlay), Some(guard)),
+            None => (None, None),
+        };
+        let materialization_id = materialization_guard
+            .as_ref()
+            .and_then(SessionMaterializationGuard::id)
+            .cloned();
+        let mut environment_selection = self.select_environment_profile(
+            instance_id,
+            &provider,
+            mode,
+            environment_profile,
+        )?;
+        // Station network overlays: Codex `-c network_access` and/or Claude
+        // ProviderHome `--settings` sidecar (permits → allowedDomains).
+        let provider_home = materialization_guard
+            .as_ref()
+            .and_then(SessionMaterializationGuard::provider_home);
+        let network_overlay_args = self.resolve_network_allowlist_overlay_args(
+            &provider,
+            mode,
+            approval_level,
+            network_allowlist,
+            provider_home,
+        )?;
+        let environment_overlay = match (environment_overlay.flatten(), network_overlay_args) {
+            (prepared, args) if args.is_empty() => prepared,
+            (Some(PreparedNativeLaunchOverlay::Instance(mut overlay)), args) => {
+                overlay.append_extra_args(args).map_err(|_| {
+                    failure(
+                        NodeFailureCode::UnsupportedNetworkAllowlistMapping,
+                        "network allowlist overlay could not merge with instance launch args",
+                    )
+                })?;
+                Some(PreparedNativeLaunchOverlay::Instance(overlay))
+            }
+            (Some(PreparedNativeLaunchOverlay::Environment(overlay)), args) => {
+                Some(PreparedNativeLaunchOverlay::Instance(
+                    overlay
+                        .into_instance_with_extra_args(args)
+                        .map_err(|_| {
+                            failure(
+                                NodeFailureCode::UnsupportedNetworkAllowlistMapping,
+                                "network allowlist overlay could not merge with environment overlay",
+                            )
+                        })?,
+                ))
+            }
+            (None, args) => Some(PreparedNativeLaunchOverlay::Instance(
+                NativeInstanceLaunchOverlay::new(
+                    provider.clone(),
+                    match mode {
+                        SessionMode::Pty => TransportKind::Pty,
+                        SessionMode::Acp => TransportKind::Acp,
+                        SessionMode::Inline => TransportKind::Pipe,
+                    },
+                    Vec::new(),
+                    args,
+                )
+                .map_err(|_| {
+                    failure(
+                        NodeFailureCode::UnsupportedNetworkAllowlistMapping,
+                        "network allowlist overlay is invalid for this transport",
+                    )
+                })?,
+            )),
+        };
+        let mut instance_overlay = environment_overlay
+            .map(|overlay| self.install_prepared_launch_overlay(instance_id, overlay))
+            .transpose()?
+            .flatten();
+        Ok(PreparedSpawn {
+            instance_overlay,
+            environment_selection,
+            materialization_guard,
+            harness_mcp_overlay,
+            #[cfg(feature = "dig2-station-probe")]
+            browser_station_lease_guard,
+            materialization_id,
+        })
+    }
+}
+
 struct SessionRecords {
     records: BTreeMap<SessionRecordId, ManagedSessionRecord>,
 }
@@ -11889,200 +12173,24 @@ impl NodeShared {
             session = ?address.session,
             "session spawn request accepted",
         );
-        // Track A follow-on: exclusive node-local BrowserStationLease after
-        // dig2 probe (feature dig2-station-probe). Opaque profile id only —
-        // never ImportSession / cookies on C2. Linux/feature-off: probe
-        // already refused or stub; this block is cfg'd out when feature off.
-        #[cfg(feature = "dig2-station-probe")]
-        let mut browser_station_lease_guard = if let Some(profile_id) = browser_profile_id {
-            use crate::dig2_station_lease::{acquire_lease, BrowserStationLeaseError};
-            match acquire_lease(
-                &self.browser_station_leases,
-                profile_id,
+        let mut prepared_spawn = SpawnPreparer::prepare(
+            self,
+            SpawnPrepareRequest {
                 instance_id,
-                unix_time_ms(),
-            ) {
-                Ok(guard) => Some(guard),
-                Err(BrowserStationLeaseError::ProfileBusy { .. }) => {
-                    return Err(failure(
-                        NodeFailureCode::BrowserStationProfileBusy,
-                        "dig2browser station profile is already leased by another session",
-                    ));
-                }
-                Err(BrowserStationLeaseError::CapacityExceeded) => {
-                    return Err(failure(
-                        NodeFailureCode::BrowserStationProfileBusy,
-                        "dig2browser station profile lease capacity exhausted",
-                    ));
-                }
-                Err(BrowserStationLeaseError::HolderAlreadyLeased) => {
-                    return Err(failure(
-                        NodeFailureCode::BrowserStationProfileBusy,
-                        "session already holds a dig2browser station profile lease",
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-        #[cfg(not(feature = "dig2-station-probe"))]
-        let _ = browser_profile_id;
-        let mut harness_mcp_overlay = if let Some(prepared) = harness_mcp {
-            // Slice A(ii) of gate4agent-arc-mailbox-and-task-layer: the door
-            // exists for PTY (env vars) and ACP (`session/new.mcpServers`,
-            // `gate4agent-shell-native`'s `mcp_server_acp_entry`) alike --
-            // both read the identical overlay resolved below, one as child
-            // environment, the other translated into one stdio MCP server
-            // entry. `Inline`/`Pipe` stays refused: this arc's proof is ACP
-            // only, and nothing downstream reads a harness-MCP overlay for
-            // that transport yet.
-            if !matches!(mode, SessionMode::Pty | SessionMode::Acp) || prepared.provider != provider
-            {
-                return Err(failure(
-                    NodeFailureCode::BindingMismatch,
-                    "harness MCP reservation does not match the exact PTY/ACP provider",
-                ));
-            }
-            prepared.verify_helper_program().map_err(harness_mcp_failure)?;
-            let control = self.native_launch_profile_control.clone().ok_or_else(|| {
-                failure(NodeFailureCode::HarnessMcpUnavailable, "harness MCP launch control is unavailable")
-            })?;
-            // Every name below is the caller's, carried in the reservation's
-            // launch description: which environment variables receive the
-            // endpoint, token and helper program, what the MCP server is called,
-            // which argv it gets and which stale variables are erased.
-            let launch = prepared.launch();
-            let mut env_entries = vec![
-                (
-                    OsString::from(launch.endpoint_env.as_str()),
-                    prepared.endpoint().as_os_str().to_os_string(),
-                ),
-                (
-                    OsString::from(launch.token_env.as_str()),
-                    prepared.token().expose().into(),
-                ),
-                (
-                    OsString::from(launch.program_env.as_str()),
-                    prepared.helper_program().as_os_str().to_os_string(),
-                ),
-            ];
-            if let Some(trace_entry) = harness_mcp_trace_env_entry(launch) {
-                env_entries.push(trace_entry);
-            }
-            let overlay = NativeMcpServerLaunchOverlay::new(
-                provider.clone(),
-                launch.server_name.as_str(),
-                prepared.helper_program().as_os_str().to_os_string(),
-                launch.args.iter().map(OsString::from).collect(),
-                env_entries,
-                launch.scrub_env.iter().map(OsString::from).collect(),
-            ).map_err(|_| failure(
-                NodeFailureCode::HarnessMcpUnavailable,
-                "harness MCP launch overlay is unavailable",
-            ))?;
-            control
-                .install_native_mcp_server_launch_overlay(instance_id, overlay)
-                .map_err(|_| failure(
-                    NodeFailureCode::HarnessMcpUnavailable,
-                    "harness MCP launch overlay could not be installed",
-                ))?;
-            // State-change line: the overlay is installed and will be read
-            // back by the PTY child's environment or, for ACP,
-            // `gate4agent-shell-native`'s `mcp_server_acp_entry` at spawn
-            // time -- no secrets here, only which instance/provider/mode
-            // now carries a harness-MCP door.
-            tracing::info!(
-                node_id = %self.node_id,
-                instance_id = ?instance_id,
-                provider = %provider,
-                mode = ?mode,
-                "harness MCP overlay installed for spawn",
-            );
-            Some(NativeHarnessMcpOverlayGuard { control, instance_id })
-        } else {
-            None
-        };
-        let prepared_materialization = self.prepare_session_materialization(
-            &address,
-            &provider,
-            mode,
-            environment_profile.as_ref(),
-            bundle.as_ref(),
-            context.as_ref(),
-            managed_authority.clone(),
+                address: &address,
+                provider: &provider,
+                mode,
+                environment_profile: environment_profile.as_ref(),
+                bundle: bundle.as_ref(),
+                context: context.as_ref(),
+                managed_authority: managed_authority.as_ref(),
+                harness_mcp,
+                approval_level,
+                network_allowlist: network_allowlist.as_ref(),
+                browser_profile_id,
+            },
         )?;
-        let (environment_overlay, mut materialization_guard) = match prepared_materialization {
-            Some((overlay, guard)) => (Some(overlay), Some(guard)),
-            None => (None, None),
-        };
-        let materialization_id = materialization_guard
-            .as_ref()
-            .and_then(SessionMaterializationGuard::id)
-            .cloned();
-        let mut environment_selection = self.select_environment_profile(
-            instance_id,
-            &provider,
-            mode,
-            environment_profile.as_ref(),
-        )?;
-        // Station network overlays: Codex `-c network_access` and/or Claude
-        // ProviderHome `--settings` sidecar (permits → allowedDomains).
-        let provider_home = materialization_guard
-            .as_ref()
-            .and_then(SessionMaterializationGuard::provider_home);
-        let network_overlay_args = self.resolve_network_allowlist_overlay_args(
-            &provider,
-            mode,
-            approval_level,
-            network_allowlist.as_ref(),
-            provider_home,
-        )?;
-        let environment_overlay = match (environment_overlay.flatten(), network_overlay_args) {
-            (prepared, args) if args.is_empty() => prepared,
-            (Some(PreparedNativeLaunchOverlay::Instance(mut overlay)), args) => {
-                overlay.append_extra_args(args).map_err(|_| {
-                    failure(
-                        NodeFailureCode::UnsupportedNetworkAllowlistMapping,
-                        "network allowlist overlay could not merge with instance launch args",
-                    )
-                })?;
-                Some(PreparedNativeLaunchOverlay::Instance(overlay))
-            }
-            (Some(PreparedNativeLaunchOverlay::Environment(overlay)), args) => {
-                Some(PreparedNativeLaunchOverlay::Instance(
-                    overlay
-                        .into_instance_with_extra_args(args)
-                        .map_err(|_| {
-                            failure(
-                                NodeFailureCode::UnsupportedNetworkAllowlistMapping,
-                                "network allowlist overlay could not merge with environment overlay",
-                            )
-                        })?,
-                ))
-            }
-            (None, args) => Some(PreparedNativeLaunchOverlay::Instance(
-                NativeInstanceLaunchOverlay::new(
-                    provider.clone(),
-                    match mode {
-                        SessionMode::Pty => TransportKind::Pty,
-                        SessionMode::Acp => TransportKind::Acp,
-                        SessionMode::Inline => TransportKind::Pipe,
-                    },
-                    Vec::new(),
-                    args,
-                )
-                .map_err(|_| {
-                    failure(
-                        NodeFailureCode::UnsupportedNetworkAllowlistMapping,
-                        "network allowlist overlay is invalid for this transport",
-                    )
-                })?,
-            )),
-        };
-        let mut instance_overlay = environment_overlay
-            .map(|overlay| self.install_prepared_launch_overlay(instance_id, overlay))
-            .transpose()?
-            .flatten();
+        let materialization_id = prepared_spawn.materialization_id.take();
         let dispatch_timeout = spawn_dispatch_timeout(deadline)?;
         let record_id = self.bind_spawn_session_with_materialization(
             &address,
@@ -12095,15 +12203,7 @@ impl NodeShared {
             context,
             materialization_id,
         )?;
-        if let Some(selection) = environment_selection.take() {
-            selection.retain();
-        }
-        if let Some(overlay) = instance_overlay.take() {
-            overlay.retain();
-        }
-        if let Some(guard) = materialization_guard.take() {
-            guard.retain();
-        }
+        prepared_spawn.retain_session_guards();
         // `transport` was already computed above, alongside this session's
         // `runtime_policy`; reused here for `Register` rather than derived a
         // second time.
@@ -12287,13 +12387,7 @@ impl NodeShared {
                     };
                 }
                 if !matches!(current.status, gate4agent_types::SessionStatus::Registered) {
-                    if let Some(overlay) = harness_mcp_overlay.take() {
-                        overlay.retain();
-                    }
-                    #[cfg(feature = "dig2-station-probe")]
-                    if let Some(guard) = browser_station_lease_guard.take() {
-                        guard.retain();
-                    }
+                    prepared_spawn.retain_launch_guards();
                     return Ok((address, runtime_policy));
                 }
             }

@@ -148,7 +148,7 @@ mod kit_manifest {
             "node kit must not depend on the hatchery TUI"
         );
         assert!(manifest.contains("path = \"../../../dig2browser\""));
-        assert!(manifest.contains("path = \"../../../mail4agent\""));
+        assert!(manifest.contains("mail4agent = { version = \"0.4\""));
         assert!(manifest.contains("claude-session-restore = { version = \"0.1.3\""));
         assert!(manifest.contains("codex-session-restore = { version = \"0.1.3\""));
         assert!(manifest.contains("grok-session-restore"));
@@ -201,7 +201,7 @@ mod deploy_artifacts {
         assert!(dockerfile.contains("cargo build --locked --release -p gate4agent-node"));
         assert!(dockerfile.contains("ENTRYPOINT [\"gate4agent-node\"]"));
         assert!(dockerfile.contains("COPY dig2browser"));
-        assert!(dockerfile.contains("COPY mail4agent"));
+        assert!(!dockerfile.contains("COPY mail4agent"));
         assert!(dockerfile.contains("COPY session-restore"));
         assert!(
             !dockerfile.contains("GATE4AGENT_NODE_TOKEN"),
@@ -211,7 +211,7 @@ mod deploy_artifacts {
         assert!(build.contains("docker build"));
         assert!(build.contains("gate4agent-node:kit"));
         assert!(build.contains("copy_tree \"$WS/dig2browser\""));
-        assert!(build.contains("copy_tree \"$WS/mail4agent\""));
+        assert!(!build.contains("copy_tree \"$WS/mail4agent\""));
         assert!(build.contains("copy_tree \"$WS/session-restore\""));
     }
 

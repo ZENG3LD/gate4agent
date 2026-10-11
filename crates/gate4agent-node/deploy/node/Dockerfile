@@ -2,7 +2,7 @@
 # Does not provision secrets, tokens, or WireGuard private keys.
 #
 # Build context is a directory that contains these siblings:
-#   gate4agent/   dig2browser/   mail4agent/   session-restore/
+#   gate4agent/   dig2browser/   session-restore/
 # `deploy/node/docker-build.sh` stages that context (it excludes target/ and .git).
 #
 #   ./crates/gate4agent-node/deploy/node/docker-build.sh
@@ -15,7 +15,6 @@ FROM rust:bookworm AS build
 WORKDIR /src
 COPY gate4agent /src/gate4agent
 COPY dig2browser /src/dig2browser
-COPY mail4agent /src/mail4agent
 COPY session-restore /src/session-restore
 WORKDIR /src/gate4agent
 RUN cargo build --locked --release -p gate4agent-node

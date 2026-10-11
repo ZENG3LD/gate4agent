@@ -21,7 +21,6 @@ copy_tree() {
 
 copy_tree "$REPO" "$STAGE/gate4agent"
 copy_tree "$WS/dig2browser" "$STAGE/dig2browser"
-copy_tree "$WS/mail4agent" "$STAGE/mail4agent"
 copy_tree "$WS/session-restore" "$STAGE/session-restore"
 
 docker build \

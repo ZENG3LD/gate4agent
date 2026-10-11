@@ -3,7 +3,7 @@
 Default `gate4agent-node` is the standard kit. Feature `kit` (on by default) links:
 
 1. `dig2browser` — path `../../../dig2browser` (local node browser machine; not the crates.io 0.5.0 tarball)
-2. `mail4agent` — path `../../../mail4agent` (crates.io 0.1.2 is binary-only)
+2. `mail4agent` — crates.io `0.4` (lib face; no sibling checkout needed)
 3. session-restore — `claude-session-restore` and `codex-session-restore` 0.1.3 from crates.io; `grok-session-restore` and `kimi-session-restore` path deps because crates.io 0.1.3 is binary-only
 4. kernel WireGuard — feature `wireguard`, `ip link add type wireguard` / `wg`. Node and C2 are peers (either side may dial). Not the UDP+ChaCha mesh underlay, not `open_wireguard_daemon_stub`, and not HQ.
 

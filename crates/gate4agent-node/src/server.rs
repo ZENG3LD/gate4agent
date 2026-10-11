@@ -3196,14 +3196,7 @@ struct NodeShared {
 
 impl Drop for NodeShared {
     fn drop(&mut self) {
-        if let Some(registry) = self.harness_mcp_registry.as_ref() {
-            let instances = registry.shutdown();
-            if let Some(control) = self.native_launch_profile_control.as_ref() {
-                for instance_id in instances {
-                    control.clear_native_mcp_server_launch_overlay(instance_id);
-                }
-            }
-        }
+        SessionLifecycleHook::on_shutdown(self);
     }
 }
 
@@ -3322,9 +3315,55 @@ impl Drop for SessionMaterializationGuard<'_> {
 trait SessionLifecycleHook {
     /// A binding was removed (unbind or spawn rollback).
     fn on_binding_removed(&self, address: &SessionAddress, removed: Option<&SessionBinding>);
+    /// A session reached a terminal control event that revokes its harness MCP door.
+    fn on_session_ended(&self, address: &SessionAddress);
+    /// Node shutdown (or drop): revoke every harness MCP reservation.
+    fn on_shutdown(&self);
+    /// A harness MCP reservation was aborted before activation.
+    fn on_harness_reservation_aborted(&self, instance_id: AgentInstanceId);
+    /// Release session-owned materialization for a removed binding.
+    fn cleanup_session_materialization(
+        &self,
+        address: &SessionAddress,
+        binding: &SessionBinding,
+    ) -> Result<(), NodeFailure>;
 }
 
 impl SessionLifecycleHook for NodeShared {
+    fn on_session_ended(&self, address: &SessionAddress) {
+        if let Some(registry) = self.harness_mcp_registry.as_ref() {
+            registry.revoke_session(address);
+        }
+        if let Some(control) = self.native_launch_profile_control.as_ref() {
+            control.clear_native_mcp_server_launch_overlay(address.session.instance_id);
+        }
+    }
+
+    fn on_shutdown(&self) {
+        if let Some(registry) = self.harness_mcp_registry.as_ref() {
+            let instances = registry.shutdown();
+            if let Some(control) = self.native_launch_profile_control.as_ref() {
+                for instance_id in instances {
+                    control.clear_native_mcp_server_launch_overlay(instance_id);
+                }
+            }
+        }
+    }
+
+    fn on_harness_reservation_aborted(&self, instance_id: AgentInstanceId) {
+        if let Some(control) = self.native_launch_profile_control.as_ref() {
+            control.clear_native_mcp_server_launch_overlay(instance_id);
+        }
+    }
+
+    fn cleanup_session_materialization(
+        &self,
+        address: &SessionAddress,
+        binding: &SessionBinding,
+    ) -> Result<(), NodeFailure> {
+        self.cleanup_session_owned_materialization(address, binding)
+    }
+
     fn on_binding_removed(&self, address: &SessionAddress, removed: Option<&SessionBinding>) {
         // Exclusive dig2browser station profile lease is node-local; clear
         // on every session unbind / rollback. Never ImportSession/cookies.
@@ -3421,9 +3460,41 @@ impl PreparedSpawn<'_> {
 /// environment selection, network overlays, launch overlay).
 trait SpawnPreparer {
     fn prepare<'a>(&'a self, request: SpawnPrepareRequest<'_>) -> Result<PreparedSpawn<'a>, NodeFailure>;
+    /// Select the native launch profile for an environment-profile session.
+    fn select_environment(
+        &self,
+        instance_id: AgentInstanceId,
+        provider: &AgentId,
+        mode: SessionMode,
+        environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
+    ) -> Result<Option<NativeEnvironmentSelectionGuard>, NodeFailure>;
+    /// Install a prepared launch overlay for the instance.
+    fn install_launch_overlay(
+        &self,
+        instance_id: AgentInstanceId,
+        overlay: PreparedNativeLaunchOverlay,
+    ) -> Result<Option<NativeInstanceOverlayGuard>, NodeFailure>;
 }
 
 impl SpawnPreparer for NodeShared {
+    fn select_environment(
+        &self,
+        instance_id: AgentInstanceId,
+        provider: &AgentId,
+        mode: SessionMode,
+        environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
+    ) -> Result<Option<NativeEnvironmentSelectionGuard>, NodeFailure> {
+        self.select_environment_profile(instance_id, provider, mode, environment_profile)
+    }
+
+    fn install_launch_overlay(
+        &self,
+        instance_id: AgentInstanceId,
+        overlay: PreparedNativeLaunchOverlay,
+    ) -> Result<Option<NativeInstanceOverlayGuard>, NodeFailure> {
+        self.install_prepared_launch_overlay(instance_id, overlay)
+    }
+
     fn prepare<'a>(&'a self, request: SpawnPrepareRequest<'_>) -> Result<PreparedSpawn<'a>, NodeFailure> {
         let SpawnPrepareRequest {
             instance_id,
@@ -3569,7 +3640,7 @@ impl SpawnPreparer for NodeShared {
             .as_ref()
             .and_then(SessionMaterializationGuard::id)
             .cloned();
-        let mut environment_selection = self.select_environment_profile(
+        let mut environment_selection = SpawnPreparer::select_environment(self, 
             instance_id,
             &provider,
             mode,
@@ -3630,7 +3701,7 @@ impl SpawnPreparer for NodeShared {
             )),
         };
         let mut instance_overlay = environment_overlay
-            .map(|overlay| self.install_prepared_launch_overlay(instance_id, overlay))
+            .map(|overlay| SpawnPreparer::install_launch_overlay(self, instance_id, overlay))
             .transpose()?
             .flatten();
         Ok(PreparedSpawn {
@@ -6975,14 +7046,7 @@ impl NodeShared {
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        if let Some(registry) = self.harness_mcp_registry.as_ref() {
-            let instances = registry.shutdown();
-            if let Some(control) = self.native_launch_profile_control.as_ref() {
-                for instance_id in instances {
-                    control.clear_native_mcp_server_launch_overlay(instance_id);
-                }
-            }
-        }
+        SessionLifecycleHook::on_shutdown(self);
         let deadline = Instant::now() + Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS);
         let mut first_error = None;
         for session in &self.handle.snapshot().sessions {
@@ -8165,7 +8229,7 @@ impl NodeShared {
             None => (None, None),
         };
         let instance_id = AgentInstanceId(self.next_instance_id.fetch_add(1, Ordering::AcqRel));
-        let mut environment_selection = match self.select_environment_profile(
+        let mut environment_selection = match SpawnPreparer::select_environment(self, 
             instance_id,
             &record.provider,
             record.mode,
@@ -8178,7 +8242,7 @@ impl NodeShared {
             }
         };
         let mut instance_overlay = environment_overlay
-            .map(|overlay| self.install_prepared_launch_overlay(instance_id, overlay))
+            .map(|overlay| SpawnPreparer::install_launch_overlay(self, instance_id, overlay))
             .transpose()?
             .flatten();
         if let Some(stale_address) = self.bound_address_for_record(record_id) {
@@ -8243,7 +8307,7 @@ impl NodeShared {
             .await
         {
             if let Some(binding) = self.remove_binding(&address) {
-                self.cleanup_session_owned_materialization(&address, &binding)?;
+                SessionLifecycleHook::cleanup_session_materialization(self, &address, &binding)?;
             }
             return Err(error);
         }
@@ -10118,14 +10182,7 @@ impl NodeShared {
             self.publish_agent_stream_chunk(address.clone(), chunk);
         }
         if revokes_harness_mcp {
-            if let Some(registry) = self.harness_mcp_registry.as_ref() {
-                registry.revoke_session(&address);
-            }
-            if let Some(control) = self.native_launch_profile_control.as_ref() {
-                control.clear_native_mcp_server_launch_overlay(
-                    address.session.instance_id,
-                );
-            }
+            SessionLifecycleHook::on_session_ended(self, &address);
         }
     }
 
@@ -12232,7 +12289,7 @@ impl NodeShared {
             Ok(command_id) => command_id,
             Err(error) => {
                 if let Some(binding) = self.remove_binding(&address) {
-                    self.cleanup_session_owned_materialization(&address, &binding)?;
+                    SessionLifecycleHook::cleanup_session_materialization(self, &address, &binding)?;
                 }
                 if let Some(record_id) = record_id.as_ref() {
                     self.discard_record(record_id)?;
@@ -12471,7 +12528,7 @@ impl NodeShared {
         .await?;
         self.wait_until_removed(address, commit_timeout).await?;
         if let Some(binding) = self.remove_binding(address) {
-            self.cleanup_session_owned_materialization(address, &binding)?;
+            SessionLifecycleHook::cleanup_session_materialization(self, address, &binding)?;
         }
         Ok(())
     }
@@ -12488,7 +12545,7 @@ impl NodeShared {
         self.wait_until_removed(address, commit_timeout).await?;
         let removed = self.remove_binding(address);
         if let Some(binding) = removed.as_ref() {
-            self.cleanup_session_owned_materialization(address, binding)?;
+            SessionLifecycleHook::cleanup_session_materialization(self, address, binding)?;
         }
         if let Some(lease_id) = removed.and_then(|binding| binding.managed_worktree_lease_id) {
             let snapshot = self.managed_worktrees.lock()
@@ -15531,10 +15588,8 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             let instance_id = shared.harness_mcp_registry.as_ref().ok_or_else(|| {
                 failure(NodeFailureCode::HarnessMcpUnavailable, "harness MCP proxy is not configured")
             })?.abort(&reservation_id, &activation_digest).map_err(harness_mcp_failure)?;
-            if let (Some(control), Some(instance_id)) =
-                (shared.native_launch_profile_control.as_ref(), instance_id)
-            {
-                control.clear_native_mcp_server_launch_overlay(instance_id);
+            if let Some(instance_id) = instance_id {
+                SessionLifecycleHook::on_harness_reservation_aborted(&*shared, instance_id);
             }
             Ok(NodeResponse::Aborted { reservation_id, activation_digest })
         }

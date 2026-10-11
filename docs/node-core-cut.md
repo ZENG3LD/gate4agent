@@ -213,7 +213,8 @@ Status: branch `migrate/node-core-extract`. Heuristic classification (name + bod
 
 ## Port status
 
-- `SpawnPreparer` (in gate4agent-node `server.rs`): done for the preparation block of `spawn_session_with_deadline` (station lease, harness MCP overlay, materialization, environment selection, network overlays, launch overlay). Not yet routed: `resume_session_record`, `spawn_managed_worktree*`, `reconcile_*`.
-- `SessionLifecycleHook`: `on_binding_removed` done. Not yet: session start/exit/retire hooks, `cleanup_session_owned_materialization`, record retire.
+- `SpawnPreparer`: `prepare` (spawn block), `select_environment`, `install_launch_overlay` (also used by `resume_session_record`). Not routed: `prepare_session_materialization` (called only from `prepare`), `spawn_managed_worktree*`/`reconcile_*` (worktree lease logic, product-only; no launch preparation of their own).
+- `SessionLifecycleHook`: `on_binding_removed`, `on_session_ended`, `on_shutdown`, `on_harness_reservation_aborted`, `cleanup_session_materialization`.
 - `ProductRoutes`, `StateExtension`: not started.
-- Note: the large legacy `mod tests` in server.rs is `cfg(all(test, windows))`; Linux coverage lives in `spawn_characterization_tests` and sibling modules.
+- Traits still use product types (`SessionBinding`, `PreparedNativeLaunchOverlay`, `NodeFailure`, receipts, guards). They cannot move to node-core until neutral types replace them, and `NodeShared` itself (one 11k-line impl, ~100 product fields/methods) cannot cross the crate boundary before ProductRoutes/StateExtension exist.
+- The legacy `mod tests` in server.rs is `cfg(all(test, windows))`; Linux coverage lives in `spawn_characterization_tests` and sibling modules.

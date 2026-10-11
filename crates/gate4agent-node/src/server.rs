@@ -3317,6 +3317,51 @@ impl Drop for SessionMaterializationGuard<'_> {
 }
 
 
+/// Port: product-side reactions to session lifecycle transitions
+/// (station lease, harness MCP overlay/registry, environment launch overlays).
+trait SessionLifecycleHook {
+    /// A binding was removed (unbind or spawn rollback).
+    fn on_binding_removed(&self, address: &SessionAddress, removed: Option<&SessionBinding>);
+}
+
+impl SessionLifecycleHook for NodeShared {
+    fn on_binding_removed(&self, address: &SessionAddress, removed: Option<&SessionBinding>) {
+        // Exclusive dig2browser station profile lease is node-local; clear
+        // on every session unbind / rollback. Never ImportSession/cookies.
+        #[cfg(feature = "dig2-station-probe")]
+        {
+            crate::dig2_station_lease::release_lease_for_holder(
+                &self.browser_station_leases,
+                address.session.instance_id,
+            );
+        }
+        if let Some(control) = self.native_launch_profile_control.as_ref() {
+            control.clear_native_mcp_server_launch_overlay(
+                address.session.instance_id,
+            );
+        }
+        if let Some(registry) = self.harness_mcp_registry.as_ref() {
+            registry.revoke_session(address);
+        }
+        if removed
+            .is_some_and(|binding| {
+                binding.environment_profile.is_some()
+                    || binding.bundle.is_some()
+                    || binding.context.is_some()
+            })
+        {
+            if let Some(control) = self.native_launch_profile_control.as_ref() {
+                control.clear_native_launch_profile_selection(
+                    address.session.instance_id,
+                );
+                control.clear_native_instance_launch_overlay(
+                    address.session.instance_id,
+                );
+            }
+        }
+    }
+}
+
 struct SpawnPrepareRequest<'r> {
     instance_id: AgentInstanceId,
     address: &'r SessionAddress,
@@ -9776,41 +9821,8 @@ impl NodeShared {
                 && binding.generation == address.session.generation
         }) {
             let removed = bindings.remove(&address.session.instance_id);
-            // Exclusive dig2browser station profile lease is node-local; clear
-            // on every session unbind / rollback. Never ImportSession/cookies.
-            #[cfg(feature = "dig2-station-probe")]
-            {
-                crate::dig2_station_lease::release_lease_for_holder(
-                    &self.browser_station_leases,
-                    address.session.instance_id,
-                );
-            }
             self.clear_terminal_frame_watermark(address);
-            if let Some(control) = self.native_launch_profile_control.as_ref() {
-                control.clear_native_mcp_server_launch_overlay(
-                    address.session.instance_id,
-                );
-            }
-            if let Some(registry) = self.harness_mcp_registry.as_ref() {
-                registry.revoke_session(address);
-            }
-            if removed
-                .as_ref()
-                .is_some_and(|binding| {
-                    binding.environment_profile.is_some()
-                        || binding.bundle.is_some()
-                        || binding.context.is_some()
-                })
-            {
-                if let Some(control) = self.native_launch_profile_control.as_ref() {
-                    control.clear_native_launch_profile_selection(
-                        address.session.instance_id,
-                    );
-                    control.clear_native_instance_launch_overlay(
-                        address.session.instance_id,
-                    );
-                }
-            }
+            SessionLifecycleHook::on_binding_removed(self, address, removed.as_ref());
             return removed;
         }
         None
@@ -18973,6 +18985,26 @@ mod spawn_characterization_tests {
             .unwrap_err();
         assert_eq!(error.code, NodeFailureCode::BackendOperationFailed);
         assert_eq!(shared.next_instance_id.load(Ordering::Acquire), 2);
+        assert_no_session_state(&shared);
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remove_binding_returns_binding_and_is_idempotent_for_environment_session() {
+        let (shared, runtime, receipt, root, _deny) = materialization_test_shared(false);
+        let address = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(77),
+                generation: SessionGeneration(1),
+            },
+        };
+        shared.bind_session_with_policy(&address, ProviderRuntimePolicy::raw_pty(), Some(receipt));
+        let removed = shared.remove_binding(&address).expect("binding removed");
+        assert!(removed.environment_profile.is_some());
+        assert!(shared.remove_binding(&address).is_none());
         assert_no_session_state(&shared);
         drop(shared);
         drop(runtime);

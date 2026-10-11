@@ -1101,7 +1101,10 @@ dependencies = [
  "gate4agent-node-protocol",
  "gate4agent-types",
  "libc",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

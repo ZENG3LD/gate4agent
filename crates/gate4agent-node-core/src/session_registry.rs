@@ -11,8 +11,8 @@ use crate::protocol::{
     NODE_STATE_SCHEMA_V6, NODE_STATE_SCHEMA_V7, NODE_STATE_SCHEMA_V8,
     NODE_STATE_SCHEMA_V9, NODE_STATE_SCHEMA_V10,
 };
-use crate::worktree_service::ManagedWorktreeLeaseRecord;
-use crate::session_environment::{
+use crate::managed_worktree::ManagedWorktreeLeaseRecord;
+use crate::materialization::{
     opaque_to_path, path_to_opaque, MaterializationId, MaterializationOwner,
     MaterializationOwnershipRecord, MaterializationState, MaterializedPathDeclaration,
     MAX_SESSION_MATERIALIZATIONS,
@@ -33,19 +33,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PERSISTED_WORKSPACES: usize = 256;
 const MAX_PERSISTED_MANAGED_WORKTREE_BRANCH_BYTES: usize = 512;
-pub(crate) const MAX_MANAGED_WORKTREE_SPAWN_REPLAYS: usize = 256;
-pub(crate) const MAX_MANAGED_SESSION_RECORDS: usize = 4_096;
+pub const MAX_MANAGED_WORKTREE_SPAWN_REPLAYS: usize = 256;
+pub const MAX_MANAGED_SESSION_RECORDS: usize = 4_096;
 const BACKUP_ROTATION_WARNING: &str = "durable-state-backup-rotation-failed";
 const CORRUPT_PRIMARY_PRESERVED_WARNING: &str = "durable-state-corrupt-primary-preserved";
-pub(crate) const DURABLE_STATE_COMMIT_FAILED: &str = "durable-state-commit-failed";
-pub(crate) const DURABLE_STATE_RECOVERY_WARNING: &str = "durable-state-recovery-required";
-pub(crate) const DURABLE_STATE_WORKSPACE_WARNING: &str =
+pub const DURABLE_STATE_COMMIT_FAILED: &str = "durable-state-commit-failed";
+pub const DURABLE_STATE_RECOVERY_WARNING: &str = "durable-state-recovery-required";
+pub const DURABLE_STATE_WORKSPACE_WARNING: &str =
     "durable-state-workspace-unavailable";
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(1);
 
-pub(crate) type ProviderSessionSemanticKey = (String, u8, String);
+pub type ProviderSessionSemanticKey = (String, u8, String);
 
-pub(crate) fn provider_session_semantic_key(
+pub fn provider_session_semantic_key(
     provider: &AgentId,
     identity: &gate4agent_types::ProviderSessionIdentity,
 ) -> ProviderSessionSemanticKey {
@@ -56,7 +56,7 @@ pub(crate) fn provider_session_semantic_key(
     (provider.as_str().to_owned(), key, identity.id.clone())
 }
 
-pub(crate) fn same_provider_session(
+pub fn same_provider_session(
     left_provider: &AgentId,
     left: &gate4agent_types::ProviderSessionIdentity,
     right_provider: &AgentId,
@@ -65,7 +65,7 @@ pub(crate) fn same_provider_session(
     left_provider == right_provider && left.key == right.key && left.id == right.id
 }
 
-pub(crate) fn sanitized_persistence_summary(message: &str) -> String {
+pub fn sanitized_persistence_summary(message: &str) -> String {
     match message {
         BACKUP_ROTATION_WARNING
         | CORRUPT_PRIMARY_PRESERVED_WARNING
@@ -76,14 +76,14 @@ pub(crate) fn sanitized_persistence_summary(message: &str) -> String {
     }
 }
 
-pub(crate) struct StatePathLock {
+pub struct StatePathLock {
     file: Option<File>,
     #[cfg(windows)]
     path: PathBuf,
 }
 
 impl StatePathLock {
-    pub(crate) fn acquire(path: Option<&Path>) -> io::Result<Option<Self>> {
+    pub fn acquire(path: Option<&Path>) -> io::Result<Option<Self>> {
         let Some(path) = path else {
             return Ok(None);
         };
@@ -192,7 +192,7 @@ fn acquire_unix_state_lock(path: &Path) -> io::Result<File> {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub(crate) struct LoadedNodeState {
+pub struct LoadedNodeState {
     pub workspaces: BTreeMap<WorkspaceId, String>,
     pub records: Vec<ManagedSessionRecord>,
     pub managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
@@ -325,7 +325,7 @@ struct PersistedNodeStateV10 {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ManagedWorktreeSpawnReplayRecordV10 {
+pub struct ManagedWorktreeSpawnReplayRecordV10 {
     pub idempotency_key: SpawnIdempotencyKey,
     pub request_digest: String,
     pub source_workspace_id: WorkspaceId,
@@ -338,7 +338,7 @@ pub(crate) struct ManagedWorktreeSpawnReplayRecordV10 {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
-pub(crate) enum ManagedWorktreeSpawnReplayStateV10 {
+pub enum ManagedWorktreeSpawnReplayStateV10 {
     Pending {
         owner_incarnation_id: NodeIncarnationId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -365,7 +365,7 @@ struct PersistedNodeStateHeader {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StateLoadRefusal {
+pub enum StateLoadRefusal {
     UnsupportedSchema,
     PathSemanticsUnsupported,
     NodeIdentityMismatch,
@@ -564,7 +564,7 @@ struct PersistedMaterializationRecordV8 {
     updated_at_unix_ms: u64,
 }
 
-pub(crate) fn load(path: Option<&Path>, expected_node_id: &NodeId) -> io::Result<LoadedNodeState> {
+pub fn load(path: Option<&Path>, expected_node_id: &NodeId) -> io::Result<LoadedNodeState> {
     let Some(path) = path else {
         return Ok(LoadedNodeState::empty());
     };
@@ -1401,7 +1401,7 @@ fn is_authoritative_state_error(error: &io::Error) -> bool {
     state_load_refusal(error).is_some()
 }
 
-pub(crate) fn state_load_refusal(error: &io::Error) -> Option<StateLoadRefusal> {
+pub fn state_load_refusal(error: &io::Error) -> Option<StateLoadRefusal> {
     error
         .get_ref()
         .and_then(|source| source.downcast_ref::<StateLoadRefusalError>())
@@ -1409,7 +1409,7 @@ pub(crate) fn state_load_refusal(error: &io::Error) -> Option<StateLoadRefusal> 
 }
 
 #[cfg(test)]
-pub(crate) fn save(
+pub fn save(
     path: Option<&Path>,
     node_id: &NodeId,
     workspaces: &BTreeMap<WorkspaceId, String>,
@@ -1489,7 +1489,7 @@ pub(crate) fn save(
 }
 
 #[cfg(test)]
-pub(crate) fn save_v4(
+pub fn save_v4(
     path: Option<&Path>,
     node_id: &NodeId,
     workspaces: &BTreeMap<WorkspaceId, String>,
@@ -1564,7 +1564,7 @@ pub(crate) fn save_v4(
 }
 
 #[cfg(test)]
-pub(crate) fn save_v5(
+pub fn save_v5(
     path: Option<&Path>,
     node_id: &NodeId,
     workspaces: &BTreeMap<WorkspaceId, String>,
@@ -1639,7 +1639,7 @@ pub(crate) fn save_v5(
 }
 
 #[cfg(test)]
-pub(crate) fn save_v7(
+pub fn save_v7(
     path: Option<&Path>,
     node_id: &NodeId,
     workspaces: &BTreeMap<WorkspaceId, String>,
@@ -1746,7 +1746,7 @@ pub(crate) fn save_v7(
 }
 
 #[cfg(test)]
-pub(crate) fn save_v8(
+pub fn save_v8(
     path: Option<&Path>,
     node_id: &NodeId,
     workspaces: &BTreeMap<WorkspaceId, String>,
@@ -1774,7 +1774,7 @@ pub(crate) fn save_v8(
 }
 
 #[cfg(test)]
-pub(crate) fn save_v9(
+pub fn save_v9(
     path: Option<&Path>,
     node_id: &NodeId,
     workspaces: &BTreeMap<WorkspaceId, String>,
@@ -1796,7 +1796,7 @@ pub(crate) fn save_v9(
     )
 }
 
-pub(crate) fn save_v10(
+pub fn save_v10(
     path: Option<&Path>,
     node_id: &NodeId,
     workspaces: &BTreeMap<WorkspaceId, String>,
@@ -1985,7 +1985,7 @@ fn persisted_v5_record(record: ManagedSessionRecord) -> PersistedManagedSessionR
     }
 }
 
-pub(crate) fn validate_display_name(display_name: &str) -> io::Result<()> {
+pub fn validate_display_name(display_name: &str) -> io::Result<()> {
     if display_name.trim().is_empty()
         || display_name.len() > MAX_SESSION_DISPLAY_NAME_BYTES
         || display_name.chars().any(char::is_control)
@@ -2033,7 +2033,7 @@ fn validate_record(record: &ManagedSessionRecord) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn sanitized_record_error_summary(message: &str) -> String {
+pub fn sanitized_record_error_summary(message: &str) -> String {
     let normalized = message.to_ascii_lowercase();
     if matches!(
         normalized.as_str(),
@@ -2710,9 +2710,9 @@ mod tests {
             materialization_root.join("bundle"),
             materialization_root.join("plugin-data"),
             vec![MaterializedPathDeclaration {
-                class: crate::session_environment::NodeSessionPathClass::Config,
+                class: crate::materialization::NodeSessionPathClass::Config,
                 relative_path: PathBuf::from("provider/settings.json"),
-                kind: crate::session_environment::MaterializedPathKind::Generated,
+                kind: crate::materialization::MaterializedPathKind::Generated,
             }],
             10,
             11,
@@ -2912,14 +2912,14 @@ mod tests {
                 provider_home: path_to_opaque(&materialization_root.join("home")).unwrap(),
                 declared_paths: vec![
                     MaterializedPathDeclaration {
-                        class: crate::session_environment::NodeSessionPathClass::Config,
+                        class: crate::materialization::NodeSessionPathClass::Config,
                         relative_path: PathBuf::from("provider"),
-                        kind: crate::session_environment::MaterializedPathKind::Generated,
+                        kind: crate::materialization::MaterializedPathKind::Generated,
                     },
                     MaterializedPathDeclaration {
-                        class: crate::session_environment::NodeSessionPathClass::Config,
+                        class: crate::materialization::NodeSessionPathClass::Config,
                         relative_path: PathBuf::from("provider/settings.json"),
-                        kind: crate::session_environment::MaterializedPathKind::Generated,
+                        kind: crate::materialization::MaterializedPathKind::Generated,
                     },
                 ],
                 created_at_unix_ms: 10,

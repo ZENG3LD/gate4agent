@@ -18,7 +18,7 @@ mod session_environment;
 
 mod worktree_service;
 
-mod session_registry;
+pub(crate) use gate4agent_node_core::session_registry;
 
 mod standalone_workspace;
 

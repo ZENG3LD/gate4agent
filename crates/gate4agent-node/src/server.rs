@@ -18607,6 +18607,357 @@ mod workspace_environment_collision_tests {
     }
 }
 
+#[cfg(test)]
+mod spawn_characterization_tests {
+    use super::*;
+    use crate::session_environment::{
+        NodeSecretReference, NodeSecretResolveError, NodeSecretValue,
+        NodeSessionEnvironmentMutation, NodeSessionFile, NodeSessionPathBinding,
+        NodeSessionPathClass,
+    };
+    use gate4agent_catalog::EnvMutation;
+    use gate4agent_runtime_native::{
+        NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver,
+        NativeLaunchProfile, NativeLaunchProfileId,
+    };
+    use std::ffi::OsString;
+    use std::sync::Arc;
+
+    struct EmptyEnvironmentResolver;
+
+    struct FixtureSecretResolver {
+        deny: Arc<AtomicBool>,
+    }
+
+    impl NodeSecretResolver for FixtureSecretResolver {
+        fn resolve(
+            &self,
+            _reference: &NodeSecretReference,
+        ) -> Result<NodeSecretValue, NodeSecretResolveError> {
+            if self.deny.load(Ordering::Acquire) {
+                Err(NodeSecretResolveError::Denied)
+            } else {
+                NodeSecretValue::text("fixture-secret")
+                    .map_err(|_| NodeSecretResolveError::Unavailable)
+            }
+        }
+    }
+
+    impl NativeChildEnvironmentResolver for EmptyEnvironmentResolver {
+        fn resolve_child_environment(
+            &self,
+        ) -> Result<Vec<EnvMutation>, NativeChildEnvironmentResolveError> {
+            Ok(vec![EnvMutation {
+                key: OsString::from("GATE4AGENT_TEST_PROFILE"),
+                value: None,
+            }])
+        }
+    }
+
+    fn agent(value: &str) -> AgentId {
+        AgentId::new(value).unwrap()
+    }
+
+    fn temporary_workspace_root(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "gate4agent-node-{label}-{}-{unique}",
+            std::process::id(),
+        ))
+    }
+
+    fn materialization_test_shared(
+        deny_secret: bool,
+    ) -> (
+        NodeShared,
+        NativeRuntime,
+        ResolvedEnvironmentProfileReceipt,
+        PathBuf,
+        Arc<AtomicBool>,
+    ) {
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        materialization_test_shared_with_workspace(deny_secret, workspace)
+    }
+
+    fn materialization_test_shared_with_workspace(
+        deny_secret: bool,
+        workspace: WorkspaceConfig,
+    ) -> (
+        NodeShared,
+        NativeRuntime,
+        ResolvedEnvironmentProfileReceipt,
+        PathBuf,
+        Arc<AtomicBool>,
+    ) {
+        let root = temporary_workspace_root(if deny_secret {
+            "materialization-denied"
+        } else {
+            "materialization-ready"
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let materialization_root = root.join("session-environments");
+        let deny = Arc::new(AtomicBool::new(deny_secret));
+        let resolver = Arc::new(FixtureSecretResolver {
+            deny: Arc::clone(&deny),
+        });
+        let materializer = SessionEnvironmentMaterializer::new(
+            materialization_root,
+            resolver,
+        )
+        .unwrap();
+        let profile_id = SpawnEnvironmentProfileId::new("materialized-claude").unwrap();
+        let profile_revision = crate::protocol::SpawnEnvironmentProfileRevision::new(
+            "materialized-claude-r1",
+        )
+        .unwrap();
+        let materialization = NodeSessionMaterializationProfile::new(
+            vec![NodeSessionEnvironmentMutation::SetSecret {
+                key: "GATE4AGENT_SESSION_TOKEN".to_owned(),
+                reference: NodeSecretReference::new("fixture-token").unwrap(),
+            }],
+            vec![NodeSessionPathBinding::new(
+                "GATE4AGENT_PROVIDER_HOME",
+                NodeSessionPathClass::ProviderHome,
+            )
+            .unwrap()],
+            vec![NodeSessionFile::secret(
+                NodeSessionPathClass::Config,
+                "auth/token",
+                NodeSecretReference::new("fixture-token").unwrap(),
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, mut runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let control = runtime.native_launch_profile_control();
+        let node_profile = NodeEnvironmentProfile::new_with_materialization(
+            profile_id.clone(),
+            profile_revision.clone(),
+            agent("claude"),
+            [NativeLaunchProfile::new(
+                NativeLaunchProfileId::new("materialized-claude-pty").unwrap(),
+                agent("claude"),
+                TransportKind::Pty,
+                vec![OsString::from("GATE4AGENT_TEST_PROFILE")],
+                Arc::new(EmptyEnvironmentResolver),
+            )
+            .unwrap()],
+            Some(materialization),
+        )
+        .unwrap();
+        let (binding, native_profiles, materialization) = node_profile.into_parts();
+        for native_profile in native_profiles {
+            runtime.upsert_native_launch_profile(native_profile).unwrap();
+        }
+        let shared = NodeShared::new_with_incarnation(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-materialization-test").unwrap(),
+            NodeIncarnationId::from_bytes([9; crate::protocol::NODE_INCARNATION_ID_BYTES]),
+            vec![workspace],
+            vec![agent("claude")],
+            ProviderRuntimeStatuses::default(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            SpawnProfileRegistry::default(),
+            Some(control),
+            None,
+            Some(materializer),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            MUTATION_SETTLE_TIMEOUT_MS.saturating_add(READINESS_SETTLE_HEADROOM_MS),
+        );
+        shared
+            .environment_profiles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(binding.id.clone(), binding);
+        shared
+            .environment_materialization_profiles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(profile_id.clone(), materialization.unwrap());
+        (
+            shared,
+            runtime,
+            ResolvedEnvironmentProfileReceipt {
+                profile_id,
+                profile_revision,
+                network_allowlist: None,
+                browser_profile_id: None,
+            },
+            root,
+            deny,
+        )
+    }
+
+
+    // ---- Characterization of the spawn preparation block (pre-SpawnPreparer) ----
+
+    async fn characterization_spawn(
+        shared: &NodeShared,
+        mode: SessionMode,
+        environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+        required: &[ProviderRuntimeCapability],
+        harness_mcp: Option<&PreparedHarnessMcpSpawn>,
+    ) -> Result<(SessionAddress, ProviderRuntimePolicy), NodeFailure> {
+        shared
+            .spawn_session_with_deadline(
+                WorkspaceId::new("primary").unwrap(),
+                agent("claude"),
+                mode,
+                gate4agent_types::TerminalSize { rows: 24, columns: 80 },
+                None,
+                environment_profile,
+                None,
+                None,
+                None,
+                Some(ProviderRuntimePolicy::raw_pty()),
+                SpawnRecordPolicy::ProviderIdentityOnly,
+                Some(Instant::now() + Duration::from_secs(30)),
+                required,
+                harness_mcp,
+                ApprovalLevel::default(),
+                None,
+                None,
+            )
+            .await
+    }
+
+    fn assert_no_session_state(shared: &NodeShared) {
+        assert!(shared.handle.snapshot().sessions.is_empty());
+        assert!(shared
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert!(shared
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_unadmitted_required_capability_refuses_before_id_mint() {
+        let (shared, runtime, _receipt, root, _deny) = materialization_test_shared(false);
+        let error = characterization_spawn(
+            &shared,
+            SessionMode::Pty,
+            None,
+            &[ProviderRuntimeCapability::SemanticReadiness],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, NodeFailureCode::UnsupportedSpawnCapability);
+        assert_eq!(shared.next_instance_id.load(Ordering::Acquire), 1);
+        assert_no_session_state(&shared);
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_denied_environment_materialization_fails_after_id_mint_with_no_state() {
+        let (shared, runtime, receipt, root, _deny) = materialization_test_shared(true);
+        let error = characterization_spawn(&shared, SessionMode::Pty, Some(receipt), &[], None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, NodeFailureCode::BackendOperationFailed);
+        assert_eq!(shared.next_instance_id.load(Ordering::Acquire), 2);
+        assert_no_session_state(&shared);
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn characterization_prepared_harness(provider: &str) -> PreparedHarnessMcpSpawn {
+        use crate::harness_mcp_proxy::{HarnessMcpProxyRegistry, ReviewedHarnessMcpProgram};
+        use crate::protocol::{HarnessMcpActivationDigest, HarnessMcpLaunchV1, HarnessMcpReservationId};
+        let helper = ReviewedHarnessMcpProgram::review(std::env::current_exe().unwrap())
+            .expect("review current test executable as fixture helper");
+        let registry = HarnessMcpProxyRegistry::new(helper);
+        let spec = crate::protocol::SpawnSpec {
+            target: crate::protocol::SpawnTarget {
+                node_id: NodeId::new("node-characterization").unwrap(),
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: crate::protocol::SpawnProfileId::new("claude").unwrap(),
+            expected_profile_revision: crate::protocol::SpawnProfileRevision::new("r1").unwrap(),
+            overrides: crate::protocol::SpawnOverrides::default(),
+            deadline_ms: crate::protocol::SpawnDeadlineMs::new(30_000).unwrap(),
+            idempotency_key: crate::protocol::SpawnIdempotencyKey::new("characterization-harness").unwrap(),
+            required_capabilities: crate::protocol::SpawnRequiredCapabilities::default(),
+        };
+        let reservation = HarnessMcpReservationId::new(format!("hmcpres_{}", "c".repeat(24))).unwrap();
+        let digest = HarnessMcpActivationDigest::new(format!("sha256:{}", "c".repeat(64))).unwrap();
+        let launch = HarnessMcpLaunchV1 {
+            server_name: "fixture-harness".to_owned(),
+            args: vec!["--session-proxy".to_owned()],
+            endpoint_env: "FIXTURE_SESSION_ENDPOINT".to_owned(),
+            token_env: "FIXTURE_SESSION_TOKEN".to_owned(),
+            program_env: "FIXTURE_MCP_PROGRAM".to_owned(),
+            trace: None,
+            scrub_env: Vec::new(),
+        };
+        let expires = unix_time_ms().saturating_add(30_000);
+        registry.arm(reservation.clone(), digest.clone(), spec.clone(), launch, expires).await.unwrap();
+        registry
+            .prepare_spawn(&reservation, &digest, &spec, expires, agent(provider))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn spawn_harness_overlay_refuses_inline_and_provider_mismatch_with_no_state() {
+        let (shared, runtime, _receipt, root, _deny) = materialization_test_shared(false);
+        let prepared = characterization_prepared_harness("claude").await;
+        let error = characterization_spawn(&shared, SessionMode::Inline, None, &[], Some(&prepared))
+            .await
+            .unwrap_err();
+        // Inline is stopped by runtime admission before the harness check runs.
+        assert_eq!(error.code, NodeFailureCode::UnsupportedSpawnCapability);
+        let mismatched = characterization_prepared_harness("codex").await;
+        let error = characterization_spawn(&shared, SessionMode::Pty, None, &[], Some(&mismatched))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, NodeFailureCode::BindingMismatch);
+        assert_no_session_state(&shared);
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_harness_overlay_without_launch_control_is_unavailable_with_no_state() {
+        let (mut shared, runtime, _receipt, root, _deny) = materialization_test_shared(false);
+        shared.native_launch_profile_control = None;
+        let prepared = characterization_prepared_harness("claude").await;
+        let error = characterization_spawn(&shared, SessionMode::Pty, None, &[], Some(&prepared))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, NodeFailureCode::HarnessMcpUnavailable);
+        assert_no_session_state(&shared);
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;

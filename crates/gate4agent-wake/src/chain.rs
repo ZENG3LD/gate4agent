@@ -302,6 +302,11 @@ impl WakeChain {
         self.links.push((id, adapter));
     }
 
+    /// Puts a link in front (an embedder's own first stop, e.g. m4a's letter hook).
+    pub fn prepend(&mut self, id: &'static str, adapter: Box<dyn WakeAdapter>) {
+        self.links.insert(0, (id, adapter));
+    }
+
     /// Link ids in order.
     pub fn ids(&self) -> Vec<&'static str> {
         self.links.iter().map(|(id, _)| *id).collect()

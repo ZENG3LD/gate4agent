@@ -19,6 +19,18 @@ const NATIVE_INSTANCE_LAUNCH_ARG_MAX_BYTES: usize = 65_536;
 const NATIVE_INSTANCE_LAUNCH_ARGS_TOTAL_MAX_BYTES: usize = 262_144;
 const RESERVED_HOOK_ENV_PREFIX: &str = "GATE4AGENT_HOOK_";
 const CONTEXT_ROOT_ENVIRONMENT_KEY: &str = "GATE4AGENT_CONTEXT_ROOT";
+
+/// The only keys of a host-assigned session identity (the messaging account the host gives
+/// one session: nick = key = role). They are host-owned like the context root, so they need no
+/// native launch profile and can ride on top of any other overlay.
+pub const SESSION_IDENTITY_ENVIRONMENT_KEYS: &[&str] = &["M4A_NICK", "M4A_SESSION_CAP"];
+
+fn is_session_identity(environment: &[EnvMutation]) -> bool {
+    !environment.is_empty()
+        && environment.iter().all(|m| {
+            SESSION_IDENTITY_ENVIRONMENT_KEYS.iter().any(|k| m.key == OsStr::new(k)) && m.value.as_ref().is_some_and(|v| !v.is_empty())
+        })
+}
 const RESERVED_CLAUDE_LAUNCH_FLAGS: &[&str] = &[
     "--continue",
     "--print",
@@ -365,6 +377,24 @@ impl NativeLaunchEnvironmentOverlay {
         Ok(overlay)
     }
 
+    /// See [`NativeInstanceLaunchOverlay::append_session_identity`].
+    pub fn append_session_identity(
+        &mut self,
+        environment: Vec<EnvMutation>,
+    ) -> Result<(), NativeLaunchProfileError> {
+        if self.transport != TransportKind::Pty {
+            return Err(NativeLaunchProfileError::UnsupportedTransport);
+        }
+        if !is_session_identity(&environment) {
+            return Err(NativeLaunchProfileError::EnvironmentOverlaySelectionMissing);
+        }
+        let mut merged = self.environment.clone();
+        merged.extend(environment);
+        validate_environment_mutations(&merged)?;
+        self.environment = merged;
+        Ok(())
+    }
+
     fn into_instance_overlay(self) -> NativeInstanceLaunchOverlay {
         NativeInstanceLaunchOverlay {
             agent_id: self.agent_id,
@@ -396,6 +426,39 @@ impl NativeLaunchEnvironmentOverlay {
 }
 
 impl NativeInstanceLaunchOverlay {
+    /// A PTY overlay carrying only a host-assigned session identity
+    /// ([`SESSION_IDENTITY_ENVIRONMENT_KEYS`]); no native launch profile is required.
+    pub fn new_session_identity(
+        agent_id: AgentId,
+        environment: Vec<EnvMutation>,
+    ) -> Result<Self, NativeLaunchProfileError> {
+        if !is_session_identity(&environment) {
+            return Err(NativeLaunchProfileError::EnvironmentOverlaySelectionMissing);
+        }
+        let mut overlay = Self::new(agent_id, TransportKind::Pty, environment, Vec::new())?;
+        overlay.profile_selection_required = false;
+        Ok(overlay)
+    }
+
+    /// Adds a host-assigned session identity to this overlay without changing whether it needs
+    /// a profile. Refused for other keys, for a key the overlay already sets, and off PTY.
+    pub fn append_session_identity(
+        &mut self,
+        environment: Vec<EnvMutation>,
+    ) -> Result<(), NativeLaunchProfileError> {
+        if self.transport != TransportKind::Pty {
+            return Err(NativeLaunchProfileError::InstanceOverlayUnsupportedTransport);
+        }
+        if !is_session_identity(&environment) {
+            return Err(NativeLaunchProfileError::EnvironmentOverlaySelectionMissing);
+        }
+        let mut merged = self.environment.clone();
+        merged.extend(environment);
+        validate_environment_mutations(&merged)?;
+        self.environment = merged;
+        Ok(())
+    }
+
     /// Append validated argv (Codex `-c` network_access merge onto an
     /// existing instance overlay).
     pub fn append_extra_args(
@@ -1197,6 +1260,41 @@ fn validate_zai_glm_claude_environment(
         return Err(NativeLaunchProfileError::FixedEnvironmentValueMismatch);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod session_identity_tests {
+    use super::*;
+
+    fn set(k: &str, v: &str) -> EnvMutation {
+        EnvMutation { key: k.into(), value: Some(v.into()) }
+    }
+    fn codex() -> AgentId {
+        AgentId::new("codex").unwrap()
+    }
+
+    #[test]
+    fn identity_overlay_needs_no_profile_and_only_takes_identity_keys() {
+        let o = NativeInstanceLaunchOverlay::new_session_identity(codex(), vec![set("M4A_NICK", "codex-1"), set("M4A_SESSION_CAP", "ab")]).unwrap();
+        assert!(!o.profile_selection_required);
+        assert!(NativeInstanceLaunchOverlay::new_session_identity(codex(), vec![set("PATH", "/x")]).is_err());
+        assert!(NativeInstanceLaunchOverlay::new_session_identity(codex(), vec![]).is_err());
+        assert!(NativeInstanceLaunchOverlay::new_session_identity(codex(), vec![set("M4A_NICK", "")]).is_err());
+    }
+
+    #[test]
+    fn identity_appends_to_an_existing_overlay_without_relaxing_it() {
+        let mut o = NativeInstanceLaunchOverlay::new(codex(), TransportKind::Pty, vec![set("FOO", "1")], Vec::new()).unwrap();
+        assert!(o.profile_selection_required);
+        o.append_session_identity(vec![set("M4A_NICK", "codex-2"), set("M4A_SESSION_CAP", "cd")]).unwrap();
+        assert!(o.profile_selection_required);
+        assert_eq!(o.environment.len(), 3);
+        assert!(o.append_session_identity(vec![set("M4A_NICK", "again")]).is_err(), "duplicate key refused");
+        assert!(o.append_session_identity(vec![set("HOME", "/h")]).is_err());
+        let mut e = NativeLaunchEnvironmentOverlay::new(codex(), TransportKind::Pty, vec![set("BAR", "2")]).unwrap();
+        e.append_session_identity(vec![set("M4A_SESSION_CAP", "ef")]).unwrap();
+        assert_eq!(e.environment.len(), 2);
+    }
 }
 
 #[cfg(test)]

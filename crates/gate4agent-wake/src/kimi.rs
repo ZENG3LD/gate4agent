@@ -8,6 +8,9 @@
 //! prompt was accepted with `status: running`. The bearer is the server's
 //! own token; the host injects it (never a literal, never logged).
 //!
+//! TODO(kimi-acp): a `kimi acp` host adapter (ACP `session/prompt`, never answering permission
+//! requests) belongs here next to this one; see the docs handoff of 2026-10-13.
+//!
 //! TODO(kimi-tui): a plain `kimi` TUI does not expose this server. For TUI
 //! sessions the fallback is the inbox + a `Stop` hook (`exit 2` with the
 //! letter on stderr continues the turn once) or `UserPromptSubmit`; neither

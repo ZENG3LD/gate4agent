@@ -457,8 +457,18 @@ pub fn adapter_for(kind: SessionKind, config: &AdapterConfig) -> Box<dyn WakeAda
             bearer: config.claude_fire_bearer.clone(),
         }),
         (Surface::Web, ProviderKind::Codex) => Box::new(CodexCloudAdapter),
+        // A web session whose host handed a routine URL is woken through it; without one
+        // there is no inbound path.
         (Surface::Web, provider @ (ProviderKind::KimiCode | ProviderKind::Grok)) => {
-            Box::new(NoInboundAdapter { provider })
+            if config.routine_url.as_deref().is_some_and(|u| !u.is_empty()) {
+                Box::new(RoutineWebhookAdapter {
+                    provider,
+                    url: config.routine_url.clone(),
+                    bearer: config.routine_bearer.clone(),
+                })
+            } else {
+                Box::new(NoInboundAdapter { provider })
+            }
         }
     }
 }
@@ -773,6 +783,16 @@ pub(crate) mod tests {
             event_id: "$ev1",
             room: None,
         }
+    }
+
+    #[test]
+    fn web_grok_uses_the_routine_only_when_one_is_configured() {
+        let kind = SessionKind::web(ProviderKind::Grok);
+        let none = adapter_for(kind, &AdapterConfig::default());
+        assert!(none.probe(&session(kind)).is_err());
+        let cfg = AdapterConfig { routine_url: Some("http://127.0.0.1:9/hook".into()), ..Default::default() };
+        let routine = adapter_for(kind, &cfg);
+        assert!(routine.probe(&session(kind)).is_ok());
     }
 
     #[test]

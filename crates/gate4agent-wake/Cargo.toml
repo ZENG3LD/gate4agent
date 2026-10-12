@@ -1,0 +1,24 @@
+[package]
+name = "gate4agent-wake"
+version = "0.5.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ZENG3LD/gate4agent"
+description = "Provider wake/spawn adapters (codex app-server, claude channel, kimi, grok ACP, hook/inbox/headless-resume) and the hosted-session wake API"
+
+[features]
+default = ["all"]
+all = ["wake-grok", "wake-claude", "wake-codex", "wake-kimi", "wake-cursor", "wake-routine", "wake-spawn"]
+wake-grok = []
+wake-claude = []
+wake-codex = []
+wake-kimi = []
+wake-cursor = []
+wake-routine = []
+wake-spawn = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+tungstenite = { version = "0.29", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }

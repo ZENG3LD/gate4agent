@@ -1,9 +1,15 @@
-//! gate4agent-wake: provider wake/spawn adapters (moved here from mail4agent, 2026-10-13).
+//! gate4agent-wake: the deliver-turn API -- put one letter into an agent session as a turn,
+//! over structured channels only. No PTY, no raw keystrokes, no screen read: this crate must
+//! never depend on the terminal crates (gate4agent-pty, -shell-*, -runtime-native, -node-core).
+//! It has no permission model of its own; the host (hatchery) decides who may deliver.
+//! Adapters never answer a permission request; the modal stays with the session's client.
 //!
-//! Layer rule: mail4agent (m4a) is the client of LIVE sessions only -- it delivers a letter and
-//! sends. Waking a session or spawning one (incl. ACP and offline sessions) is g4a's job, so the
-//! adapters live here once. Standalone m4a builds still use them through m4a's `legacy-wake`
-//! shim; a host that owns its sessions (the hatchery node) uses [`hosted`] instead.
+//! (Adapters moved here from mail4agent, 2026-10-13; the grok leader ACP client and the routine
+//! POST followed on `feat/deliver-adapters`, so the messenger links no session channel.)
+//!
+//! Layer rule: mail4agent (m4a) is a pure messenger -- it hands a letter over (`M4A_LETTER_HOOK`)
+//! and keeps it in its durable inbox. The host (the hatchery node) decides with [`hosted`] and
+//! delivers through the adapters here.
 //!
 //! Original description (mail4agent):
 //!
@@ -56,6 +62,10 @@ pub mod kimi;
 #[cfg(not(feature = "wake-kimi"))]
 pub use off::kimi;
 pub mod registry;
+#[cfg(feature = "wake-grok")]
+pub mod grok_leader;
+#[cfg(feature = "wake-routine")]
+pub mod routine;
 #[cfg(not(all(feature = "wake-claude", feature = "wake-codex", feature = "wake-kimi", feature = "wake-spawn")))]
 mod off;
 #[cfg(feature = "wake-spawn")]
@@ -77,16 +87,6 @@ pub fn reply_hint(to: &str, from_nick: &str) -> String {
     format!("{SEND_COMMAND} --as {to} --to {from_nick} '<your reply>'")
 }
 
-/// POSTs one routine JSON object: `(url, body, bearer)`. The embedder registers it (m4a
-/// registers its `post_routine_json`, which carries the shared URL/bearer rules).
-pub type RoutineTransport = fn(&str, &serde_json::Value, Option<&str>) -> Result<(), String>;
-
-static ROUTINE_TRANSPORT: std::sync::OnceLock<RoutineTransport> = std::sync::OnceLock::new();
-
-/// Registers the routine POST transport once; later calls are ignored.
-pub fn set_routine_transport(transport: RoutineTransport) {
-    let _ = ROUTINE_TRANSPORT.set(transport);
-}
 
 pub use chain::{plan_chain, ChainError, HostEnv, Mechanism, Tier, WakeChain, WebVendor};
 pub use claude_channel::ClaudeChannelAdapter;
@@ -466,17 +466,6 @@ pub fn adapter_for(kind: SessionKind, config: &AdapterConfig) -> Box<dyn WakeAda
 // ---------------------------------------------------------------- local --
 
 /// Grok CLI: ACP `session/prompt` on an already-running `leader.sock`.
-/// Sends one prompt to a grok leader over ACP: `(leader_sock, session_id, cwd, prompt)`.
-/// g4a does not link a grok ACP client itself; the embedder registers one (m4a registers
-/// `mail4agent_grok::wake_decrypted_room_blocking`).
-pub type GrokLeaderTransport = fn(&Path, &str, &Path, &str) -> Result<(), String>;
-
-static GROK_LEADER_TRANSPORT: std::sync::OnceLock<GrokLeaderTransport> = std::sync::OnceLock::new();
-
-/// Registers the grok leader ACP transport once; later calls are ignored.
-pub fn set_grok_leader_transport(transport: GrokLeaderTransport) {
-    let _ = GROK_LEADER_TRANSPORT.set(transport);
-}
 
 pub struct GrokLeaderAdapter {
     /// `M4A_LEADER_SOCK`.
@@ -514,12 +503,9 @@ impl WakeAdapter for GrokLeaderAdapter {
         let cwd = session_cwd(session)?;
         #[cfg(feature = "wake-grok")]
         {
-            let transport = GROK_LEADER_TRANSPORT
-                .get()
-                .ok_or_else(|| WakeError::Unavailable("no grok leader transport registered".into()))?;
-            transport(sock, &session.session_id, Path::new(&cwd), &wake_prompt(session, letter))
+            grok_leader::wake_decrypted_room_blocking(sock, &session.session_id, &cwd, &wake_prompt(session, letter))
                 .map(|()| WakeOutcome::Delivered)
-                .map_err(WakeError::Transport)
+                .map_err(|e| WakeError::Transport(e.to_string()))
         }
     }
 }
@@ -608,12 +594,15 @@ impl WakeAdapter for RoutineWebhookAdapter {
                 body.insert(k.into(), serde_json::Value::String(v.into()));
             }
         }
-        let transport = ROUTINE_TRANSPORT
-            .get()
-            .ok_or_else(|| WakeError::Unavailable("no routine transport registered".into()))?;
-        transport(url, &serde_json::Value::Object(body), self.bearer.as_deref())
+        #[cfg(not(feature = "wake-routine"))]
+        {
+            let _ = (url, body);
+            return Err(WakeError::Unavailable("this build was made without feature wake-routine".into()));
+        }
+        #[cfg(feature = "wake-routine")]
+        routine::post_routine_json(url, &serde_json::Value::Object(body), self.bearer.as_deref())
             .map(|()| WakeOutcome::Delivered)
-            .map_err(WakeError::Transport)
+            .map_err(|e| WakeError::Transport(e.to_string()))
     }
 }
 

@@ -59,6 +59,7 @@ pub mod hook;
 pub mod inbox;
 #[cfg(feature = "wake-kimi")]
 pub mod kimi;
+pub mod kimi_acp;
 #[cfg(not(feature = "wake-kimi"))]
 pub use off::kimi;
 pub mod registry;
@@ -363,6 +364,8 @@ pub struct AdapterConfig {
     pub kimi_url: Option<String>,
     /// Kimi local server bearer (`M4A_KIMI_SERVER_TOKEN`), in memory only.
     pub kimi_bearer: Option<String>,
+    /// When set, local Kimi uses the ACP host (`M4A_KIMI_ACP` gate); value is the binary (`M4A_KIMI_BIN` or `"kimi"`).
+    pub kimi_acp_bin: Option<String>,
     /// Web routine URL of the bot (`M4A_ROUTINE_URL`), in memory only.
     pub routine_url: Option<String>,
     /// Web routine key (`M4A_ROUTINE_BEARER`), in memory only.
@@ -403,6 +406,7 @@ impl AdapterConfig {
             codex: CodexEndpoint::from_env(),
             kimi_url,
             kimi_bearer,
+            kimi_acp_bin: kimi_acp::KimiAcpConfig::from_env().map(|c| c.bin),
             routine_url: None,
             routine_bearer: None,
             claude_fire_url: get(CLAUDE_FIRE_URL_ENV),
@@ -437,10 +441,17 @@ pub fn adapter_for(kind: SessionKind, config: &AdapterConfig) -> Box<dyn WakeAda
         (Surface::Local, ProviderKind::Codex) => {
             Box::new(CodexAppServerAdapter::new(config.codex.clone()))
         }
-        (Surface::Local, ProviderKind::KimiCode) => Box::new(KimiServerAdapter::new(
-            config.kimi_url.clone(),
-            config.kimi_bearer.clone(),
-        )),
+        (Surface::Local, ProviderKind::KimiCode) => {
+            // ACP host when the host gated it; else the local kimi server. One wake owner.
+            if let Some(bin) = config.kimi_acp_bin.clone() {
+                Box::new(kimi_acp::KimiAcpAdapter::new(Some(kimi_acp::KimiAcpConfig { bin })))
+            } else {
+                Box::new(KimiServerAdapter::new(
+                    config.kimi_url.clone(),
+                    config.kimi_bearer.clone(),
+                ))
+            }
+        },
         (Surface::Local, ProviderKind::ClaudeCode) => {
             Box::new(ClaudeChannelAdapter::new(config.inbox_dir.clone()))
         }

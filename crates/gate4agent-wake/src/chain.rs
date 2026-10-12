@@ -14,6 +14,7 @@ use super::claude_channel::ClaudeChannelAdapter;
 use super::codex::CodexAppServerAdapter;
 use super::hook::{HookFlavor, InboxHookAdapter, InboxQueueAdapter};
 use super::kimi::KimiServerAdapter;
+use super::kimi_acp::{KimiAcpAdapter, KimiAcpConfig};
 use super::spawn::ResumeSpawnAdapter;
 use super::{
     AdapterConfig, ClaudeRoutineFireAdapter, GrokLeaderAdapter, NoInboundAdapter, ProviderKind,
@@ -204,6 +205,7 @@ pub fn mechanisms(kind: SessionKind, vendor: Option<WebVendor>) -> Vec<Mechanism
             m("codex-exec-resume-spawn", Spawn, false),
         ],
         (Surface::Local, ProviderKind::KimiCode) => vec![
+            m("kimi-acp-host", InSession, true),
             m("kimi-server-prompt", InSession, true),
             m("kimi-stop-hook", Hook, false),
             m("inbox-queue", Queue, true),
@@ -357,6 +359,9 @@ pub fn plan_chain(session: &ProviderSession, host: &HostEnv, config: &AdapterCon
                 leader_sock: config.leader_sock.clone(),
             }),
             "codex-app-server-turn" => Box::new(CodexAppServerAdapter::new(config.codex.clone())),
+            "kimi-acp-host" => Box::new(KimiAcpAdapter::new(
+                config.kimi_acp_bin.clone().map(|bin| KimiAcpConfig { bin }),
+            )),
             "kimi-server-prompt" => Box::new(KimiServerAdapter::new(
                 config.kimi_url.clone(),
                 config.kimi_bearer.clone(),

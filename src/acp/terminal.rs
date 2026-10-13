@@ -17,10 +17,13 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
-use super::protocol::{EnvVariable, TerminalCreateParams, TerminalExitStatus, TerminalOutputResult};
+use super::protocol::{
+    EnvVariable, TerminalCreateParams, TerminalExitStatus, TerminalOutputResult,
+};
 
 /// Cap on retained combined stdout+stderr per terminal when the agent does
 /// not send `outputByteLimit` — an ACP agent that never calls
@@ -36,7 +39,16 @@ struct TerminalHandle {
     /// probe from `output`) has observed the process end. `None` means
     /// still running as far as this handle has observed.
     exit_status: Mutex<Option<TerminalExitStatus>>,
+    /// Number of output drain threads that have reached end of stream.
+    drains_done: Arc<(Mutex<u8>, Condvar)>,
 }
+
+/// Both stdout and stderr drains.
+const DRAIN_COUNT: u8 = 2;
+/// How long `wait_for_exit` waits for the pipes to drain after the process
+/// ends. A grandchild that inherited the pipes can keep them open forever, so
+/// this is bounded rather than a join.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Table of live terminals for one ACP host session, keyed by an
 /// opaque, host-generated `terminalId`.
@@ -95,8 +107,21 @@ impl TerminalStore {
 
         let output = Arc::new(Mutex::new(Vec::new()));
         let truncated = Arc::new(AtomicBool::new(false));
-        spawn_output_drain(stdout, Arc::clone(&output), Arc::clone(&truncated), limit);
-        spawn_output_drain(stderr, Arc::clone(&output), Arc::clone(&truncated), limit);
+        let drains_done = Arc::new((Mutex::new(0_u8), Condvar::new()));
+        spawn_output_drain(
+            stdout,
+            Arc::clone(&output),
+            Arc::clone(&truncated),
+            limit,
+            Arc::clone(&drains_done),
+        );
+        spawn_output_drain(
+            stderr,
+            Arc::clone(&output),
+            Arc::clone(&truncated),
+            limit,
+            Arc::clone(&drains_done),
+        );
 
         let id = format!("term-{:x}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let handle = TerminalHandle {
@@ -104,6 +129,7 @@ impl TerminalStore {
             output,
             truncated,
             exit_status: Mutex::new(None),
+            drains_done,
         };
         self.sessions
             .lock()
@@ -158,6 +184,10 @@ impl TerminalStore {
                 .lock()
                 .map_err(|_| "terminal child mutex poisoned".to_string())?;
             let exit = child.wait().map_err(|e| e.to_string())?;
+            // The process is gone, but its last writes may still sit in the
+            // pipes; let the drains catch up so `output` after
+            // `wait_for_exit` sees everything the command printed.
+            wait_for_drains(&handle.drains_done, DRAIN_GRACE);
             let status = exit_status_from(&exit);
             *handle
                 .exit_status
@@ -237,6 +267,12 @@ impl TerminalStore {
     }
 }
 
+fn wait_for_drains(drains_done: &(Mutex<u8>, Condvar), grace: Duration) {
+    let (count, cvar) = drains_done;
+    let Ok(guard) = count.lock() else { return };
+    let _ = cvar.wait_timeout_while(guard, grace, |done| *done < DRAIN_COUNT);
+}
+
 fn exit_status_from(status: &std::process::ExitStatus) -> TerminalExitStatus {
     TerminalExitStatus {
         exit_code: status.code(),
@@ -264,28 +300,40 @@ fn spawn_output_drain(
     output: Arc<Mutex<Vec<u8>>>,
     truncated: Arc<AtomicBool>,
     limit: usize,
+    drains_done: Arc<(Mutex<u8>, Condvar)>,
 ) {
     thread::spawn(move || {
-        let mut chunk = [0_u8; 8 * 1024];
-        loop {
-            let read = match reader.read(&mut chunk) {
-                Ok(0) => return,
-                Ok(n) => n,
-                Err(_) => return,
-            };
-            let Ok(mut buffer) = output.lock() else { return };
-            if buffer.len() >= limit {
-                truncated.store(true, Ordering::Release);
-                return;
-            }
-            let take = read.min(limit - buffer.len());
-            buffer.extend_from_slice(&chunk[..take]);
-            if take < read {
-                truncated.store(true, Ordering::Release);
-                return;
-            }
+        drain(&mut reader, &output, &truncated, limit);
+        let (count, cvar) = &*drains_done;
+        if let Ok(mut done) = count.lock() {
+            *done = done.saturating_add(1);
+            cvar.notify_all();
         }
     });
+}
+
+fn drain(reader: &mut impl Read, output: &Mutex<Vec<u8>>, truncated: &AtomicBool, limit: usize) {
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = match reader.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        let Ok(mut buffer) = output.lock() else {
+            return;
+        };
+        if buffer.len() >= limit {
+            truncated.store(true, Ordering::Release);
+            return;
+        }
+        let take = read.min(limit - buffer.len());
+        buffer.extend_from_slice(&chunk[..take]);
+        if take < read {
+            truncated.store(true, Ordering::Release);
+            return;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -325,18 +373,27 @@ mod tests {
     fn full_lifecycle_create_output_wait_release() {
         let store = TerminalStore::new();
         let working_dir = std::env::temp_dir();
-        let id = store.create(&working_dir, &echo_command()).expect("spawn should succeed");
+        let id = store
+            .create(&working_dir, &echo_command())
+            .expect("spawn should succeed");
 
         let exit = store.wait_for_exit(&id).expect("wait should succeed");
         assert_eq!(exit.exit_code, Some(0));
 
         let output = store.output(&id).expect("output should succeed");
-        assert!(output.output.contains("hello"), "output was: {:?}", output.output);
+        assert!(
+            output.output.contains("hello"),
+            "output was: {:?}",
+            output.output
+        );
         assert!(!output.truncated);
         assert_eq!(output.exit_status.and_then(|s| s.exit_code), Some(0));
 
         store.release(&id).expect("release should succeed");
-        assert!(store.output(&id).is_err(), "terminal must be gone after release");
+        assert!(
+            store.output(&id).is_err(),
+            "terminal must be gone after release"
+        );
     }
 
     #[test]
@@ -385,9 +442,13 @@ mod tests {
             cwd: None,
             output_byte_limit: None,
         };
-        let id = store.create(&working_dir, &params).expect("spawn should succeed");
+        let id = store
+            .create(&working_dir, &params)
+            .expect("spawn should succeed");
         store.kill(&id).expect("kill should succeed");
-        let exit = store.wait_for_exit(&id).expect("wait after kill should still succeed");
+        let exit = store
+            .wait_for_exit(&id)
+            .expect("wait after kill should still succeed");
         assert_ne!(exit.exit_code, Some(0));
         store.release(&id).expect("release should succeed");
     }

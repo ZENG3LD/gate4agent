@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-node-core"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Transport core of the gate4agent node: platform endpoints, spawn profiles, kernel WireGuard bring-up"
 license = "MIT"
@@ -9,9 +9,9 @@ license = "MIT"
 name = "gate4agent_node_core"
 
 [dependencies]
-gate4agent-node-protocol = { path = "../gate4agent-node-protocol", version = "0.5.0" }
-gate4agent-types = { path = "../gate4agent-types", version = "0.5.0" }
-gate4agent-runtime-native = { path = "../gate4agent-runtime-native", version = "0.5.0" }
+gate4agent-node-protocol = { path = "../gate4agent-node-protocol", version = "0.5.1" }
+gate4agent-types = { path = "../gate4agent-types", version = "0.5.1" }
+gate4agent-runtime-native = { path = "../gate4agent-runtime-native", version = "0.5.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

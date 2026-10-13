@@ -5663,7 +5663,7 @@ mod tests {
                 &[OsString::from("--bundle-mode")],
             )
             .unwrap_err(),
-            "native instance launch arguments require PTY transport"
+            "native instance launch arguments require PTY transport (or Codex -c overlays on ACP)"
         );
         assert_eq!(
             validate_instance_launch_arguments(

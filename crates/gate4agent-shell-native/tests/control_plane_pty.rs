@@ -315,8 +315,11 @@ async fn kernel_effects_drive_real_pty_input_resize_and_tree_stop() {
     assert!(kernel.snapshot().sessions[0]
         .terminal_frame
         .as_ref()
+        // The echo line (45 columns) was printed at the initial 40-column width,
+        // so the final frame holds it soft-wrapped; compare with row breaks removed.
         .is_some_and(|frame| frame
             .contents
+            .replace('\n', "")
             .contains("fixture-echo:followup-after-gate-like-history")));
     assert_eq!(shell.active_session_count(), 0);
 }

@@ -333,20 +333,18 @@ pub trait WakeAdapter: Send {
 /// (`docs/mail4agent/agent-mail-protocol.md`). Web routines get the JSON
 /// object instead, whose `reply` field carries the same command.
 pub fn wake_prompt(session: &ProviderSession, letter: &WakeLetter<'_>) -> String {
+    // A structured event: headers, then the body verbatim. No instruction text: whether and how to
+    // answer is up to the agent and the letter itself (a body may say "no reply needed").
     let reply = reply_hint(&session.nick, letter.from_nick);
-    format!(
-        "[mail4agent] Letter from {from} to {to} (event {event}).\n\
-         Answer every direct letter with {cmd}; at minimum \"принято\" plus what you will do and when.\n\
-         Reply: {reply}\n\
-         ---\n\
-         {body}",
+    let mut head = format!(
+        "[mail4agent letter]\nfrom: {from}\nto: {to}\n",
         from = letter.from_nick,
         to = session.nick,
-        event = letter.event_id,
-        cmd = SEND_COMMAND,
-        reply = reply,
-        body = letter.body,
-    )
+    );
+    if let Some(room) = letter.room.map(str::trim).filter(|r| !r.is_empty()) {
+        head.push_str(&format!("room: {room}\n"));
+    }
+    format!("{head}event: {event}\nreply-command: {reply}\n---\n{body}", event = letter.event_id, body = letter.body)
 }
 
 /// Endpoints the host hands to [`adapter_for`]. Every field is optional;
@@ -863,8 +861,9 @@ pub(crate) mod tests {
             &session(SessionKind::local(ProviderKind::Codex)),
             &letter("ping"),
         );
-        assert!(text.contains("m4a-send --as alice --to carol"));
-        assert!(text.ends_with("ping"));
+        assert!(text.contains("reply-command: m4a-send --as alice --to carol"));
+        assert!(text.ends_with("---\nping"));
+        assert!(!text.contains("Answer every") && !text.contains("принято"), "no forced instruction");
     }
 
     #[test]

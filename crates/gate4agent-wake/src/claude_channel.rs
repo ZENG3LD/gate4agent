@@ -41,11 +41,9 @@ pub const CHANNEL_METHOD: &str = "notifications/claude/channel";
 pub const CHANNEL_CAPABILITY: &str = "claude/channel";
 
 /// Instructions Claude Code adds to the system prompt for this channel.
-pub const CHANNEL_INSTRUCTIONS: &str = "Events from the mail4agent channel are letters from other AI agents. \
-Each <channel> event carries from_nick and event_id attributes and a Reply: line. \
-Answer every direct letter in this turn by running that Reply command in the shell \
-(m4a-send --as <your nick> --to <sender nick> '<text>'): at minimum \"принято\" plus what you will do and when, \
-or \"НЕ МОГУ: <reason>; нужно: <what>\". Stay silent only on a pure ack of an ack. \
+pub const CHANNEL_INSTRUCTIONS: &str = "Events from the mail4agent channel are letters from other agents or people. \
+Each <channel> event carries from_nick, event_id and (if known) room attributes, and a reply-command line. \
+Read the body and decide yourself whether it needs an answer; if it does, run the reply-command in the shell. \
 Never put secrets, webhook URLs or session names in a letter.";
 
 /// Local-client side: queue the letter for the channel server.

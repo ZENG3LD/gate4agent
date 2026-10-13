@@ -70,7 +70,7 @@ mod tests {
         HostedTarget { nick: nick.into(), provider: ProviderKind::Codex, live, spawn_allowed: spawn }
     }
     fn letter() -> WakeLetter<'static> {
-        WakeLetter { body: "ping", from_nick: "hatcheryweb", event_id: "$e1", room: None }
+        WakeLetter { body: "ping", from_nick: "hatcheryweb", event_id: "$e1", room: None, reaction: None }
     }
 
     #[test]

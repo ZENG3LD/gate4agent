@@ -271,6 +271,26 @@ pub struct WakeLetter<'a> {
     pub event_id: &'a str,
     /// Room id, if known.
     pub room: Option<&'a str>,
+    /// Set when this letter reports a reaction instead of carrying a message. A reaction letter is
+    /// low priority: it has no reply command and the routine JSON says `"reply_needed": false`.
+    pub reaction: Option<ReactionNote<'a>>,
+}
+
+/// What a reaction letter is about: `from_nick` reacted `key` to `target` (an event in `room`).
+/// The letter's own `event_id` is the reaction event; `body` is a short human line with a snippet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReactionNote<'a> {
+    /// The emoji (annotation key).
+    pub key: &'a str,
+    /// The event that was reacted to.
+    pub target: &'a str,
+}
+
+/// The `react` hint: `m4a --as <to> react '<room>' '<event>' '<emoji>'`, or `None` without a room.
+pub fn react_hint_for(to: &str, room: Option<&str>, event: &str) -> Option<String> {
+    let room = room.map(str::trim).filter(|r| r.starts_with('!') && !r.contains(char::is_whitespace) && !r.contains('\''))?;
+    let event = Some(event.trim()).filter(|e| e.starts_with('$') && !e.contains(char::is_whitespace) && !e.contains('\''))?;
+    Some(format!("{ROOM_COMMAND} --as {to} react '{room}' '{event}' '<emoji>'"))
 }
 
 /// What a wake did.
@@ -348,16 +368,31 @@ pub trait WakeAdapter: Send {
 pub fn wake_prompt(session: &ProviderSession, letter: &WakeLetter<'_>) -> String {
     // A structured event: headers, then the body verbatim. No instruction text: whether and how to
     // answer is up to the agent and the letter itself (a body may say "no reply needed").
-    let reply = reply_hint_for(&session.nick, letter.from_nick, letter.room);
-    let mut head = format!(
-        "[mail4agent letter]\nfrom: {from}\nto: {to}\n",
-        from = letter.from_nick,
-        to = session.nick,
-    );
+    let mut head = format!("[mail4agent letter]\nkind: {}\nfrom: {from}\nto: {to}\n", if letter.reaction.is_some() { "reaction" } else { "message" }, from = letter.from_nick, to = session.nick);
     if let Some(room) = letter.room.map(str::trim).filter(|r| !r.is_empty()) {
         head.push_str(&format!("room: {room}\n"));
     }
-    format!("{head}event: {event}\nreply-command: {reply}\n---\n{body}", event = letter.event_id, body = letter.body)
+    head.push_str(&format!("event: {}\n", letter.event_id));
+    match letter.reaction {
+        Some(r) => {
+            head.push_str(&format!("reaction: {}\ntarget-event: {}\npriority: low\nreply-needed: no\n", r.key, r.target));
+            if let Some(h) = react_hint_for(&session.nick, letter.room, r.target) {
+                head.push_str(&format!("react-command: {h}\n"));
+            }
+        }
+        None => {
+            head.push_str(&format!("reply-command: {}\n", reply_hint_for(&session.nick, letter.from_nick, letter.room)));
+            if let Some(room) = letter.room.map(str::trim).filter(|r| r.starts_with('!') && !r.contains('\'')) {
+                if letter.event_id.starts_with('$') && !letter.event_id.contains('\'') {
+                    head.push_str(&format!("reply-to-command: {ROOM_COMMAND} --as {} send '{room}' --reply-to '{}' '<your reply>'\n", session.nick, letter.event_id));
+                }
+            }
+            if let Some(h) = react_hint_for(&session.nick, letter.room, letter.event_id) {
+                head.push_str(&format!("react-command: {h}\n"));
+            }
+        }
+    }
+    format!("{head}---\n{body}", body = letter.body)
 }
 
 /// Endpoints the host hands to [`adapter_for`]. Every field is optional;
@@ -611,8 +646,17 @@ impl WakeAdapter for RoutineWebhookAdapter {
         }
         self.probe(session)?;
         let url = self.url.as_deref().unwrap_or_default();
-        let reply = reply_hint_for(&session.nick, letter.from_nick, letter.room);
+        let reply = if letter.reaction.is_some() { String::new() } else { reply_hint_for(&session.nick, letter.from_nick, letter.room) };
+        let react_target = letter.reaction.map(|r| r.target).unwrap_or(letter.event_id);
+        let react = react_hint_for(&session.nick, letter.room, react_target).unwrap_or_default();
         let mut body = serde_json::Map::new();
+        body.insert("kind".into(), serde_json::Value::String(if letter.reaction.is_some() { "reaction" } else { "message" }.into()));
+        body.insert("reply_needed".into(), serde_json::Value::Bool(letter.reaction.is_none()));
+        if let Some(r) = letter.reaction {
+            body.insert("priority".into(), serde_json::Value::String("low".into()));
+            body.insert("reaction".into(), serde_json::Value::String(r.key.into()));
+            body.insert("target_event_id".into(), serde_json::Value::String(r.target.into()));
+        }
         for (k, v) in [
             ("body", Some(letter.body)),
             ("from", Some(letter.from_nick)),
@@ -621,6 +665,7 @@ impl WakeAdapter for RoutineWebhookAdapter {
             ("from_nick", Some(letter.from_nick)),
             ("to", Some(session.nick.as_str())),
             ("reply", Some(reply.as_str())),
+            ("react", Some(react.as_str())),
         ] {
             if let Some(v) = v.map(str::trim).filter(|v| !v.is_empty() || k == "body") {
                 body.insert(k.into(), serde_json::Value::String(v.into()));
@@ -804,7 +849,22 @@ pub(crate) mod tests {
             from_nick: "carol",
             event_id: "$ev1",
             room: None,
+            reaction: None,
         }
+    }
+
+    #[test]
+    fn reaction_letters_are_low_priority_with_no_reply_command() {
+        let session = ProviderSession { kind: SessionKind::web(ProviderKind::Grok), session_id: "s".into(), nick: "hatcheryweb".into(), cwd: None, headless: false };
+        let l = WakeLetter { body: "kimi reacted 👍 to your message: \"hi\"", from_nick: "kimi", event_id: "$r1", room: Some("!room:x"), reaction: Some(ReactionNote { key: "👍", target: "$m1" }) };
+        let p = wake_prompt(&session, &l);
+        assert!(p.contains("kind: reaction\n") && p.contains("reaction: 👍\n") && p.contains("target-event: $m1\n") && p.contains("priority: low\n") && p.contains("reply-needed: no\n"));
+        assert!(!p.contains("reply-command:"));
+        assert!(p.contains("react-command: m4a --as hatcheryweb react '!room:x' '$m1' '<emoji>'"));
+        let m = WakeLetter { reaction: None, event_id: "$m2", ..l };
+        let p = wake_prompt(&session, &m);
+        assert!(p.contains("kind: message\n") && p.contains("event: $m2\n") && p.contains("reply-command: m4a --as hatcheryweb send '!room:x'"));
+        assert!(p.contains("reply-to-command: m4a --as hatcheryweb send '!room:x' --reply-to '$m2' '<your reply>'"));
     }
 
     #[test]

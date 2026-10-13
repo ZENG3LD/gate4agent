@@ -50,6 +50,11 @@ async fn drive_until(
                 events.push(event);
             }
             if predicate(runtime, events) {
+                // The snapshot can turn true after the drain above; collect the
+                // events published in that window so assertions see them all.
+                while let Ok(event) = subscription.try_recv() {
+                    events.push(event);
+                }
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

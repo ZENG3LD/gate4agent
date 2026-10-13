@@ -146,10 +146,20 @@ fn fd_count_is_stable_across_two_spawns_best_effort() {
         drop(pair.master);
     }
 
-    let after = match std::fs::read_dir("/dev/fd") {
-        Ok(after_dir) => after_dir.count(),
-        Err(_) => return,
-    };
+    // /dev/fd is process-wide and sibling tests run on parallel threads, so a
+    // single sample can catch their transient descriptors. A real leak from
+    // these spawns persists; give transient ones a moment to close.
+    let mut after = usize::MAX;
+    for _ in 0..50 {
+        after = match std::fs::read_dir("/dev/fd") {
+            Ok(after_dir) => after_dir.count(),
+            Err(_) => return,
+        };
+        if after <= before + 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     assert!(
         after <= before + 2,
         "fd count grew from {before} to {after} across two spawn/teardown cycles"

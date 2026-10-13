@@ -88,6 +88,19 @@ pub fn reply_hint(to: &str, from_nick: &str) -> String {
     format!("{SEND_COMMAND} --as {to} --to {from_nick} '<your reply>'")
 }
 
+/// Room-aware reply: a letter that came from a room (group or DM) is answered in that same room
+/// (`m4a --as <to> send <room> '<text>'`), so a group message is never answered by private DM. Falls
+/// back to [`reply_hint`] when the room is unknown.
+pub fn reply_hint_for(to: &str, from_nick: &str, room: Option<&str>) -> String {
+    match room.map(str::trim).filter(|r| r.starts_with('!') && !r.contains(char::is_whitespace) && !r.contains('\'')) {
+        Some(room) => format!("{ROOM_COMMAND} --as {to} send '{room}' '<your reply>'"),
+        None => reply_hint(to, from_nick),
+    }
+}
+
+/// The room-aware messenger CLI (`m4a`, i.e. `m4a-agent mail`).
+pub const ROOM_COMMAND: &str = "m4a";
+
 
 pub use chain::{plan_chain, ChainError, HostEnv, Mechanism, Tier, WakeChain, WebVendor};
 pub use claude_channel::ClaudeChannelAdapter;
@@ -335,7 +348,7 @@ pub trait WakeAdapter: Send {
 pub fn wake_prompt(session: &ProviderSession, letter: &WakeLetter<'_>) -> String {
     // A structured event: headers, then the body verbatim. No instruction text: whether and how to
     // answer is up to the agent and the letter itself (a body may say "no reply needed").
-    let reply = reply_hint(&session.nick, letter.from_nick);
+    let reply = reply_hint_for(&session.nick, letter.from_nick, letter.room);
     let mut head = format!(
         "[mail4agent letter]\nfrom: {from}\nto: {to}\n",
         from = letter.from_nick,
@@ -598,7 +611,7 @@ impl WakeAdapter for RoutineWebhookAdapter {
         }
         self.probe(session)?;
         let url = self.url.as_deref().unwrap_or_default();
-        let reply = reply_hint(&session.nick, letter.from_nick);
+        let reply = reply_hint_for(&session.nick, letter.from_nick, letter.room);
         let mut body = serde_json::Map::new();
         for (k, v) in [
             ("body", Some(letter.body)),
@@ -853,6 +866,13 @@ pub(crate) mod tests {
             let err = adapter.wake(&s, &letter("x")).unwrap_err().to_string();
             assert!(err.contains(expect), "{kind}: {err}");
         }
+    }
+
+    #[test]
+    fn room_letters_are_answered_in_the_room() {
+        assert_eq!(reply_hint_for("alice", "carol", Some("!r1:example.org")), "m4a --as alice send '!r1:example.org' '<your reply>'");
+        assert_eq!(reply_hint_for("alice", "carol", None), reply_hint("alice", "carol"));
+        assert_eq!(reply_hint_for("alice", "carol", Some("bad room")), reply_hint("alice", "carol"));
     }
 
     #[test]

@@ -459,13 +459,13 @@ fn rediscovery_revokes_disappeared_candidate() {
     write(&transcript, r#"{"type":"session","id":"gone"}"#);
     let mut authority = NativeHistoryAuthority::new(
         NativeHistoryConfig::new(vec![root(
-            "pi",
+            "claude-code",
             HistorySourceLayout::SingleNdjson,
             &sessions,
         )])
         .unwrap(),
     );
-    let discovery = request("pi", 8);
+    let discovery = request("claude", 8);
     let candidate = authority.discover(&discovery).unwrap().remove(0);
     fs::remove_file(&transcript).unwrap();
     assert!(authority.discover(&discovery).unwrap().is_empty());
@@ -477,27 +477,27 @@ fn rediscovery_revokes_disappeared_candidate() {
 }
 
 #[test]
-fn pi_resume_identity_uses_the_validated_primary_transcript() {
-    let fixture = FixtureDir::new("pi-resume");
+fn claude_resume_identity_is_the_transcript_session_id() {
+    let fixture = FixtureDir::new("resume");
     let sessions = fixture.path().join("sessions");
-    let transcript = sessions.join("pi-session-1.jsonl");
+    let transcript = sessions.join("project").join("claude-session-1.jsonl");
     write(
         &transcript,
         concat!(
-            r#"{"type":"session","id":"parsed-pi-session-1"}"#,
+            r#"{"type":"user","sessionId":"claude-session-1","message":{"role":"user","content":"hello"}}"#,
             "\n",
             r#"{"role":"user","content":"hello"}"#
         ),
     );
     let mut authority = NativeHistoryAuthority::new(
         NativeHistoryConfig::new(vec![root(
-            "pi",
+            "claude-code",
             HistorySourceLayout::SingleNdjson,
             &sessions,
         )])
         .unwrap(),
     );
-    let discovery = request("pi", 8);
+    let discovery = request("claude", 8);
     let candidate = discover_history(&mut authority, &discovery)
         .unwrap()
         .remove(0);
@@ -508,16 +508,9 @@ fn pi_resume_identity_uses_the_validated_primary_transcript() {
         .unwrap();
 
     assert_eq!(identity.key, ProviderSessionKey::SessionId);
-    assert_eq!(identity.id, "parsed-pi-session-1");
-    assert_eq!(
-        identity.transcript_path.as_deref(),
-        Some(
-            fs::canonicalize(transcript)
-                .unwrap()
-                .to_string_lossy()
-                .as_ref()
-        )
-    );
+    assert_eq!(identity.id, "claude-session-1");
+    // Claude resumes by session id alone; only path-addressed providers carry a transcript path.
+    assert_eq!(identity.transcript_path, None);
 }
 
 #[test]
@@ -531,12 +524,12 @@ fn traversal_reports_the_hard_entry_boundary_without_leaking_paths() {
         ..NativeHistoryLimits::default()
     };
     let config = NativeHistoryConfig::with_limits(
-        vec![root("pi", HistorySourceLayout::SingleNdjson, &sessions)],
+        vec![root("claude-code", HistorySourceLayout::SingleNdjson, &sessions)],
         limits,
     )
     .unwrap();
     let mut authority = NativeHistoryAuthority::new(config);
-    let discovery = request("pi", 8);
+    let discovery = request("claude", 8);
 
     assert!(authority.discover(&discovery).unwrap().len() <= 1);
     let issues = authority.take_discovery_issues();
@@ -556,8 +549,8 @@ fn candidate_capacity_evicts_the_least_recent_source_instead_of_deadlocking() {
         &grok.join("repo").join("grok-1").join("summary.json"),
         r#"{"info":{"id":"grok-1"}}"#,
     );
-    let pi = fixture.path().join("pi");
-    write(&pi.join("pi-1.jsonl"), r#"{"type":"session","id":"pi-1"}"#);
+    let claude = fixture.path().join("claude");
+    write(&claude.join("project").join("claude-1.jsonl"), "{}");
     let limits = NativeHistoryLimits {
         max_candidates: 1,
         ..NativeHistoryLimits::default()
@@ -569,7 +562,7 @@ fn candidate_capacity_evicts_the_least_recent_source_instead_of_deadlocking() {
                 HistorySourceLayout::SummaryJsonWithSiblingNdjson,
                 &grok,
             ),
-            root("pi", HistorySourceLayout::SingleNdjson, &pi),
+            root("claude-code", HistorySourceLayout::SingleNdjson, &claude),
         ],
         limits,
     )
@@ -577,8 +570,8 @@ fn candidate_capacity_evicts_the_least_recent_source_instead_of_deadlocking() {
     let mut authority = NativeHistoryAuthority::new(config);
     let grok_request = request("grok", 8);
     let grok_candidate = authority.discover(&grok_request).unwrap().remove(0);
-    let pi_request = request("pi", 8);
-    assert_eq!(authority.discover(&pi_request).unwrap().len(), 1);
+    let claude_request = request("claude", 8);
+    assert_eq!(authority.discover(&claude_request).unwrap().len(), 1);
     assert_eq!(authority.active_candidate_count(), 1);
 
     let stale_load = HistoryLoadRequest::new(&grok_request, grok_candidate).unwrap();

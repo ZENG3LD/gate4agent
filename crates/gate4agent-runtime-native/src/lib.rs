@@ -3297,6 +3297,14 @@ mod tests {
         assert_eq!(unchanged.revision, first.revision);
 
         std::fs::write(&path, transcript("changed title")).unwrap();
+        // The rewrite can land in the same mtime tick as the first write; advance the mtime so the
+        // locator metadata change is deterministic instead of timing-dependent.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+            .unwrap();
         catalog.indexes.get_mut(&provider).unwrap().refreshed_at =
             Instant::now() - NATIVE_SESSION_INDEX_REFRESH_INTERVAL;
         let changed = catalog

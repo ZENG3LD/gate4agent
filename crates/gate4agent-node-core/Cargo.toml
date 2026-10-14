@@ -9,7 +9,7 @@ license = "MIT"
 name = "gate4agent_node_core"
 
 [dependencies]
-gate4agent-node-protocol = { path = "../gate4agent-node-protocol", version = "0.5.3" }
+gate4agent-node-protocol = { path = "../gate4agent-node-protocol", version = "0.5.4" }
 gate4agent-types = { path = "../gate4agent-types", version = "0.5.3" }
 gate4agent-runtime-native = { path = "../gate4agent-runtime-native", version = "0.5.3" }
 serde = { version = "1", features = ["derive"] }

@@ -5888,6 +5888,37 @@ pub struct RequestEnvelope {
     pub request: NodeRequest,
 }
 
+/// Launch options for [`NodeRequest::SpawnWithOptions`]. The node maps them to the
+/// provider CLI's own flags; a provider without a mapping refuses the spawn.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnSessionOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl SpawnSessionOptions {
+    pub const MAX_BYTES: usize = 128;
+
+    /// Plain identifiers only (letters, digits, `-_.:/[]`), bounded.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let ok = |v: &str| {
+            !v.is_empty()
+                && v.len() <= Self::MAX_BYTES
+                && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.:/[]".contains(&b))
+        };
+        if self.model.as_deref().is_some_and(|m| !ok(m)) {
+            return Err("spawn model is invalid");
+        }
+        if self.effort.as_deref().is_some_and(|e| !ok(e)) {
+            return Err("spawn effort is invalid");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum NodeRequest {
@@ -6017,6 +6048,17 @@ pub enum NodeRequest {
         mode: SessionMode,
         terminal_size: TerminalSize,
         initial_prompt: Option<String>,
+    },
+    /// `Spawn` plus launch options (model / reasoning effort). Separate variant so the plain
+    /// `Spawn` wire shape stays unchanged for older peers.
+    SpawnWithOptions {
+        workspace_id: WorkspaceId,
+        provider: AgentId,
+        mode: SessionMode,
+        terminal_size: TerminalSize,
+        initial_prompt: Option<String>,
+        #[serde(default)]
+        options: SpawnSessionOptions,
     },
     SpawnSpec {
         spec: SpawnSpec,
@@ -6358,6 +6400,7 @@ impl NodeRequest {
             | Self::CreateWorktree { .. }
             | Self::RemoveWorktree { .. }
             | Self::Spawn { .. }
+            | Self::SpawnWithOptions { .. }
             | Self::SpawnSpec { .. }
             | Self::SpawnManagedWorktree { .. }
             | Self::SpawnManagedWorktreeV2 { .. }
@@ -6467,6 +6510,7 @@ impl NodeRequest {
             | Self::CreateWorktree { .. }
             | Self::RemoveWorktree { .. }
             | Self::Spawn { .. }
+            | Self::SpawnWithOptions { .. }
             | Self::Resume { .. }
             | Self::RenameSessionRecord { .. }
             | Self::ResumeSessionRecord { .. }
@@ -6632,6 +6676,7 @@ impl NodeRequest {
             | Self::CreateWorktree { .. }
             | Self::RemoveWorktree { .. }
             | Self::Spawn { .. }
+            | Self::SpawnWithOptions { .. }
             | Self::SpawnSpec { .. }
             | Self::SpawnManagedWorktree { .. }
             | Self::SpawnManagedWorktreeV2 { .. }
@@ -11606,5 +11651,37 @@ mod tests {
         .is_replay_safe());
         assert!(!NodeRequest::ExportContextPack { session: session_address("primary", 1) }
             .is_replay_safe());
+    }
+}
+
+#[cfg(test)]
+mod spawn_with_options_wire_tests {
+    use super::*;
+
+    #[test]
+    fn plain_spawn_wire_is_unchanged_and_options_roundtrip() {
+        let size = TerminalSize { rows: 24, columns: 80 };
+        let plain = NodeRequest::Spawn {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            provider: AgentId::new("codex").unwrap(),
+            mode: SessionMode::Pty,
+            terminal_size: size,
+            initial_prompt: None,
+        };
+        let v = serde_json::to_value(&plain).unwrap();
+        assert_eq!(v["kind"], "spawn");
+        assert!(v.get("options").is_none());
+        let with = NodeRequest::SpawnWithOptions {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            provider: AgentId::new("codex").unwrap(),
+            mode: SessionMode::Pty,
+            terminal_size: size,
+            initial_prompt: None,
+            options: SpawnSessionOptions { model: Some("m-1".into()), effort: Some("high".into()) },
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["kind"], "spawn-with-options");
+        assert_eq!(serde_json::from_value::<NodeRequest>(v).unwrap(), with);
+        assert!(SpawnSessionOptions { model: Some("bad model".into()), effort: None }.validate().is_err());
     }
 }

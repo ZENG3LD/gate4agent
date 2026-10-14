@@ -1781,7 +1781,7 @@ fn ensure_node_request_provider_capability(
     open_provider_ids_enabled: bool,
 ) -> Result<(), NodeClientError> {
     match request {
-        NodeRequest::Spawn { provider, .. } => {
+        NodeRequest::Spawn { provider, .. } | NodeRequest::SpawnWithOptions { provider, .. } => {
             ensure_outbound_provider_id_capability(provider, open_provider_ids_enabled)?;
         }
         NodeRequest::IndexProviderSession { provider, .. } => {
@@ -1980,6 +1980,7 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::ReleaseController
         | NodeRequest::UnregisterWorkspace { .. }
         | NodeRequest::Spawn { .. }
+        | NodeRequest::SpawnWithOptions { .. }
         | NodeRequest::SpawnSpec { .. }
         | NodeRequest::SpawnManagedWorktree { .. }
         | NodeRequest::SpawnManagedWorktreeV2 { .. }
@@ -2199,6 +2200,7 @@ fn node_request_contains_tagged_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::Spawn { .. }
+        | NodeRequest::SpawnWithOptions { .. }
         | NodeRequest::SpawnSpec { .. }
         | NodeRequest::SpawnManagedWorktree { .. }
         | NodeRequest::SpawnManagedWorktreeV2 { .. }

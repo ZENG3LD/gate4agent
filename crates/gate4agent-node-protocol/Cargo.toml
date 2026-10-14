@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-node-protocol"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 description = "Bounded wire contract for the local gate4agent node (inventory, spawn, sessions, worktrees, delivery)"
 license = "MIT"

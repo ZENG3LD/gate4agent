@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-node-protocol"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "gate4agent-build-stamp",
  "gate4agent-types",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-node-wire"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "gate4agent-node-protocol",
  "gate4agent-types",

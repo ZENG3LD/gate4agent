@@ -300,7 +300,7 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
         descriptors.push(descriptor(AdapterFamily::History, id));
         descriptors.push(descriptor(AdapterFamily::Resume, id));
     }
-    for id in ["claude-code", "codex"] {
+    for id in ["claude-code", "codex", "grok", "kimi"] {
         descriptors.push(descriptor_with_revision(
             AdapterFamily::SessionOptions,
             id,
@@ -452,7 +452,7 @@ mod tests {
                 )
             })
             .collect::<std::collections::BTreeSet<_>>();
-        let expected = ["claude-code", "codex"]
+        let expected = ["claude-code", "codex", "grok", "kimi"]
             .into_iter()
             .map(|id| (id, SESSION_OPTION_CATALOG_REVISION))
             .collect();

@@ -154,7 +154,21 @@ pub fn session_option_catalog(
         "claude-code" => Ok(claude_catalog(adapter_id.clone())),
         "codex" => Ok(codex_catalog(adapter_id.clone())),
         "cursor" => Ok(cursor_catalog(adapter_id.clone())),
+        "grok" => Ok(grok_catalog(adapter_id.clone())),
+        "kimi" => Ok(kimi_catalog(adapter_id.clone())),
         id => Err(SessionOptionAdapterError::UnsupportedAdapter(id.to_owned())),
+    }
+}
+
+/// Launch options for a model id the pinned catalog does not list (models discovered on the
+/// node at runtime). The provider-level flag shape still applies, so an effort selected for a
+/// discovered model is not silently dropped.
+fn unlisted_model_options(adapter_id: &AdapterId) -> Vec<SessionOption> {
+    match adapter_id.as_str() {
+        "claude-code" => vec![claude_effort(true)],
+        "codex" => vec![codex_effort(true)],
+        "grok" => vec![grok_effort()],
+        _ => Vec::new(),
     }
 }
 
@@ -165,7 +179,19 @@ pub fn resolve_session_option_launch(
 ) -> Result<ResolvedSessionOptionLaunch, SessionOptionAdapterError> {
     let catalog = session_option_catalog(adapter_id)?;
     let selection = normalize_selection(selection)?;
-    let model = find_model(&catalog, &selection.model);
+    let unlisted;
+    let model = match find_model(&catalog, &selection.model) {
+        Some(model) => Some(model),
+        None if valid_dynamic_model_id(&selection.model) => {
+            let options = unlisted_model_options(adapter_id)
+                .into_iter()
+                .filter(|option| selection.values.contains_key(&option.id))
+                .collect::<Vec<_>>();
+            unlisted = model(&selection.model, &selection.model, false, options);
+            Some(&unlisted)
+        }
+        None => None,
+    };
     let values = model
         .map(|model| resolved_model_values(model, &selection))
         .transpose()?
@@ -860,6 +886,69 @@ fn codex_catalog(adapter_id: AdapterId) -> AgentSessionOptionCatalog {
     }
 }
 
+fn grok_effort() -> SessionOption {
+    // `grok --reasoning-effort <EFFORT>` (alias `--effort`), grok 1.0.46 `--help`.
+    select_option(
+        "effort",
+        "Reasoning effort",
+        SessionOptionCategory::ThoughtLevel,
+        &[("low", "Low"), ("medium", "Medium"), ("high", "High")],
+        "high",
+        SessionOptionApply {
+            launch: Some(SessionOptionLaunchApplication::Flag {
+                flag: "--reasoning-effort".to_owned(),
+            }),
+            argument_override: Some(SessionOptionArgumentOverride::Flags(vec![
+                "--reasoning-effort".to_owned(),
+                "--effort".to_owned(),
+            ])),
+            composed_into_model: false,
+            mid_session: SessionOptionMidSessionApplication::Unsupported,
+        },
+    )
+}
+
+fn grok_catalog(adapter_id: AdapterId) -> AgentSessionOptionCatalog {
+    AgentSessionOptionCatalog {
+        adapter_id,
+        revision: SESSION_OPTION_CATALOG_REVISION.to_owned(),
+        models: Vec::new(),
+        model_apply: SessionOptionApply {
+            launch: Some(SessionOptionLaunchApplication::Flag {
+                flag: "--model".to_owned(),
+            }),
+            argument_override: Some(SessionOptionArgumentOverride::Flags(vec![
+                "-m".to_owned(),
+                "--model".to_owned(),
+            ])),
+            composed_into_model: false,
+            mid_session: command_apply("/model"),
+        },
+        model_list: None,
+    }
+}
+
+fn kimi_catalog(adapter_id: AdapterId) -> AgentSessionOptionCatalog {
+    // `kimi -m/--model <alias>` (kimi-code 2.1.1); no reasoning-effort launch flag.
+    AgentSessionOptionCatalog {
+        adapter_id,
+        revision: SESSION_OPTION_CATALOG_REVISION.to_owned(),
+        models: Vec::new(),
+        model_apply: SessionOptionApply {
+            launch: Some(SessionOptionLaunchApplication::Flag {
+                flag: "--model".to_owned(),
+            }),
+            argument_override: Some(SessionOptionArgumentOverride::Flags(vec![
+                "-m".to_owned(),
+                "--model".to_owned(),
+            ])),
+            composed_into_model: false,
+            mid_session: command_apply("/model"),
+        },
+        model_list: None,
+    }
+}
+
 fn cursor_catalog(adapter_id: AdapterId) -> AgentSessionOptionCatalog {
     let effort = || {
         select_option(
@@ -1232,7 +1321,7 @@ mod tests {
     #[test]
     fn unsupported_or_unsafe_values_fail_typed_without_fallback() {
         assert!(matches!(
-            session_option_catalog(&id("grok")),
+            session_option_catalog(&id("omp")),
             Err(SessionOptionAdapterError::UnsupportedAdapter(_))
         ));
         let future = resolve_session_option_launch(
@@ -1254,5 +1343,34 @@ mod tests {
             ),
             Err(SessionOptionAdapterError::UnsafeCommandValue)
         ));
+    }
+}
+
+#[cfg(test)]
+mod fleet_launch_flags {
+    use super::*;
+
+    fn args(adapter: &str, model: &str, effort: Option<&str>) -> Vec<String> {
+        let mut sel = SessionOptionSelection::new(model);
+        if let Some(e) = effort {
+            sel = sel.with_value("effort", e);
+        }
+        resolve_session_option_launch(&AdapterId::new(adapter).unwrap(), &sel, &[]).unwrap().args
+    }
+
+    #[test]
+    fn every_fleet_provider_maps_model_and_effort_to_its_own_flags() {
+        assert_eq!(args("claude-code", "opus", Some("high")), ["--model", "opus", "--effort", "high"]);
+        assert_eq!(args("codex", "gpt-5.5", Some("high")), ["-m", "gpt-5.5", "-c", "model_reasoning_effort=high"]);
+        assert_eq!(args("grok", "grok-4.6", Some("low")), ["--model", "grok-4.6", "--reasoning-effort", "low"]);
+        assert_eq!(args("kimi", "kimi-k2", None), ["--model", "kimi-k2"]);
+    }
+
+    #[test]
+    fn discovered_unlisted_models_keep_the_selected_effort() {
+        assert_eq!(args("codex", "gpt-5", Some("high")), ["-m", "gpt-5", "-c", "model_reasoning_effort=high"]);
+        assert_eq!(args("claude-code", "claude-x", Some("max")), ["--model", "claude-x", "--effort", "max"]);
+        // No effort selected: no effort flag forced on an unlisted model.
+        assert_eq!(args("codex", "gpt-5", None), ["-m", "gpt-5"]);
     }
 }

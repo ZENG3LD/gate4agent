@@ -998,21 +998,19 @@ mod tests {
     }
 
     #[test]
-    fn launch_only_agents_cannot_borrow_another_provider_option_catalog() {
+    fn kimi_launch_maps_its_own_model_flag() {
         let spec = builtin_registry().get_by_id("kimi").unwrap();
-        assert!(matches!(
-            plan_launch(
-                spec,
-                LaunchRequest {
-                    session_options: Some(SessionOptionSelection::new("opus")),
-                    platform: RuntimePlatform::Linux,
-                    ..LaunchRequest::default()
-                },
-            ),
-            Err(LaunchPlanError::SessionOptions(
-                SessionOptionCatalogError::UnsupportedAgent(_)
-            ))
-        ));
+        let plan = plan_launch(
+            spec,
+            LaunchRequest {
+                session_options: Some(SessionOptionSelection::new("kimi-k2")),
+                platform: RuntimePlatform::Linux,
+                ..LaunchRequest::default()
+            },
+        )
+        .unwrap();
+        let args = args_as_strings(&plan);
+        assert!(args.windows(2).any(|w| w == ["--model", "kimi-k2"]), "{args:?}");
     }
 
     #[test]

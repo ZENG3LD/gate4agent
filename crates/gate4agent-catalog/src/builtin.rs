@@ -390,7 +390,7 @@ mod tests {
             );
         }
 
-        for id in ["claude", "codex"] {
+        for id in ["claude", "codex", "grok", "kimi"] {
             let binding = registry
                 .get_by_id(id)
                 .unwrap()
@@ -402,18 +402,6 @@ mod tests {
             assert_eq!(
                 binding.revision,
                 gate4agent_adapters::SESSION_OPTION_CATALOG_REVISION
-            );
-        }
-        for id in ["grok", "kimi"] {
-            assert!(
-                registry
-                    .get_by_id(id)
-                    .unwrap()
-                    .capabilities
-                    .adapters
-                    .session_options
-                    .is_none(),
-                "unexpected session-option adapter for {id}"
             );
         }
     }

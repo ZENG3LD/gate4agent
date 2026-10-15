@@ -161,10 +161,7 @@ mod tests {
             "claude-code"
         );
         let kimi = registry.get_by_id("kimi").unwrap();
-        assert!(matches!(
-            session_option_catalog_for(kimi),
-            Err(SessionOptionCatalogError::UnsupportedAgent(_))
-        ));
+        assert_eq!(session_option_catalog_for(kimi).unwrap().adapter_id.as_str(), "kimi");
 
         let mut stale = claude.clone();
         stale

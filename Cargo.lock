@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-adapters"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "gate4agent-types",
  "serde_json",

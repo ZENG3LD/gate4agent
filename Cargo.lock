@@ -484,7 +484,7 @@ version = "0.5.3"
 
 [[package]]
 name = "gate4agent-runtime-native"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "gate4agent-adapters",
  "gate4agent-catalog",

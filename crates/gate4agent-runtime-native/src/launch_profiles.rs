@@ -23,7 +23,7 @@ const CONTEXT_ROOT_ENVIRONMENT_KEY: &str = "GATE4AGENT_CONTEXT_ROOT";
 /// The only keys of a host-assigned session identity (the messaging account the host gives
 /// one session: nick = key = role). They are host-owned like the context root, so they need no
 /// native launch profile and can ride on top of any other overlay.
-pub const SESSION_IDENTITY_ENVIRONMENT_KEYS: &[&str] = &["M4A_NICK", "M4A_SESSION_CAP", "M4A_SESSION_ID"];
+pub const SESSION_IDENTITY_ENVIRONMENT_KEYS: &[&str] = &["M4A_NICK", "M4A_SESSION_CAP", "M4A_SESSION_ID", "M4A_SESSION_HANDLE", "M4A_SIGNER_SOCK"];
 
 fn is_session_identity(environment: &[EnvMutation]) -> bool {
     !environment.is_empty()

@@ -19,7 +19,21 @@ thiserror = "2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Windows: boringtun speaks WireGuard. A tun is opened only when no other tun
+# owns the default route. wintun.dll is loaded at runtime. No default route.
+# Not optional: a feature cannot enable a target-only optional crate on other targets.
+[target.'cfg(windows)'.dependencies]
+base64 = "0.22"
+boringtun = { version = "0.7.1", default-features = false }
+smoltcp = { version = "0.11.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_LibraryLoader",
+] }
+
 [features]
 default = []
-# Kernel WireGuard for node<->C2 (calls `ip link` / `wg`).
+# Node<->C2 WireGuard. Linux calls `ip link` / `wg`. Windows opens its own
+# tun only when the machine has none, and then only for the peer host route.
 wireguard = []

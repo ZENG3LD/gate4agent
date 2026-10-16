@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-keys"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2021"
 description = "g4a's embedded keystore layer on tesserax-keytree: node and session grants per transport, and the authority mode (own root standalone, delegated keys when run under an orchestrator)."
 license = "MIT"

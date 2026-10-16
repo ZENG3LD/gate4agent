@@ -33,6 +33,11 @@ struct Job {
 
 static GATE: OnceLock<Gate> = OnceLock::new();
 
+/// Idle time before the inner (in-tunnel) TCP socket sends a keepalive.
+const INNER_KEEPALIVE: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(15);
+/// Unacked time after which the inner TCP socket is reset.
+const INNER_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(45);
+
 pub(super) fn connect(addr: SocketAddr) -> std::io::Result<Option<TcpStream>> {
     let Some(gate) = GATE.get() else {
         return Ok(None);
@@ -260,6 +265,12 @@ fn pump(
                     next_port = next_port.wrapping_add(1).max(20_000);
                     let connected = {
                         let socket = sockets.get_mut::<tcp::Socket>(handle);
+                        // The loopback leg cannot see the tunnel die, so the
+                        // inner socket must: probe when idle, give up when
+                        // the peer stops acking. Its abort closes the loopback
+                        // stream and the caller's reconnect logic runs.
+                        socket.set_keep_alive(Some(INNER_KEEPALIVE));
+                        socket.set_timeout(Some(INNER_TIMEOUT));
                         socket
                             .connect(
                                 iface.context(),

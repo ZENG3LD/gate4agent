@@ -605,8 +605,8 @@ mod tests {
 
     #[test]
     fn peer_prefix_is_a_host_route() {
-        let v4: IpAddr = "10.88.0.1".parse().unwrap();
-        assert_eq!(peer_prefix(v4), "10.88.0.1/32");
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(peer_prefix(v4), "192.0.2.1/32");
         assert!(!peer_prefix(v4).contains("0.0.0.0/0"));
     }
 

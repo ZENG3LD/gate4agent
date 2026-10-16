@@ -8,6 +8,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Command;
 
 use thiserror::Error;
@@ -100,18 +101,41 @@ pub enum NodeWgPeerError {
     Setup(String),
 }
 
-/// Creates a kernel WireGuard interface for the node↔C2 peer.
+/// Creates the node↔C2 WireGuard peer.
 /// Allowed IPs and the installed route are only the C2 tunnel host.
-/// Does not substitute another transport when `ip link add type wireguard` fails.
+/// Linux: `ip link add type wireguard`, and a failed `ip` is an error.
+/// Windows, no tun on the machine: one adapter and a host route for the peer.
+/// Windows, a tun already owns the default route: no adapter and no route.
+/// The WireGuard session runs in this process and its UDP leaves through that tun.
 pub fn bring_up_node_wireguard(config: &NodeWgPeerConfig) -> Result<IpAddr, NodeWgPeerError> {
     config.validate()?;
     require_key_file(&config.private_key_path)?;
-    create_wireguard_iface(&config.interface_name)?;
-    if let Err(error) = configure_wireguard(config) {
-        delete_iface(&config.interface_name);
-        return Err(error);
+    #[cfg(windows)]
+    {
+        crate::kit_wireguard_windows::bring_up(config)?;
+        return Ok(config.peer_tunnel_address);
     }
-    Ok(config.peer_tunnel_address)
+    #[cfg(not(windows))]
+    {
+        create_wireguard_iface(&config.interface_name)?;
+        if let Err(error) = configure_wireguard(config) {
+            delete_iface(&config.interface_name);
+            return Err(error);
+        }
+        Ok(config.peer_tunnel_address)
+    }
+}
+
+/// Dial `addr`. When this process already has an in-process WireGuard session
+/// for that peer, the stream is carried inside it. Otherwise this is a normal connect.
+pub fn tcp_connect(addr: SocketAddr) -> std::io::Result<std::net::TcpStream> {
+    #[cfg(all(windows, feature = "wireguard"))]
+    {
+        if let Some(stream) = crate::kit_wireguard_windows::connect_inside(addr)? {
+            return Ok(stream);
+        }
+    }
+    std::net::TcpStream::connect(addr)
 }
 
 fn require_key_file(path: &Path) -> Result<(), NodeWgPeerError> {
@@ -127,6 +151,7 @@ fn require_key_file(path: &Path) -> Result<(), NodeWgPeerError> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn create_wireguard_iface(name: &str) -> Result<(), NodeWgPeerError> {
     let output = Command::new("ip")
         .args(["link", "add", "dev", name, "type", "wireguard"])
@@ -143,6 +168,7 @@ fn create_wireguard_iface(name: &str) -> Result<(), NodeWgPeerError> {
     )))
 }
 
+#[cfg(not(windows))]
 fn configure_wireguard(config: &NodeWgPeerConfig) -> Result<(), NodeWgPeerError> {
     let name = &config.interface_name;
     let listen = config.listen_port.to_string();
@@ -187,6 +213,7 @@ fn configure_wireguard(config: &NodeWgPeerConfig) -> Result<(), NodeWgPeerError>
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn command_ok(program: &str, args: &[&str]) -> Result<(), NodeWgPeerError> {
     let output = Command::new(program)
         .args(args)
@@ -202,6 +229,7 @@ fn command_ok(program: &str, args: &[&str]) -> Result<(), NodeWgPeerError> {
     )))
 }
 
+#[cfg(not(windows))]
 fn delete_iface(name: &str) {
     let _ = Command::new("ip")
         .args(["link", "del", "dev", name])

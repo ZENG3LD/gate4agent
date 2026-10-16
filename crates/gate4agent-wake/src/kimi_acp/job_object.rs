@@ -24,7 +24,7 @@ mod win {
                 .ok_or_else(|| "child has no pid".to_string())?;
             unsafe {
                 let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if handle == 0 || handle == INVALID_HANDLE_VALUE {
+                if handle.is_null() || handle == INVALID_HANDLE_VALUE {
                     return Err(format!("CreateJobObjectW: {}", io::Error::last_os_error()));
                 }
                 let mut info = std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
@@ -41,7 +41,7 @@ mod win {
                     return Err(format!("SetInformationJobObject: {err}"));
                 }
                 let proc = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
-                if proc == 0 || proc == INVALID_HANDLE_VALUE {
+                if proc.is_null() || proc == INVALID_HANDLE_VALUE {
                     let err = io::Error::last_os_error();
                     CloseHandle(handle);
                     return Err(format!("OpenProcess: {err}"));

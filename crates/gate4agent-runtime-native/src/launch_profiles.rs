@@ -23,7 +23,20 @@ const CONTEXT_ROOT_ENVIRONMENT_KEY: &str = "GATE4AGENT_CONTEXT_ROOT";
 /// The only keys of a host-assigned session identity (the messaging account the host gives
 /// one session: nick = key = role). They are host-owned like the context root, so they need no
 /// native launch profile and can ride on top of any other overlay.
-pub const SESSION_IDENTITY_ENVIRONMENT_KEYS: &[&str] = &["M4A_NICK", "M4A_SESSION_CAP", "M4A_SESSION_ID", "M4A_SESSION_HANDLE", "M4A_SIGNER_SOCK"];
+/// Besides nick/key/handle, the account's own non-secret client settings ride along: its store
+/// root, the display name the nick came from, and where its messenger is.
+pub const SESSION_IDENTITY_ENVIRONMENT_KEYS: &[&str] = &[
+    "M4A_NICK",
+    "M4A_SESSION_CAP",
+    "M4A_SESSION_ID",
+    "M4A_SESSION_HANDLE",
+    "M4A_SIGNER_SOCK",
+    "M4A_STORE_ROOT",
+    "M4A_BOT_NAME",
+    "M4A_PRODUCT_URL",
+    "M4A_HOMESERVER_URL",
+    "M4A_TIER",
+];
 
 fn is_session_identity(environment: &[EnvMutation]) -> bool {
     !environment.is_empty()
@@ -1521,4 +1534,24 @@ fn os_string_bytes(value: &OsStr) -> usize {
 
 fn contains_nul(value: &OsStr) -> bool {
     value.to_string_lossy().contains('\0')
+}
+
+#[cfg(test)]
+mod session_identity_keys_tests {
+    use super::*;
+
+    fn m(k: &str) -> EnvMutation {
+        EnvMutation { key: k.into(), value: Some("v".into()) }
+    }
+
+    #[test]
+    fn account_client_settings_ride_with_the_identity_but_nothing_else_does() {
+        let agent = AgentId::new("codex").unwrap();
+        assert!(NativeInstanceLaunchOverlay::new_session_identity(
+            agent.clone(),
+            vec![m("M4A_NICK"), m("M4A_SESSION_CAP"), m("M4A_STORE_ROOT"), m("M4A_BOT_NAME"), m("M4A_PRODUCT_URL")],
+        )
+        .is_ok());
+        assert!(NativeInstanceLaunchOverlay::new_session_identity(agent, vec![m("M4A_NICK"), m("OPENAI_API_KEY")]).is_err());
+    }
 }

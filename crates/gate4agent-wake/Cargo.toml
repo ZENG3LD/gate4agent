@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-wake"
-version = "0.5.7"
+version = "0.5.8"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ZENG3LD/gate4agent"
@@ -16,6 +16,10 @@ wake-kimi = ["dep:tokio", "dep:thiserror"]
 wake-cursor = []
 wake-routine = []
 wake-spawn = []
+
+[[bin]]
+name = "g4a-grok-push"
+required-features = ["wake-grok"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

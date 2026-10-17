@@ -72,7 +72,11 @@ impl AcpClient {
         // children when the last handle closes (hard-kill of this host).
         #[cfg(windows)]
         {
-            command.creation_flags(0x0100_0000); // CREATE_SUSPENDED — assigned in JobObject::assign
+            use std::os::windows::process::CommandExt;
+            // CREATE_SUSPENDED (job assign) | CREATE_NO_WINDOW (no console for ACP connector)
+            const CREATE_SUSPENDED: u32 = 0x0100_0000;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
         }
         let mut child = command
             .spawn()
@@ -254,5 +258,15 @@ mod tests {
         let err = finish(json!({"jsonrpc":"2.0","id":1,"error":{"message":"Unknown sessionId"}}));
         assert!(matches!(err, Err(AcpError::Rpc(m)) if m.contains("Unknown sessionId")));
         assert!(finish(json!({"jsonrpc":"2.0","id":1,"result":{"ok":true}})).is_ok());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_flags {
+    #[test]
+    fn create_no_window_is_combined_with_suspended() {
+        const CREATE_SUSPENDED: u32 = 0x0100_0000;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        assert_eq!(CREATE_SUSPENDED | CREATE_NO_WINDOW, 0x0900_0000);
     }
 }

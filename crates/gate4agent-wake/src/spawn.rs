@@ -169,6 +169,11 @@ impl WakeAdapter for ResumeSpawnAdapter {
             })
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
         if let Some(cwd) = session.cwd.as_deref().filter(|cwd| cwd.is_dir()) {
             command.current_dir(cwd);
         }
